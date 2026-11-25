@@ -6,7 +6,11 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
-import { T3_PROJECT_FILE_NAME, type T3ProjectFile } from "@t3tools/contracts";
+import {
+  LEGACY_T3_PROJECT_FILE_NAME,
+  T3_PROJECT_FILE_NAME,
+  type T3ProjectFile,
+} from "@t3tools/contracts";
 import { T3ProjectFileFromJson } from "@t3tools/shared/t3ProjectFile";
 
 const decodeT3ProjectFileJson = Schema.decodeEffect(T3ProjectFileFromJson);
@@ -48,29 +52,38 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
+  const readCandidate = (workspaceRoot: string, fileName: string) => {
+    const filePath = path.join(workspaceRoot, fileName);
+    return fileSystem.readFileString(filePath).pipe(
+      Effect.map((content) => Option.some({ filePath, content })),
+      Effect.catchTags({
+        PlatformError: (error) =>
+          error.reason._tag === "NotFound"
+            ? Effect.succeed(Option.none<{ readonly filePath: string; readonly content: string }>())
+            : logT3ProjectFileLoadError(
+                new T3ProjectFileLoadError({
+                  operation: "read",
+                  workspaceRoot,
+                  filePath,
+                  cause: error,
+                }),
+              ).pipe(
+                Effect.as(Option.none<{ readonly filePath: string; readonly content: string }>()),
+              ),
+      }),
+    );
+  };
+
   const load: T3ProjectFileLoader["Service"]["load"] = Effect.fn("T3ProjectFileLoader.load")(
     function* (workspaceRoot) {
-      const filePath = path.join(workspaceRoot, T3_PROJECT_FILE_NAME);
-      const raw = yield* fileSystem.readFileString(filePath).pipe(
-        Effect.asSome,
-        Effect.catchTags({
-          PlatformError: (error) =>
-            error.reason._tag === "NotFound"
-              ? Effect.succeed(Option.none<string>())
-              : logT3ProjectFileLoadError(
-                  new T3ProjectFileLoadError({
-                    operation: "read",
-                    workspaceRoot,
-                    filePath,
-                    cause: error,
-                  }),
-                ).pipe(Effect.as(Option.none<string>())),
-        }),
-      );
+      const primary = yield* readCandidate(workspaceRoot, T3_PROJECT_FILE_NAME);
+      const raw = Option.isSome(primary)
+        ? primary
+        : yield* readCandidate(workspaceRoot, LEGACY_T3_PROJECT_FILE_NAME);
       if (Option.isNone(raw)) {
         return Option.none<T3ProjectFile>();
       }
-      return yield* decodeT3ProjectFileJson(raw.value).pipe(
+      return yield* decodeT3ProjectFileJson(raw.value.content).pipe(
         Effect.asSome,
         Effect.catchTags({
           SchemaError: (error) =>
@@ -78,7 +91,7 @@ export const make = Effect.gen(function* () {
               new T3ProjectFileLoadError({
                 operation: "decode",
                 workspaceRoot,
-                filePath,
+                filePath: raw.value.filePath,
                 cause: error,
               }),
             ).pipe(Effect.as(Option.none<T3ProjectFile>())),

@@ -14,6 +14,7 @@ import {
   useSettingsScope,
 } from "../components/settings/SettingsScopeContext";
 import { useEnvironments } from "../state/environments";
+import { prefetchUnifiedMcpSnapshot } from "../state/unifiedMcp";
 import { SettingsScopeNotice } from "../components/settings/SettingsScopeNotice";
 import { SETTINGS_DEVICE_ONLY_PATHS } from "../components/settings/SettingsScopeSentence";
 import { SettingsPageContainer } from "../components/settings/settingsLayout";
@@ -210,6 +211,7 @@ export const Route = createFileRoute("/_chat/settings")({
   validateSearch: validateSettingsRouteSearch,
   search: { middlewares: [retainSettingsScope] },
   beforeLoad: async ({ location }) => {
+    prefetchUnifiedMcpSnapshot();
     if (location.pathname === "/settings") {
       throw redirect({ to: "/settings/general", replace: true });
     }

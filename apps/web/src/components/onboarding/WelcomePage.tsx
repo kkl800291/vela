@@ -280,7 +280,7 @@ export function WelcomePage({
         <div className="min-h-0 flex-1 overflow-y-auto scrollbar-gutter-both">
           <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-6 pt-12 pb-8 sm:pt-20">
             <h1 className="text-2xl font-semibold tracking-tight text-foreground">
-              <T>Welcome to T3 Code</T>
+              <T>Welcome to Vela</T>
             </h1>
             <p className="mt-1.5 text-sm text-muted-foreground">
               <T>
@@ -303,7 +303,6 @@ export function WelcomePage({
                 projectImport={projectImport}
                 isImporting={isImporting}
               />
-              {showPhone ? <PhoneSection environmentId={environmentId} /> : null}
             </div>
             <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
               {agentReady ? (
@@ -335,7 +334,6 @@ export function WelcomePage({
                 </Button>
               </div>
             </div>
-            <TelemetryNotice environmentId={environmentId} />
           </div>
         </div>
       </div>
@@ -350,7 +348,7 @@ function TelemetryNotice({ environmentId }: { readonly environmentId: Environmen
     <p className="mt-auto pt-12 text-2xs leading-relaxed text-muted-foreground/70">
       {telemetryOff === undefined ? (
         <T>
-          T3 Code collects anonymous usage data to improve the app. To opt out, see the{" "}
+          Vela collects anonymous usage data to improve the app. To opt out, see the{" "}
           <a
             className="underline decoration-current/40 underline-offset-2 hover:text-muted-foreground"
             href={PRIVACY_POLICY_URL}
@@ -989,7 +987,7 @@ function PhoneSection({ environmentId }: { readonly environmentId: EnvironmentId
             <SmartphoneIcon className="size-4" />
           </RowIcon>
           <span className="min-w-0 flex-1 text-sm font-medium text-foreground">
-            <T>Use T3 Code on your phone</T>
+            <T>Use Vela on your phone</T>
           </span>
           <CollapsibleTrigger render={<Button variant="ghost-muted" size="xs" />}>
             {open ? gt("Hide") : gt("Set up")}
@@ -1015,7 +1013,7 @@ function PhoneSection({ environmentId }: { readonly environmentId: EnvironmentId
                 size={124}
                 level="M"
                 marginSize={2}
-                title={gt("T3 Code app for iPhone and Android")}
+                title={gt("Vela app for iPhone and Android")}
               />
             </div>
           </div>
@@ -1065,7 +1063,7 @@ function PhoneConnectLink({ environmentId }: { readonly environmentId: Environme
   if (isSignedIn && link === null && linkState.isPending) {
     return (
       <p className="text-sm text-muted-foreground">
-        <T>Checking T3 Connect…</T>
+        <T>Checking Vela Connect…</T>
       </p>
     );
   }
@@ -1073,9 +1071,9 @@ function PhoneConnectLink({ environmentId }: { readonly environmentId: Environme
     return (
       <>
         <p className="text-sm text-foreground">
-          <T>Could not check T3 Connect.</T>
+          <T>Could not check Vela Connect.</T>
         </p>
-        {settingsLink(gt("Check T3 Connect"))}
+        {settingsLink(gt("Check Vela Connect"))}
       </>
     );
   }
@@ -1090,7 +1088,7 @@ function PhoneConnectLink({ environmentId }: { readonly environmentId: Environme
   if (isSignedIn && shared && reachability === undefined) {
     return (
       <p className="text-sm text-foreground">
-        <T>T3 Connect is on for this computer. Sign in to the app with the same account.</T>
+        <T>Vela Connect is on for this computer. Sign in to the app with the same account.</T>
       </p>
     );
   }
@@ -1100,17 +1098,17 @@ function PhoneConnectLink({ environmentId }: { readonly environmentId: Environme
       <>
         <p className="text-sm text-foreground">
           {shared
-            ? gt("T3 Connect is on, but the app cannot reach this computer.")
+            ? gt("Vela Connect is on, but the app cannot reach this computer.")
             : gt("Signed in. Share this computer so the app can reach it.")}
         </p>
-        {settingsLink(shared ? gt("Check T3 Connect") : gt("Set up T3 Connect"))}
+        {settingsLink(shared ? gt("Check Vela Connect") : gt("Set up Vela Connect"))}
       </>
     );
   }
   return (
     <>
       <p className="text-sm text-foreground">
-        <T>Sign in to T3 Connect here, then in the app with the same account.</T>
+        <T>Sign in to Vela Connect here, then in the app with the same account.</T>
       </p>
       {loadFailed ? (
         <Button variant="outline" size="xs" onClick={retryClerkLoad}>
@@ -1118,7 +1116,7 @@ function PhoneConnectLink({ environmentId }: { readonly environmentId: Environme
         </Button>
       ) : (
         <Button variant="outline" size="xs" disabled={!isLoaded} onClick={openAuthPrompt}>
-          <T>Sign in to T3 Connect</T>
+          <T>Sign in to Vela Connect</T>
         </Button>
       )}
     </>

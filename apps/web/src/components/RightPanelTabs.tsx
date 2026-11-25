@@ -50,6 +50,7 @@ import {
   FileDiff,
   Files,
   Globe2,
+  Layers,
   MessagesSquare,
   Plus,
   TerminalSquare,
@@ -160,6 +161,7 @@ export interface RightPanelTabsProps {
   onAddDevice: () => void;
   /** Absent where side chats are not offered. */
   onAddSideChat?: (() => void) | undefined;
+  onAddDispatch?: (() => void) | undefined;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -168,6 +170,7 @@ export interface RightPanelTabsProps {
   pullRequestsAvailable: boolean;
   deviceAvailable: boolean;
   sideChatAvailable?: boolean;
+  dispatchAvailable?: boolean;
   /** Overrides the default reason while side chats are available but cannot start. */
   sideChatDisabledReason?: string | null;
   pullRequestStatusSeeds?: Readonly<Record<string, PullRequestTabStatusSeed>>;
@@ -189,7 +192,7 @@ function shouldOpenDefaultBrowserProfileFromMenuClick(pointerType: string | unde
 }
 
 const SURFACE_DISABLED_REASONS = {
-  browser: msg("Browser previews are only available in the T3 Code desktop app."),
+  browser: msg("Browser previews are only available in the Vela desktop app."),
   terminal: msg("Terminal surfaces are only available from a project thread."),
   files: msg("Files are only available when a project is open."),
   diff: msg("Diff is only available for server threads in Git repositories."),
@@ -346,6 +349,7 @@ function RightPanelEmptyState(props: {
   onAddDevice: () => void;
   /** Absent where side chats are not offered. */
   onAddSideChat?: (() => void) | undefined;
+  onAddDispatch?: (() => void) | undefined;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -354,6 +358,7 @@ function RightPanelEmptyState(props: {
   pullRequestsAvailable: boolean;
   deviceAvailable: boolean;
   sideChatAvailable: boolean;
+  dispatchAvailable?: boolean;
   sideChatDisabledReason: string | null;
 }) {
   const gt = useGT();
@@ -418,6 +423,19 @@ function RightPanelEmptyState(props: {
       disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.device),
       onClick: props.onAddDevice,
     },
+    ...(props.onAddDispatch
+      ? [
+          {
+            label: msg("Dispatch"),
+            description: msg("Run gated task cards with hard gates, independent review, and rollback."),
+            icon: Layers,
+            shortcut: "G",
+            available: props.dispatchAvailable === true,
+            disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.files),
+            onClick: props.onAddDispatch,
+          },
+        ]
+      : []),
     ...(props.onAddSideChat
       ? [
           {
@@ -618,6 +636,8 @@ function surfaceTitle(
       return `#${surface.number}`;
     case "pull-requests":
       return resolve(msg("Linked items"));
+    case "dispatch":
+      return resolve(msg("Dispatch"));
     case "issue":
       // A git host numbers its issues; a tracker with keys of its own, such as Linear, names them.
       return /^\d+$/.test(surface.key) ? `#${surface.key}` : surface.key;
@@ -719,6 +739,8 @@ function SurfaceIcon({
       );
     case "pull-requests":
       return <PullRequestGlyph.link className="size-3 shrink-0" />;
+    case "dispatch":
+      return <Layers className="size-3 shrink-0" />;
     case "issue":
       return <IssueSurfaceIcon surface={surface} environmentId={environmentId} />;
     case "thread":
@@ -1260,6 +1282,18 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: messages(SURFACE_DISABLED_REASONS.device),
       onClick: props.onAddDevice,
     },
+    ...(props.onAddDispatch
+      ? [
+          {
+            label: msg("Dispatch"),
+            icon: Layers,
+            shortcut: "G",
+            available: props.dispatchAvailable === true,
+            disabledReason: messages(SURFACE_DISABLED_REASONS.files),
+            onClick: props.onAddDispatch,
+          },
+        ]
+      : []),
     ...(props.onAddSideChat
       ? [
           {
@@ -1698,6 +1732,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddPullRequests={props.onAddPullRequests}
             onAddDevice={props.onAddDevice}
             onAddSideChat={props.onAddSideChat}
+            onAddDispatch={props.onAddDispatch}
             browserAvailable={props.browserAvailable}
             terminalAvailable={props.terminalAvailable}
             diffAvailable={props.diffAvailable}
@@ -1706,6 +1741,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             pullRequestsAvailable={props.pullRequestsAvailable}
             deviceAvailable={props.deviceAvailable}
             sideChatAvailable={props.sideChatAvailable === true}
+            dispatchAvailable={props.dispatchAvailable === true}
             sideChatDisabledReason={props.sideChatDisabledReason ?? null}
           />
         ) : (

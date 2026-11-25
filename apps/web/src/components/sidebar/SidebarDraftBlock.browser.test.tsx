@@ -1,3 +1,4 @@
+import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { EnvironmentId, MessageId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { Profiler } from "react";
@@ -11,8 +12,12 @@ import { SidebarDraftBlock, useSidebarDrafts } from "./SidebarDraftBlock";
 const NO_TERMINAL_LABELS: ReadonlyMap<string, string> = new Map();
 
 function DraftBlock(props: {
-  routeDraftId?: string | null;
-  terminalLabels?: ReadonlyMap<string, string>;
+  routeDraftId?: string | null | undefined;
+  terminalLabels?: ReadonlyMap<string, string> | undefined;
+  projectByKey?: ReadonlyMap<string, EnvironmentProject> | undefined;
+  projectDisplayNameByKey?: ReadonlyMap<string, string> | undefined;
+  variant?: "card" | "folder" | undefined;
+  navigationParent?: string | undefined;
 }) {
   const routeDraftId = props.routeDraftId ?? null;
   const terminalLabels = props.terminalLabels ?? NO_TERMINAL_LABELS;
@@ -23,9 +28,11 @@ function DraftBlock(props: {
       routeDraftComposer={routeDraftComposer}
       terminalLabels={terminalLabels}
       jumpLabelByDraftId={null}
-      projectByKey={new Map()}
-      projectDisplayNameByKey={new Map()}
+      projectByKey={props.projectByKey ?? new Map()}
+      projectDisplayNameByKey={props.projectDisplayNameByKey ?? new Map()}
       routeDraftId={routeDraftId}
+      variant={props.variant}
+      navigationParent={props.navigationParent}
       onNavigateToDraft={vi.fn()}
       onDraftContextMenu={vi.fn()}
     />
@@ -137,4 +144,60 @@ it("lists empty drafts by terminal label while their terminal exists, active or 
   await screen.rerender(block(null));
   await expect.element(rows).toHaveAccessibleName("dev, Unsent draft");
   expect(rows.elements()).toHaveLength(1);
+});
+
+it("renders compact folder draft rows without divider or repeated project name", async () => {
+  const initial = useComposerDraftStore.getState();
+  using _store = {
+    [Symbol.dispose]: () => useComposerDraftStore.setState(initial, true),
+  };
+  useComposerDraftStore.setState({
+    draftsByThreadKey: {},
+    draftThreadsByThreadKey: {},
+    logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+  });
+  const environmentId = EnvironmentId.make("draft-terminal-environment");
+  const terminalDraftId = DraftId.make("draft-folder-terminal");
+  initial.setProjectDraftThreadId(
+    scopeProjectRef(environmentId, ProjectId.make("terminal-project")),
+    terminalDraftId,
+    { threadId: ThreadId.make("terminal-thread") },
+  );
+
+  const terminalLabels = new Map([[`${environmentId}:terminal-thread`, "npm run dev"]]);
+  const projectByKey = new Map<string, EnvironmentProject>([
+    [
+      `${environmentId}:terminal-project`,
+      {
+        id: ProjectId.make("terminal-project"),
+        environmentId,
+        title: "Terminal Project",
+        workspaceRoot: "/projects/terminal-project",
+        repositoryIdentity: null,
+        defaultModelSelection: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        scripts: [],
+      },
+    ],
+  ]);
+  const projectDisplayNameByKey = new Map([[`${environmentId}:terminal-project`, "Terminal Project"]]);
+  await using screen = await render(
+    <ul>
+      <DraftBlock
+        routeDraftId={terminalDraftId}
+        terminalLabels={terminalLabels}
+        projectByKey={projectByKey}
+        projectDisplayNameByKey={projectDisplayNameByKey}
+        variant="folder"
+        navigationParent="folder:terminal-project"
+      />
+    </ul>,
+  );
+
+  const row = screen.getByTestId("sidebar-draft-row");
+  await expect.element(row).toHaveAttribute("data-sidebar-parent", "folder:terminal-project");
+  await expect.element(row).toHaveTextContent("npm run dev");
+  expect(row.element().textContent).not.toContain("Terminal Project");
+  await expect.element(screen.getByTestId("sidebar-draft-divider")).not.toBeInTheDocument();
 });

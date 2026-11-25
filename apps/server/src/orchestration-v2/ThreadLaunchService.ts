@@ -127,6 +127,8 @@ export interface ThreadLaunchInput {
   readonly delegatedFrom?: OrchestrationV2DelegatedFrom;
   /** The workflow run this thread is an agent step of. */
   readonly workflowRun?: OrchestrationV2WorkflowOrigin;
+  /** Parent thread when launched as an app-managed subagent outside `delegated_task.request`. */
+  readonly subagentParentThreadId?: ThreadId;
 }
 
 type PreparationInput = Pick<
@@ -1543,6 +1545,9 @@ const make = Effect.gen(function* () {
                   ? {}
                   : { delegatedFrom: input.delegatedFrom }),
                 ...(input.workflowRun === undefined ? {} : { workflowRun: input.workflowRun }),
+                ...(input.subagentParentThreadId === undefined
+                  ? {}
+                  : { subagentParentThreadId: input.subagentParentThreadId }),
                 createdBy: input.createdBy,
                 creationSource: input.creationSource,
                 ...(initialMessage === undefined

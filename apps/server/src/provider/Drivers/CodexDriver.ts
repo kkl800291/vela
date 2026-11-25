@@ -301,6 +301,7 @@ export const CodexDriver: ProviderDriver<
           Effect.flatMap((maintenanceCapabilities) =>
             enrichProviderSnapshotWithVersionAdvisory(snapshot, maintenanceCapabilities, {
               enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
+              registryUrl: settings.providerNpmRegistry,
             }),
           ),
           Effect.provideService(HttpClient.HttpClient, httpClient),

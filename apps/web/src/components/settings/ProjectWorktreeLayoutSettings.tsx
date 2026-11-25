@@ -119,7 +119,7 @@ function CheckoutWorktreeLayout({
       <p className="px-3 py-2.5 text-xs text-muted-foreground sm:px-4">
         {policyDenial ?? (
           <T>
-            This project's <code>t3.json</code> sets up worktree threads with its own commands. They
+            This project's <code>vela.json</code> sets up worktree threads with its own commands. They
             run on this environment's machine with your permissions, and only as approved here: a
             command whose text changes needs approval again.
           </T>

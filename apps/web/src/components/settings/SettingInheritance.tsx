@@ -152,7 +152,7 @@ export function settingInheritanceLayers(
   if (fileBacked && target.projectId !== null) {
     layers.push({
       key: "t3.json",
-      label: "t3.json",
+      label: "vela.json",
       value:
         source === "t3.json"
           ? formatValue(key, target.settings[key], resolve)

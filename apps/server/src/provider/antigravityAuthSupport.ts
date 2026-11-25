@@ -257,9 +257,10 @@ const antigravityUserConfigFiles = [
   ["AGENTS.md"],
   ["GEMINI.md"],
   ["config", "skills.json"],
+  ["config", "mcp_config.json"],
 ] as const;
 
-/** Private GEMINI_HOME isolates credentials/hooks/MCP; link global skills and rules from the real ~/.gemini. */
+/** Private GEMINI_HOME isolates credentials/hooks; link global skills, rules, and MCP config from the real ~/.gemini. */
 const linkAntigravityUserConfig = Effect.fn("linkAntigravityUserConfig")(function* (input: {
   readonly profileDirectory: string;
   readonly userHome: string;
@@ -299,16 +300,26 @@ const linkAntigravityUserConfig = Effect.fn("linkAntigravityUserConfig")(functio
       const existing = yield* fs.readLink(link).pipe(
         Effect.map((value): string | undefined => path.resolve(path.dirname(link), value)),
         Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
-        // An empty folder is the harness's placeholder from a launch without the link.
-        // rmdir refuses a non-empty folder, so content added meanwhile is never deleted.
+        // An empty folder or 0-byte file (e.g. CLI-generated empty mcp_config.json) is the
+        // harness's placeholder from a launch without the link. Never replace non-empty content.
         Effect.catch((error) =>
-          Effect.tryPromise({
-            try: () => NodeFSP.rmdir(link),
-            catch: (cause) => new AntigravitySkillLinkError({ link, cause }),
-          }).pipe(
-            Effect.as(undefined),
-            Effect.mapError(() => error),
-          ),
+          type === "file"
+            ? fs.stat(link).pipe(
+                Effect.filterOrFail(
+                  (info) => info.type === "File" && info.size === 0n,
+                  () => error,
+                ),
+                Effect.flatMap(() => fs.remove(link)),
+                Effect.as(undefined),
+                Effect.mapError(() => error),
+              )
+            : Effect.tryPromise({
+                try: () => NodeFSP.rmdir(link),
+                catch: (cause) => new AntigravitySkillLinkError({ link, cause }),
+              }).pipe(
+                Effect.as(undefined),
+                Effect.mapError(() => error),
+              ),
         ),
       );
       if (existing === target) return;
@@ -357,13 +368,14 @@ const copyAntigravityUserConfigFiles = Effect.fn("copyAntigravityUserConfigFiles
       const target = path.join(input.userHome, ".gemini", ...segments);
       yield* Effect.gen(function* () {
         const current = yield* readOptional(link);
-        if (current !== undefined && current !== copies[key]) {
+        // Treat a 0-byte file (e.g. CLI-created empty mcp_config.json) as a replaceable placeholder.
+        if (current !== undefined && current.length > 0 && current !== copies[key]) {
           delete copies[key];
           return;
         }
         const source = yield* readOptional(target);
         if (source === undefined) {
-          if (current !== undefined) yield* fs.remove(link);
+          if (current !== undefined && copies[key] !== undefined) yield* fs.remove(link);
           delete copies[key];
           return;
         }

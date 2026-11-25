@@ -609,6 +609,9 @@ const diagnose = (
         exists: (file) => Effect.succeed(files.includes(file)),
       }),
     ),
+    Effect.provideService(ProcessRunner.ProcessRunner, {
+      run: () => Effect.die("Android platform check must not spawn processes"),
+    }),
     Effect.provide(platform === "win32" ? NodePath.layerWin32 : NodePath.layerPosix),
   );
 
@@ -883,7 +886,12 @@ it.effect("keeps local Android and iOS available without ffmpeg", () =>
         HttpClient.make(() => Effect.die(new Error("Readiness must not make network requests"))),
       ),
       Effect.provideService(ProcessRunner.ProcessRunner, {
-        run: () => Effect.die("Platform availability must not probe emulator video"),
+        run: (input) =>
+          input.command === "xcrun" && input.args[0] === "--find" && input.args[1] === "simctl"
+            ? Effect.succeed(
+                processOutput(0, "/Applications/Xcode.app/Contents/Developer/usr/bin/simctl\n"),
+              )
+            : Effect.die("Platform availability must not probe emulator video"),
       }),
     );
     expect((yield* onTestHost(host.summary)).platforms).toEqual([
@@ -898,6 +906,44 @@ it.effect("keeps local Android and iOS available without ffmpeg", () =>
       platform: "ios",
       available: true,
     });
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("marks iOS unavailable on macOS when Command Line Tools xcrun lacks simctl", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-device-clt-" });
+    yield* fs.makeDirectory(`${baseDir}/bin`);
+    yield* fs.writeFileString(`${baseDir}/bin/xcrun`, "#!/bin/sh\nexit 72\n");
+    yield* fs.chmod(`${baseDir}/bin/xcrun`, 0o755);
+    const onTestHost = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.provideService(HostProcess.Environment, {
+          HOME: baseDir,
+          PATH: `${baseDir}/bin`,
+        }),
+        Effect.provideService(HostProcess.Platform, "darwin"),
+      );
+    const host = yield* LocalDeviceHost.make().pipe(
+      Effect.provide(Layer.mergeAll(ServerConfig.layerTest(baseDir, baseDir), NetService.layer)),
+      onTestHost,
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make(() => Effect.die(new Error("Readiness must not make network requests"))),
+      ),
+      Effect.provideService(ProcessRunner.ProcessRunner, {
+        run: (input) => {
+          expect(input.command).toBe("xcrun");
+          expect(input.args).toEqual(["--find", "simctl"]);
+          return Effect.succeed(
+            processOutput(72, "", 'xcrun: error: unable to find utility "simctl"'),
+          );
+        },
+      }),
+    );
+    const availability = yield* onTestHost(host.platformAvailability("ios"));
+    expect(availability.available).toBe(false);
+    expect(availability.reason).toContain("Xcode");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 

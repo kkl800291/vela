@@ -280,6 +280,17 @@ export function useComposerMenuItems({
               },
             ] as const)
           : []),
+        ...(gitCwd !== null && activeThreadId !== null
+          ? ([
+              {
+                id: "slash:dispatch",
+                type: "slash-command",
+                command: "dispatch",
+                label: "/dispatch",
+                description: gt("Break work into gated steps with review and one-click rollback"),
+              },
+            ] as const)
+          : []),
         ...(freshSessionAvailable
           ? ([
               {

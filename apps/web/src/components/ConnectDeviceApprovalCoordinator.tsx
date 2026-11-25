@@ -118,13 +118,13 @@ function NewConnectDeviceToast({
           ? m(
               msg("{device} connected through {product}. Not you? Review it.", {
                 device: describeConnectDeviceClient(first),
-                product: "T3 Connect",
+                product: "Vela Connect",
               }),
             )
           : m(
               msg(
                 "{count, plural, one {{count} device} other {{count} devices}} connected through {product}. Not you? Review them.",
-                { count: unseen.length, product: "T3 Connect" },
+                { count: unseen.length, product: "Vela Connect" },
               ),
             ),
       timeout: 0,

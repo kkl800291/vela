@@ -99,7 +99,7 @@ function T3ConnectEnvironmentRow(props: {
               </p>
               <p className="mt-4 max-w-xl text-xs leading-4.5 text-muted-foreground">
                 <T>
-                  T3 Connect access will be revoked, any managed tunnel will be removed, and a host
+                  Vela Connect access will be revoked, any managed tunnel will be removed, and a host
                   space will become available. Local connections on your devices are not changed.
                 </T>
               </p>
@@ -158,7 +158,7 @@ function T3ConnectTunnelUsage() {
               {tunnelUpgradeCopy(usage.upgrade, m)}{" "}
               {usage.upgrade === "link" ? (
                 <InlineButton disabled={t3Chat.pending !== null} onClick={() => void t3Chat.link()}>
-                  {t3Chat.pending === "link" ? gt("Opening…") : gt("Link T3 Chat")}
+                  {t3Chat.pending === "link" ? gt("Opening…") : gt("Link Vela Chat")}
                 </InlineButton>
               ) : (
                 <a
@@ -167,7 +167,7 @@ function T3ConnectTunnelUsage() {
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  <T>Upgrade on T3 Chat</T>
+                  <T>Upgrade on Vela Chat</T>
                 </a>
               )}
             </>
@@ -223,7 +223,7 @@ export function T3ConnectUserProfilePage() {
       toastManager.add({
         type: "success",
         title: gt("Server deregistered"),
-        description: gt("T3 Connect access was revoked and a host space is now available."),
+        description: gt("Vela Connect access was revoked and a host space is now available."),
       });
       return;
     }
@@ -274,7 +274,7 @@ export function T3ConnectUserProfilePage() {
 
   return (
     <ClerkUserProfilePage
-      title="T3 Connect"
+      title="Vela Connect"
       description={gt(
         "Environments registered to your account. Connections on this device are managed in Settings.",
       )}
@@ -291,7 +291,7 @@ export function T3ConnectUserProfilePage() {
         {environmentsState.error ? (
           <div className="mb-4 border-t border-destructive/35 py-3 text-xs" role="alert">
             <p className="font-medium text-destructive-foreground">
-              <T>Could not load T3 Connect environments</T>
+              <T>Could not load Vela Connect environments</T>
             </p>
             <p className="mt-1 text-xs text-muted-foreground">{environmentsState.error}</p>
           </div>
@@ -324,7 +324,7 @@ export function T3ConnectUserProfilePage() {
               </EmptyMedia>
               <EmptyHeader>
                 <EmptyTitle>
-                  <T>No T3 Connect environments</T>
+                  <T>No Vela Connect environments</T>
                 </EmptyTitle>
                 <EmptyDescription>
                   <T>

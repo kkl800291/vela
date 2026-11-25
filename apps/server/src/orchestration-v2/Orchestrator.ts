@@ -792,7 +792,7 @@ const WORKSPACE_PREPARATION_INPUT = "Preparing workspace";
 /** How long automatic settlement waits for a queued turn to start. */
 export const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
 const RUNTIME_REQUEST_DELIVERY_FAILED_MESSAGE =
-  "T3 Code could not confirm that your answer reached the agent. If the run stays stuck, stop it and try again.";
+  "Vela could not confirm that your answer reached the agent. If the run stays stuck, stop it and try again.";
 
 function withoutPreparationResult(
   item: Extract<OrchestrationV2TurnItem, { readonly type: "command_execution" }>,
@@ -4122,6 +4122,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
 
     const now = yield* DateTime.now;
+    const parentThread =
+      command.subagentParentThreadId === undefined
+        ? null
+        : yield* findThread(command.subagentParentThreadId);
+    const subagentParent =
+      parentThread !== null && parentThread.deletedAt === null ? parentThread : null;
     const emitEvent = emit(events, command);
     const thread: OrchestrationV2AppThread = {
       createdBy: command.createdBy,
@@ -4144,12 +4150,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ? {}
         : { delegatedFrom: command.delegatedFrom }),
       ...(command.workflowRun === undefined ? {} : { workflowRun: command.workflowRun }),
-      lineage: {
-        parentThreadId: null,
-        relationshipToParent: null,
-        rootThreadId: command.threadId,
-        ...(command.workflowRun === undefined ? {} : { workflowStep: true }),
-      },
+      lineage:
+        subagentParent !== null
+          ? {
+              parentThreadId: subagentParent.id,
+              relationshipToParent: "subagent",
+              rootThreadId: subagentParent.lineage.rootThreadId,
+            }
+          : {
+              parentThreadId: null,
+              relationshipToParent: null,
+              rootThreadId: command.threadId,
+              ...(command.workflowRun === undefined ? {} : { workflowStep: true }),
+            },
       forkedFrom: null,
       createdAt: now,
       updatedAt: now,

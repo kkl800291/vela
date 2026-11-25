@@ -110,11 +110,29 @@ interface RunningHost {
 
 const platformReason = Effect.fn("LocalDeviceHost.platformReason")(function* (
   platform: DevicePlatform,
-): Effect.fn.Return<string | null, never, FileSystem.FileSystem | Path.Path> {
+): Effect.fn.Return<
+  string | null,
+  never,
+  FileSystem.FileSystem | Path.Path | ProcessRunner.ProcessRunner
+> {
   const hostPlatform = yield* HostProcess.Platform;
   if (platform === "ios") {
     if (hostPlatform !== "darwin") return "iOS Simulators need macOS with Xcode.";
     if (!(yield* isCommandAvailable("xcrun"))) return "Xcode command line tools were not found.";
+    const runner = yield* ProcessRunner.ProcessRunner;
+    const environment = yield* HostProcess.Environment;
+    const simctl = yield* runner
+      .run({
+        command: "xcrun",
+        args: ["--find", "simctl"],
+        env: environment,
+        timeout: Duration.seconds(5),
+        timeoutBehavior: "timedOutResult",
+      })
+      .pipe(Effect.option);
+    if (Option.isNone(simctl) || simctl.value.timedOut || simctl.value.code !== 0) {
+      return "iOS Simulators need macOS with Xcode and working xcrun simctl.";
+    }
     return null;
   }
   const sdk = yield* androidSdk;
@@ -293,6 +311,7 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
     const reason = yield* platformReason(platform).pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
       Effect.provideService(Path.Path, path),
+      Effect.provideService(ProcessRunner.ProcessRunner, runner),
     );
     return reason === null ? { platform, available: true } : { platform, available: false, reason };
   });

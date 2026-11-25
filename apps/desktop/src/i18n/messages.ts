@@ -42,9 +42,11 @@ export function m(message: string, variables: Readonly<Record<string, string>> =
       ? undefined
       : activeCatalog[hashMessage(source, { ...options, $format: "ICU" })];
   // Untranslated text is English, so it takes English plural rules.
-  return target === undefined
-    ? gtFallback(source, { ...options, $locale: DEFAULT_LOCALE })
-    : gtFallback(target, { ...options, $locale: activeLocale, $_fallback: source });
+  const rendered =
+    target === undefined
+      ? gtFallback(source, { ...options, $locale: DEFAULT_LOCALE })
+      : gtFallback(target, { ...options, $locale: activeLocale, $_fallback: source });
+  return rendered.replaceAll("Vela", "Vela");
 }
 
 /** Runs `listener` after each switch to a different UI language. */

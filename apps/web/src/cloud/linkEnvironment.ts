@@ -69,7 +69,7 @@ const ensureRelayClientAvailable = Effect.fn("linkEnvironment.ensureRelayClientA
     if (status.status === "unsupported") {
       return yield* new CloudEnvironmentLinkError({
         message: m(
-          msg("T3 Code cannot install the relay client automatically on {platform}-{arch}.", {
+          msg("Vela cannot install the relay client automatically on {platform}-{arch}.", {
             platform: status.platform,
             arch: status.arch,
           }),
@@ -110,7 +110,7 @@ const ensureRelayClientAvailable = Effect.fn("linkEnvironment.ensureRelayClientA
         message:
           installedStatus.status === "unsupported"
             ? m(
-                msg("T3 Code cannot install the relay client automatically on {platform}-{arch}.", {
+                msg("Vela cannot install the relay client automatically on {platform}-{arch}.", {
                   platform: installedStatus.platform,
                   arch: installedStatus.arch,
                 }),
@@ -300,8 +300,8 @@ export const checkCloudReachability: (input: {
         request: ({ client, headers }) => client.checkReachability({ headers }),
       },
       {
-        message: msg("Could not check T3 Connect."),
-        withDetail: msg("Could not check T3 Connect: {detail}"),
+        message: msg("Could not check Vela Connect."),
+        withDetail: msg("Could not check Vela Connect: {detail}"),
       },
     );
   });
@@ -369,7 +369,7 @@ export const unlinkEnvironmentFromCloud: (input: {
           decodedRelayClientError(
             m(
               msg(
-                "Disconnected locally, but T3 Connect did not confirm it removed this environment",
+                "Disconnected locally, but Vela Connect did not confirm it removed this environment",
               ),
             ),
           ),

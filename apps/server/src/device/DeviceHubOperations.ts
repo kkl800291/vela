@@ -199,10 +199,14 @@ export const makeDeviceHubOperations = (options: {
     }
     const hubList = listed.value;
     const devices: Array<HostDevice> = [...hubList.simulators, ...hubList.emulators];
-    const androidAvailable = yield* options.platformAvailable("android");
+    const [iosAvailable, androidAvailable] = yield* Effect.all([
+      options.platformAvailable("ios"),
+      options.platformAvailable("android"),
+    ]);
     const warnings = hubList.errors?.filter(
       (error) =>
-        // The host summary already explains a missing Android SDK; the hub's failed probes are noise.
+        // The host summary already explains missing Xcode/simctl or Android SDK; failed hub probes are noise.
+        !(!iosAvailable && error.message.startsWith("[apple-utils] ")) &&
         !(!androidAvailable && error.message.startsWith("[android-utils] ")) &&
         // CoreSimulator can retain deleted devices; their optional usage timestamps are absent.
         !(
@@ -252,6 +256,7 @@ export const makeDeviceHubOperations = (options: {
       }
     }
     const simulatorsUnlisted =
+      iosAvailable &&
       hubList.simulators.length === 0 &&
       (hubList.errors ?? []).some((error) => SIMULATOR_LIST_FAILED.test(error.message));
     return {

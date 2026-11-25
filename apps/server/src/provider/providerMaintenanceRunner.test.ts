@@ -1373,7 +1373,12 @@ describe("providerMaintenanceRunner", () => {
       );
       assert.deepEqual(call.args, []);
       assert.strictEqual(call.shell, true);
-      assert.deepStrictEqual(call.env, { PATH: "C:\\fake\\npm" });
+      assert.deepStrictEqual(call.env, {
+        PATH: "C:\\fake\\npm",
+        npm_config_audit: "false",
+        npm_config_fund: "false",
+        npm_config_update_notifier: "false",
+      });
       assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
     }).pipe(
       Effect.provide(
@@ -1708,3 +1713,78 @@ it.effect("refuses incompatible latest versions and unapproved or unpinnable tar
     ),
   );
 });
+
+it("configures non-interactive npm flags and optional registry mirror on maintenance commands", () => {
+  const defaultEnv = ProviderMaintenanceRunner.buildMaintenanceCommandEnv(undefined, null)!;
+  assert.strictEqual(defaultEnv.npm_config_audit, "false");
+  assert.strictEqual(defaultEnv.npm_config_fund, "false");
+  assert.strictEqual(defaultEnv.npm_config_update_notifier, "false");
+
+  const nativeEnv = ProviderMaintenanceRunner.buildMaintenanceCommandEnv(
+    { CODEX_HOME: "/work/codex-home" },
+    null,
+    { executable: "codex", lockKey: "codex-native" },
+  );
+  assert.deepStrictEqual(nativeEnv, { CODEX_HOME: "/work/codex-home" });
+
+  const mirrored = ProviderMaintenanceRunner.buildMaintenanceCommandEnv(
+    { CUSTOM_FLAG: "1" },
+    "https://registry.npmmirror.com/",
+  )!;
+  assert.strictEqual(mirrored.CUSTOM_FLAG, "1");
+  assert.strictEqual(mirrored.npm_config_registry, "https://registry.npmmirror.com");
+  assert.strictEqual(mirrored.NPM_CONFIG_REGISTRY, "https://registry.npmmirror.com");
+
+  const preserved = ProviderMaintenanceRunner.buildMaintenanceCommandEnv(
+    { npm_config_registry: "https://custom.internal.npm", npm_config_audit: "true" },
+    "https://registry.npmmirror.com",
+  )!;
+  assert.strictEqual(preserved.npm_config_registry, "https://custom.internal.npm");
+  assert.strictEqual(preserved.npm_config_audit, "true");
+});
+
+it.effect("streams live output chunks while a maintenance command is running", () =>
+  Effect.gen(function* () {
+    const exit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+    const spawned = yield* Deferred.make<void>();
+    const spawner = ChildProcessSpawner.make(() =>
+      Deferred.succeed(spawned, undefined).pipe(
+        Effect.as(
+          ChildProcessSpawner.makeHandle({
+            pid: ChildProcessSpawner.ProcessId(1),
+            exitCode: Deferred.await(exit),
+            isRunning: Effect.succeed(true),
+            kill: () => Effect.void,
+            unref: Effect.succeed(Effect.void),
+            stdin: Sink.drain,
+            stdout: Stream.make(encoder.encode("fetching tarball\nunpacking package\n")),
+            stderr: Stream.empty,
+            all: Stream.empty,
+            getInputFd: () => Sink.drain,
+            getOutputFd: () => Stream.empty,
+          }),
+        ),
+      ),
+    );
+    const { registry, updateStatesRef } = yield* makeRegistry(baseOpenCodeProvider);
+    const updater = yield* makeTestRunner(registry).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerNonWindowsPlatform,
+          layerLatestVersionHttpClient("0.0.0"),
+          Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        ),
+      ),
+    );
+    const running = yield* updater.updateProvider(OPENCODE_DRIVER).pipe(Effect.forkChild);
+    yield* Deferred.await(spawned);
+    yield* TestClock.adjust("1 second");
+    const streamed = (yield* Ref.get(updateStatesRef)).find(
+      (state) => state.status === "running" && state.output !== null,
+    );
+    assert.strictEqual(streamed?.output, "fetching tarball\nunpacking package");
+    yield* Deferred.succeed(exit, ChildProcessSpawner.ExitCode(0));
+    const result = yield* Fiber.join(running);
+    assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
+  }),
+);

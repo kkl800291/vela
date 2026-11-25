@@ -12,9 +12,11 @@ import {
   ClientSettingsPatch,
   ClientServerSettingsPatch,
   ClaudeSettings,
+  DEFAULT_NPM_MIRROR_REGISTRY,
   DEFAULT_SERVER_SETTINGS,
   globalIdleCompaction,
   idleCompactionPatch,
+  normalizeProviderNpmRegistry,
   PROJECT_SCOPED_SERVER_SETTING_KEYS,
   requiredScopesForProjectMutation,
   resolveIdleCompaction,
@@ -553,5 +555,21 @@ describe("server model preferences", () => {
     const input = { favorites: [], providerModelPreferences: {} };
     expect(encodeServerSettings(decodeServerSettings(input))).toMatchObject(input);
     expect(decodeServerSettingsPatch(input)).toEqual(input);
+  });
+});
+
+describe("providerNpmRegistry normalization", () => {
+  it("normalizes valid http/https registries and rejects invalid values", () => {
+    expect(DEFAULT_SERVER_SETTINGS.providerNpmRegistry).toBe("");
+    expect(normalizeProviderNpmRegistry("")).toBeNull();
+    expect(normalizeProviderNpmRegistry("   ")).toBeNull();
+    expect(normalizeProviderNpmRegistry(`${DEFAULT_NPM_MIRROR_REGISTRY}/`)).toBe(
+      DEFAULT_NPM_MIRROR_REGISTRY,
+    );
+    expect(normalizeProviderNpmRegistry("http://localhost:4873/npm/")).toBe(
+      "http://localhost:4873/npm",
+    );
+    expect(normalizeProviderNpmRegistry("ftp://registry.example.com")).toBeNull();
+    expect(normalizeProviderNpmRegistry("not a url")).toBeNull();
   });
 });

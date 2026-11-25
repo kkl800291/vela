@@ -128,6 +128,7 @@ import {
 } from "./composerContextUndo";
 import { ComposerBanner } from "./ComposerBanner";
 import { ComposerSurface } from "./ComposerSurface";
+import { DispatchComposerBanner } from "./DispatchRightPanel";
 import { CollapsedComposerPromptPreview } from "./CollapsedComposerPromptPreview";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./ComposerBannerStack";
 import {
@@ -2099,6 +2100,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         }
         return;
       }
+      if (item.command === "dispatch") {
+        const applied = applyPromptReplacement(
+          trigger.rangeStart,
+          trigger.rangeEnd,
+          "请用 vela_dispatch_plan（action=\"publish\"，互相独立的任务设 dependsOn:[] 以便同时解锁并行执行，不要擅自启动 blind_check 子代理，未指定模型时省略 executor/reviewer）将以下需求拆成任务卡推到右侧派发面板，拆完停下等我确认：",
+          { expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd) },
+        );
+        if (applied) {
+          setComposerHighlightedItemId(null);
+          useRightPanelStore.getState().open(routeThreadRef, "dispatch");
+        }
+        return;
+      }
       if (item.command === "clear") {
         const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
           expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
@@ -3695,6 +3709,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       <ComposerBanner.Dock>
         <ComposerBanner.Column>
           <ComposerBannerStack items={shelfItems} />
+          <DispatchComposerBanner
+            workspaceRoot={gitCwd ?? undefined}
+            threadRef={routeThreadRef}
+            isMainAgentWorking={phase === "running" || phase === "connecting" || isSendBusy}
+          />
           {showComposerTopDrawer ? (
             <ComposerBanner.Attachment>
               <ComposerBanner.Root data-chat-composer-top-drawer="true" variant="info">

@@ -314,6 +314,28 @@ it.layer(
     ),
   );
 
+  it.effect("reads the latest version from a configured npm registry mirror", () =>
+    resolveLatestProviderVersion(manualPackageTool, {
+      registryUrl: "https://registry.npmmirror.com/",
+    }).pipe(
+      Effect.provide(ProviderLatestVersions.layer),
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make((request) => {
+          expect(request.url).toBe(
+            "https://registry.npmmirror.com/%40example%2Fpackage-tool/latest",
+          );
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(request, Response.json({ version: "2.4.0" })),
+          );
+        }),
+      ),
+      Effect.map((version) => {
+        expect(version).toBe("2.4.0");
+      }),
+    ),
+  );
+
   it.effect("gives up on a registry body that stalls after the headers", () =>
     Effect.gen(function* () {
       const lookup = yield* resolveLatestProviderVersion(manualPackageTool).pipe(

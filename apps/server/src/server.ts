@@ -37,6 +37,9 @@ import * as KeepAwake from "./background/KeepAwake.ts";
 import * as ServerConfig from "./config.ts";
 import { withRootRequestSpans, withUntracedRequests } from "./http.ts";
 import * as ServerHttp from "./http.ts";
+import * as UnifiedMcpRoutes from "./mcp/unifiedMcpRoutes.ts";
+import * as VelaDispatchRoutes from "./dispatch/velaDispatchRoutes.ts";
+import * as VelaDispatchService from "./dispatch/VelaDispatchService.ts";
 import {
   guardHttpResponseWriteErrors,
   keepIdleConnections,
@@ -813,7 +816,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
       AntigravityInstallation.AntigravityInstallation.layer.pipe(
         Layer.provide(layerServerSettings),
       ),
-      CodexInstallation.CodexInstallation.layer,
+      CodexInstallation.CodexInstallation.layer.pipe(Layer.provide(layerServerSettings)),
     ),
   ),
 );
@@ -912,6 +915,8 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerHttp.layerDesktopReadinessProofRoute,
     ServerHttp.layerAssetRoute,
     ServerHttp.layerAttachmentUploadRoute,
+    UnifiedMcpRoutes.layer,
+    VelaDispatchRoutes.layer,
     GuestHttp.layer,
     LinkThreadHttp.layer,
     DeviceHubProxy.layer,
@@ -966,7 +971,7 @@ const layerMakeRoutes = Layer.mergeAll(
   Layer.provide(layerServerSettings),
   Layer.provide(PreviewAutomationBroker.layer),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(layerDesktopAppUpdate))),
-  Layer.provide(ProviderMaintenanceRunner.layer),
+  Layer.provide(ProviderMaintenanceRunner.layer.pipe(Layer.provide(layerServerSettings))),
   Layer.provide(layerCommandReadiness),
   Layer.provide(ServerHttp.layerBrowserApiCors),
   Layer.provide(ServerHttp.layerHttpCompression),
@@ -1420,6 +1425,7 @@ const layerMakeServer = Layer.unwrap(
 
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
+      Layer.provide(VelaDispatchService.layer),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(

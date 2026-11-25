@@ -137,7 +137,7 @@ import { useSidebarProjectGroups } from "../hooks/useSidebarProjectGroups";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
 import { registerSettleAndAdvance } from "../settleAndAdvance";
 import { resolveThreadActionProjectRef, startNewThreadFromContext } from "../lib/chatThreadActions";
-import { useClientSettings } from "../hooks/useSettings";
+import { updateClientSettings, useClientSettings } from "../hooks/useSettings";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useLocalStorage } from "../hooks/useLocalStorage";
 import { useNowMinute } from "../hooks/useNowMinute";
@@ -860,6 +860,7 @@ function useSidebarLookups() {
     projects,
     serverConfigs,
     projectGroups,
+    hasMultipleEnvironments: environments.length > 1,
     environmentLabelById,
     providerEntriesByEnvironment,
     projectByKey,
@@ -933,6 +934,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     projects,
     serverConfigs,
     projectGroups,
+    hasMultipleEnvironments,
     environmentLabelById,
     providerEntriesByEnvironment,
     projectByKey,
@@ -1333,6 +1335,21 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     },
   );
 
+  const { draftIds, draftProjectKeyById, routeDraftComposer } = useSidebarDrafts(
+    scopedProjectKeys,
+    routeDraftIdForRows,
+    draftTerminalLabels,
+  );
+  // Draft rows sit above the threads, so jumps and traversal reach them first.
+  // Search hides them, so they drop out while it is open.
+  const listedDraftIds = isSearchingThreads ? EMPTY_DRAFT_IDS : draftIds;
+  const draftProjectKeys = new Set(
+    listedDraftIds.flatMap((id) => {
+      const key = draftProjectKeyById.get(id);
+      return key ? [key] : [];
+    }),
+  );
+
   const {
     workingShelfEnabled,
     pinnedThreads,
@@ -1386,7 +1403,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         : scopedProjectGroups
       : null,
     keepEmptyFolders: (group) =>
-      scopedProjectGroups.length > 0 || (group.pinned && !group.archived),
+      scopedProjectGroups.length > 0 ||
+      (group.pinned && !group.archived) ||
+      group.memberProjectRefs.some((ref) =>
+        draftProjectKeys.has(`${ref.environmentId}:${ref.projectId}`),
+      ),
   });
 
   // Ranked across environments as the palette ranks them, so one
@@ -1468,16 +1489,49 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   const settledThreadKeysRef = useRef(settledThreadKeys);
   const snoozedThreadKeysRef = useRef(snoozedThreadKeys);
 
-  const { draftIds, routeDraftComposer } = useSidebarDrafts(
-    scopedProjectKeys,
-    routeDraftIdForRows,
-    draftTerminalLabels,
-  );
-  // Draft rows sit above the threads, so jumps and traversal reach them first.
-  // Search hides them, so they drop out while it is open.
-  const listedDraftIds = isSearchingThreads ? EMPTY_DRAFT_IDS : draftIds;
   const draftIdByRowKey = new Map<string, DraftId>(listedDraftIds.map((id) => [`draft:${id}`, id]));
-  const orderedRowKeys = [...draftIdByRowKey.keys(), ...orderedThreadKeys];
+  const folderDraftsByProjectKey = new Map<string, { visible: DraftId[]; hiddenCount: number }>();
+  const unplacedDraftIds: DraftId[] = [];
+  if (projectFolders !== null) {
+    const folderByMemberProjectKey = new Map<string, (typeof projectFolders)[number]>();
+    for (const folder of projectFolders) {
+      folderDraftsByProjectKey.set(folder.group.projectKey, { visible: [], hiddenCount: 0 });
+      for (const ref of folder.group.memberProjectRefs) {
+        folderByMemberProjectKey.set(`${ref.environmentId}:${ref.projectId}`, folder);
+      }
+    }
+    for (const draftId of listedDraftIds) {
+      const draftProjectKey = draftProjectKeyById.get(draftId);
+      const folder = draftProjectKey ? folderByMemberProjectKey.get(draftProjectKey) : undefined;
+      if (!folder) {
+        unplacedDraftIds.push(draftId);
+        continue;
+      }
+      const bucket = folderDraftsByProjectKey.get(folder.group.projectKey)!;
+      if (folder.collapsed && draftId !== routeDraftIdForRows) {
+        bucket.hiddenCount += 1;
+      } else {
+        bucket.visible.push(draftId);
+      }
+    }
+  }
+  const orderedRowKeys =
+    projectFolders === null
+      ? [...draftIdByRowKey.keys(), ...orderedThreadKeys]
+      : [
+          ...unplacedDraftIds.map((id) => `draft:${id}`),
+          ...pinnedKeys,
+          ...projectFolders.flatMap((folder) => {
+            const folderDrafts = folderDraftsByProjectKey.get(folder.group.projectKey);
+            return [
+              ...(folderDrafts?.visible.map((id) => `draft:${id}`) ?? []),
+              ...folder.threads.map(threadShellKey),
+            ];
+          }),
+          ...visibleWorkingThreads.map(threadShellKey),
+          ...visibleSnoozedThreads.map(threadShellKey),
+          ...renderedSettledThreads.map(threadShellKey),
+        ];
   const routeDraftRowKey = `draft:${routeDraftIdForRows}`;
   const routeRowKey = draftIdByRowKey.has(routeDraftRowKey) ? routeDraftRowKey : routeRowThreadKey;
 
@@ -3092,6 +3146,10 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           <SidebarGroup className="z-[1]">
             <SidebarThreadHeader
               hasProjects={projectGroups.length > 0}
+              groupByProject={boringSidebarEnabled}
+              onToggleGroupByProject={() => {
+                void updateClientSettings({ boringSidebarEnabled: !boringSidebarEnabled });
+              }}
               projectScope={
                 <Combobox
                   items={projectScopeItems}
@@ -3380,7 +3438,11 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               `${thread.environmentId}:${thread.projectId}`,
                             ) ?? null
                           }
-                          environmentLabel={environmentLabelById.get(thread.environmentId) ?? null}
+                          environmentLabel={
+                            hasMultipleEnvironments
+                              ? (environmentLabelById.get(thread.environmentId) ?? null)
+                              : null
+                          }
                           environmentMachine={
                             environmentMachineById.get(thread.environmentId) ?? "server"
                           }
@@ -3590,7 +3652,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               showJumpHints ? (jumpLabelByKey.get(threadKey) ?? null) : null
                             }
                             environmentLabel={
-                              environmentLabelById.get(thread.environmentId) ?? null
+                              hasMultipleEnvironments
+                                ? (environmentLabelById.get(thread.environmentId) ?? null)
+                                : null
                             }
                             environmentMachine={
                               environmentMachineById.get(thread.environmentId) ?? "server"
@@ -3633,7 +3697,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                       const items: ReactNode[] = [
                         <SidebarDraftBlock
                           key="draft-sessions"
-                          draftIds={draftIds}
+                          draftIds={projectFolders === null ? listedDraftIds : unplacedDraftIds}
                           routeDraftComposer={routeDraftComposer}
                           terminalLabels={draftTerminalLabels}
                           jumpLabelByDraftId={draftJumpLabelById}
@@ -3653,17 +3717,39 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                         }
                         if (projectFolders !== null && item.marker === "active-placeholder") {
                           for (const folder of projectFolders) {
+                            const folderDrafts = folderDraftsByProjectKey.get(
+                              folder.group.projectKey,
+                            );
                             items.push(
                               <SidebarProjectFolderHeader
                                 key={`project-folder:${folder.group.projectKey}`}
                                 group={folder.group}
                                 collapsed={folder.collapsed}
                                 hiddenThreads={folder.hiddenThreads}
+                                hiddenDraftCount={folderDrafts?.hiddenCount ?? 0}
                                 onToggle={toggleProjectFolder}
                                 onNewThread={startThreadInProjectFolder}
                                 onContextMenu={handleProjectFolderContextMenu}
                               />,
                             );
+                            if (folderDrafts && folderDrafts.visible.length > 0) {
+                              items.push(
+                                <SidebarDraftBlock
+                                  key={`project-folder-drafts:${folder.group.projectKey}`}
+                                  draftIds={folderDrafts.visible}
+                                  routeDraftComposer={routeDraftComposer}
+                                  terminalLabels={draftTerminalLabels}
+                                  jumpLabelByDraftId={draftJumpLabelById}
+                                  projectByKey={projectByKey}
+                                  projectDisplayNameByKey={projectDisplayNameByKey}
+                                  routeDraftId={routeDraftIdForRows}
+                                  variant="folder"
+                                  navigationParent={sidebarFolderRowId(folder.group.projectKey)}
+                                  onNavigateToDraft={navigateToDraft}
+                                  onDraftContextMenu={handleDraftContextMenu}
+                                />,
+                              );
+                            }
                             for (const thread of folder.threads) {
                               items.push(
                                 renderThreadRow(

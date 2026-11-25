@@ -67,6 +67,8 @@ import { useUsageLimitsPanel } from "./chat/useUsageLimitsPanel";
 import { useWorktreeSetup } from "./chat/useWorktreeSetup";
 import { useChatShortcuts } from "./chat/useChatShortcuts";
 import { ChatBannerLane } from "./chat/ChatBannerLane";
+import { DispatchInlinePlanCard } from "./chat/dispatch/DispatchInlinePlanCard";
+import { useVelaDispatchState } from "../state/velaDispatch";
 import * as Schema from "effect/Schema";
 import {
   AuthOrchestrationOperateScope,
@@ -2534,6 +2536,7 @@ export default function ChatView(props: ChatViewProps) {
     activateRightPanelSurfaceStable,
     addDeviceSurfaceStable,
     addDiffSurfaceStable,
+    addDispatchSurfaceStable,
     addFilesSurfaceStable,
     addPullRequestSurfaceStable,
     addPullRequestsSurfaceStable,
@@ -3041,7 +3044,7 @@ export default function ChatView(props: ChatViewProps) {
         : serverConfig === null
           ? gt("Side chats are not ready yet. Try again in a moment.")
           : serverConfig.environment.capabilities.sideChats !== true
-            ? gt("Update this environment's T3 Code server to use side chats.")
+            ? gt("Update this environment's Vela server to use side chats.")
             : sideChatsOffered && !isServerThread
               ? gt("Side chats start after the first message.")
               : sideChat.available &&
@@ -3221,6 +3224,27 @@ export default function ChatView(props: ChatViewProps) {
     void onSend(undefined, "auto", "foreground", { annotation, image });
   };
   const sendPreviewAnnotationStable = useStableCallback(sendPreviewAnnotation);
+  const sendDispatchPrompt = async (prompt: string): Promise<boolean> => {
+    const draft = useComposerDraftStore.getState().getComposerDraft(composerDraftTarget);
+    if (composerDraftHasUserContent(draft)) return false;
+    const sendContext = composerRef.current?.getSendContext();
+    if (!sendContext) return false;
+    await onSend(undefined, "auto", "foreground", undefined, {
+      prompt,
+      sendContext: {
+        ...sendContext,
+        images: [],
+        files: [],
+        terminalContexts: [],
+        previewAnnotations: [],
+        reviewComments: [],
+        threadContexts: [],
+        environmentContexts: [],
+      },
+    });
+    return true;
+  };
+  const sendDispatchPromptStable = useStableCallback(sendDispatchPrompt);
   const onComposerResumeStable = useStableCallback(onResume);
   const onComposerCompactContextStable = useStableCallback(onCompactContext);
   // Read from the projection the footer renders, so the scroll below sees the new message.
@@ -3349,15 +3373,37 @@ export default function ChatView(props: ChatViewProps) {
     ]
       .filter((part) => part !== null)
       .join(" · ") || null;
-  // The end of the timeline holds the thread's present and next turns: what it is doing now,
-  // its lifecycle status, guest messages awaiting you, then your queued messages.
+  const dispatchInlineWorkspaceRoot =
+    !embedded && !isProviderSubagent && parentSubagentThreadRef === null
+      ? (gitCwd ?? undefined)
+      : undefined;
+  const { state: inlineDispatchState } = useVelaDispatchState(
+    dispatchInlineWorkspaceRoot,
+    dispatchInlineWorkspaceRoot ? routeThreadRef.threadId : undefined,
+  );
+  const hasInlineDispatchCard =
+    !isWorking &&
+    inlineDispatchState !== null &&
+    (inlineDispatchState.steps.length > 0 || inlineDispatchState.blindCheck !== null);
+  // The end of the timeline holds the thread's present and next turns: inline dispatch plan card,
+  // what it is doing now, its lifecycle status, guest messages awaiting you, then your queued messages.
   const timelineFooter =
+    !hasInlineDispatchCard &&
     pendingHandoff === null &&
     !hasThreadNow &&
     threadStatusLine === null &&
     pendingGuestMessageCount === 0 &&
     !hasQueuedTurns ? null : (
       <>
+        {hasInlineDispatchCard && dispatchInlineWorkspaceRoot && inlineDispatchState ? (
+          <div className="chat-content-lane pt-2 pb-1">
+            <DispatchInlinePlanCard
+              workspaceRoot={dispatchInlineWorkspaceRoot}
+              threadRef={routeThreadRef}
+              state={inlineDispatchState}
+            />
+          </div>
+        ) : null}
         {pendingHandoff === null ? null : (
           <div className="chat-content-lane">
             <HandoffRow
@@ -3456,6 +3502,10 @@ export default function ChatView(props: ChatViewProps) {
       onSendAnnotation={sendPreviewAnnotationStable}
       onCloseSurface={closeRightPanelSurface}
       sideChatParentPanel={sideChatParentPanel}
+      dispatch={{
+        isServerThread,
+        sendPrompt: sendDispatchPromptStable,
+      }}
       terminal={{
         launchContext: activeTerminalLaunchContext ?? null,
         keybindings,
@@ -3561,7 +3611,7 @@ export default function ChatView(props: ChatViewProps) {
             ref={threadPanelPopoverAnchorRef}
             data-chat-header
             className={cn(
-              "relative bg-background [[data-panel-animations=true]_&]:motion-safe:transition-[padding-left] [[data-panel-animations=true]_&]:motion-safe:duration-(--panel-animation-duration) [[data-panel-animations=true]_&]:motion-safe:ease-out",
+              "relative bg-background [[data-panel-animations=true]_&]:motion-safe:transition-[padding-left] [[data-panel-animations=true]_&]:motion-safe:duration-(--panel-animation-duration) [[data-panel-animations=true]_&]:motion-safe:ease-drawer",
               isElectron
                 ? cn(
                     "drag-region flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center px-3 sm:px-5",
@@ -4270,6 +4320,7 @@ export default function ChatView(props: ChatViewProps) {
           onAddPullRequests={addPullRequestsSurfaceStable}
           onAddDevice={addDeviceSurfaceStable}
           onAddSideChat={sideChatsOffered ? openSideChatStable : undefined}
+          onAddDispatch={addDispatchSurfaceStable}
           browserAvailable={canOperatePreview && browserAvailable}
           terminalAvailable={activeProject !== null && canOperateTerminal}
           diffAvailable={isServerThread && diffAvailable}
@@ -4278,6 +4329,7 @@ export default function ChatView(props: ChatViewProps) {
           pullRequestsAvailable={linkedItemsSurfaceAvailable}
           deviceAvailable={activeThreadRef !== null}
           sideChatAvailable={sideChat.available}
+          dispatchAvailable={activeProject !== null}
           sideChatDisabledReason={sideChatDisabledReason}
         >
           {rightPanelContent}

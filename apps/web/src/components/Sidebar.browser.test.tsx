@@ -27,6 +27,7 @@ import { useThreadRouteTarget } from "../hooks/useThreadRouteTarget";
 import { useProjects, useServerConfigs, useQuietThreadShells } from "../state/entities";
 import { useConnectedEnvironmentIds, usePrimaryEnvironmentId } from "../state/environments";
 import { readEnvironmentScope, useEnvironmentScope } from "../state/session";
+import { useTerminalLabelsByThreadKey } from "../state/terminalSessions";
 import { useOrchestrationCommand } from "../state/use-orchestration-command";
 import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { readLocalApi } from "../localApi";
@@ -47,6 +48,7 @@ vi.mock("../hooks/useNowMinute", { spy: true });
 vi.mock("../hooks/useThreadRouteTarget", { spy: true });
 vi.mock("./sidebar/SidebarThreadRow", { spy: true });
 vi.mock("../state/session", { spy: true });
+vi.mock("../state/terminalSessions", { spy: true });
 vi.mock("../state/use-orchestration-command", { spy: true });
 vi.mock("../localApi", { spy: true });
 vi.mock(import("../state/server"), async (original) => {
@@ -199,6 +201,7 @@ describe("sidebar numbered jumps", () => {
     const initial = useComposerDraftStore.getState();
     using stack = new DisposableStack();
     stack.defer(() => useComposerDraftStore.setState(initial, true));
+    stack.defer(() => vi.mocked(useTerminalLabelsByThreadKey).mockRestore());
     const previousSettings = getClientSettings();
     stack.defer(() => __setClientSettingsForTests(previousSettings));
     __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
@@ -248,6 +251,67 @@ describe("sidebar numbered jumps", () => {
     await vi.waitFor(() =>
       expect(screen.router!.state.location.pathname).not.toBe(`/draft/${draftId}`),
     );
+    await userEvent.keyboard("{Control>}1{/Control}");
+    await vi.waitFor(() =>
+      expect(screen.router!.state.location.pathname).toBe(`/draft/${draftId}`),
+    );
+  });
+
+  it("places terminal-only unsent drafts inside their project folder with ordered jump hints", async () => {
+    const initial = useComposerDraftStore.getState();
+    using stack = new DisposableStack();
+    stack.defer(() => useComposerDraftStore.setState(initial, true));
+    stack.defer(() => vi.mocked(useTerminalLabelsByThreadKey).mockRestore());
+    const previousSettings = getClientSettings();
+    stack.defer(() => __setClientSettingsForTests(previousSettings));
+    __setClientSettingsForTests({ ...DEFAULT_CLIENT_SETTINGS, boringSidebarEnabled: true });
+    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+    const web = project("web");
+    vi.mocked(useProjects).mockReturnValue([web]);
+    const thread = threadShell(web.id, 0);
+    vi.mocked(useQuietThreadShells).mockReturnValue([thread]);
+    const threadRef = scopeThreadRef(thread.environmentId, thread.id);
+    vi.mocked(useThreadRouteTarget).mockReturnValue({ kind: "server", threadRef });
+    vi.mocked(useHandleNewThread).mockReturnValue({
+      activeDraftThread: null,
+      activeThread: null,
+      defaultProjectRef: null,
+      defaultProjectFallbackReady: true,
+      handleNewThread: vi.fn(),
+      routeDraftId: null,
+      routeThreadRef: threadRef,
+    });
+    const draftId = DraftId.make("terminal-draft");
+    const draftThreadId = ThreadId.make("terminal-draft-thread");
+    initial.setProjectDraftThreadId(scopeProjectRef(web.environmentId, web.id), draftId, {
+      threadId: draftThreadId,
+      createdAt: "2026-01-02T00:00:00.000Z",
+    });
+    vi.mocked(useTerminalLabelsByThreadKey).mockReturnValue(
+      new Map([[`${web.environmentId}:${draftThreadId}`, "npm run dev"]]),
+    );
+
+    await using screen = await render(
+      <SidebarProvider>
+        <Sidebar routeReveal={{ observedKey: null, pendingKey: null }} />
+      </SidebarProvider>,
+    );
+
+    const draftRow = screen.getByTestId("sidebar-draft-row");
+    await expect.element(draftRow).toBeInTheDocument();
+    await expect.element(draftRow).toHaveTextContent("npm run dev");
+    const threadRow = screen.getByTestId("sidebar-row-folder");
+    await expect.element(threadRow).toBeInTheDocument();
+    const folderParent = threadRow.element().getAttribute("data-sidebar-parent");
+    expect(folderParent).toBeTruthy();
+    expect(draftRow.element().getAttribute("data-sidebar-parent")).toBe(folderParent);
+    await expect.element(screen.getByTestId("sidebar-draft-divider")).not.toBeInTheDocument();
+
+    await userEvent.keyboard("{Control>}");
+    await expect.element(draftRow.getByText("Ctrl+1")).toBeVisible();
+    await expect.element(threadRow.getByText("Ctrl+2")).toBeVisible();
+    await userEvent.keyboard("{/Control}");
+
     await userEvent.keyboard("{Control>}1{/Control}");
     await vi.waitFor(() =>
       expect(screen.router!.state.location.pathname).toBe(`/draft/${draftId}`),

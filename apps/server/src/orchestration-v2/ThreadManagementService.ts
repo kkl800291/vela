@@ -97,6 +97,7 @@ export function withCreationProvenance(
         delegatedFrom: _delegatedFrom,
         initialMessage: _initialMessage,
         workflowRun: _workflowRun,
+        subagentParentThreadId: _subagentParentThreadId,
         ...rest
       } = command;
       return { ...rest, ...provenance };

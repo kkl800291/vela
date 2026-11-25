@@ -7,6 +7,7 @@ import {
   type ServerProviderUpdatedPayload,
   type ServerProviderUpdateState,
 } from "@t3tools/contracts";
+import { normalizeProviderNpmRegistry } from "@t3tools/contracts/settings";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -15,6 +16,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
@@ -23,6 +25,7 @@ import { HttpClient } from "effect/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as NodeUtil from "node:util";
 
+import * as ServerSettings from "../serverSettings.ts";
 import * as ModelManifest from "./ModelManifest.ts";
 import * as ProviderInstallationGate from "./ProviderInstallationGate.ts";
 import * as ProviderRegistry from "./ProviderRegistry.ts";
@@ -41,11 +44,57 @@ import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStr
 const isServerProviderUpdateError = Schema.is(ServerProviderUpdateError);
 
 const UPDATE_OUTPUT_MAX_BYTES = 10_000;
+const UPDATE_LIVE_OUTPUT_MAX_BYTES = 4_096;
 // Sample installer output because every progress update resends the provider list to all clients.
 const UPDATE_PROGRESS_INTERVAL = Duration.seconds(1);
 const UPDATE_PROGRESS_MAX_LENGTH = 200;
 // An installer may write for minutes without a line ending; only its tail matters.
 const UPDATE_PARTIAL_LINE_MAX_LENGTH = 4_096;
+
+export interface ProviderMaintenanceCommandProgress {
+  readonly line: string;
+  readonly output: string | null;
+}
+
+function isPackageManagerMaintenanceAction(
+  command: Pick<ProviderMaintenanceCommandAction, "executable" | "lockKey">,
+): boolean {
+  if (
+    /^(?:npm-global|pnpm-global|bun-global|vite-plus-global|yarn-global|volta|acp)/i.test(
+      command.lockKey,
+    )
+  ) {
+    return true;
+  }
+  const executable = command.executable.split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  return /^(?:npm|pnpm|bun|yarn|pi|npx|pnpx)(?:\.cmd|\.exe)?$/.test(executable);
+}
+
+export function buildMaintenanceCommandEnv(
+  baseEnv: NodeJS.ProcessEnv | undefined,
+  configuredRegistry: string | null,
+  action?: Pick<ProviderMaintenanceCommandAction, "executable" | "lockKey">,
+): NodeJS.ProcessEnv | undefined {
+  const isPackageManager = action === undefined || isPackageManagerMaintenanceAction(action);
+  const registry =
+    normalizeProviderNpmRegistry(configuredRegistry) ??
+    normalizeProviderNpmRegistry(process.env.VELA_NPM_REGISTRY);
+  if (!isPackageManager && !registry) {
+    return baseEnv;
+  }
+  const merged: NodeJS.ProcessEnv = { ...baseEnv };
+  if (isPackageManager) {
+    // Skip slow interactive/telemetry checks when Vela runs package-manager CLIs non-interactively.
+    merged.npm_config_audit ??= "false";
+    merged.npm_config_fund ??= "false";
+    merged.npm_config_update_notifier ??= "false";
+  }
+  if (registry) {
+    merged.npm_config_registry ??= registry;
+    merged.NPM_CONFIG_REGISTRY ??= registry;
+  }
+  return merged;
+}
 
 export interface ProviderMaintenanceCommandResult {
   readonly stdout: string;
@@ -106,7 +155,7 @@ const runProviderMaintenanceCommandWithSpawner = Effect.fn("ProviderMaintenanceR
     readonly command: string;
     readonly args: ReadonlyArray<string>;
     readonly env?: NodeJS.ProcessEnv;
-    readonly onProgress?: (line: string) => Effect.Effect<void>;
+    readonly onProgress?: (progress: ProviderMaintenanceCommandProgress) => Effect.Effect<void>;
   }) {
     const collectCommandResult = Effect.fn("ProviderMaintenanceRunner.collectCommandResult")(
       function* () {
@@ -133,11 +182,40 @@ const runProviderMaintenanceCommandWithSpawner = Effect.fn("ProviderMaintenanceR
           );
         yield* Effect.addFinalizer(() => child.kill().pipe(Effect.ignore));
 
-        const pendingProgress = yield* Ref.make<string | null>(null);
+        const pendingProgress = yield* Ref.make<ProviderMaintenanceCommandProgress | null>(null);
+        const liveOutputLines: Array<string> = [];
+        let lastEmittedKey: string | null = null;
+        const appendLiveOutput = (lines: ReadonlyArray<string>, activeLine: string | null) => {
+          for (const rawLine of lines) {
+            const clean = toProgressLine(rawLine);
+            if (!clean) continue;
+            if (liveOutputLines.at(-1) !== clean) {
+              liveOutputLines.push(clean);
+            }
+          }
+          if (liveOutputLines.length > 60) {
+            liveOutputLines.splice(0, liveOutputLines.length - 60);
+          }
+          const combined =
+            activeLine && liveOutputLines.at(-1) !== activeLine
+              ? [...liveOutputLines, activeLine].join("\n")
+              : liveOutputLines.join("\n");
+          const trimmed = combined.trim();
+          if (!trimmed) return null;
+          return trimmed.length <= UPDATE_LIVE_OUTPUT_MAX_BYTES
+            ? trimmed
+            : trimmed.slice(-UPDATE_LIVE_OUTPUT_MAX_BYTES);
+        };
         const onProgress = input.onProgress;
         if (onProgress) {
           yield* Ref.getAndSet(pendingProgress, null).pipe(
-            Effect.flatMap((line) => (line === null ? Effect.void : onProgress(line))),
+            Effect.flatMap((progress) => {
+              if (progress === null) return Effect.void;
+              const nextKey = `${progress.line}\0${progress.output ?? ""}`;
+              if (nextKey === lastEmittedKey) return Effect.void;
+              lastEmittedKey = nextKey;
+              return onProgress(progress);
+            }),
             Effect.repeat(Schedule.spaced(UPDATE_PROGRESS_INTERVAL)),
             Effect.forkScoped,
           );
@@ -152,10 +230,13 @@ const runProviderMaintenanceCommandWithSpawner = Effect.fn("ProviderMaintenanceR
             Stream.tap((chunk) => {
               const split = splitOutputLines(partialLine, decoder.decode(chunk, { stream: true }));
               partialLine = split.partialLine;
-              const line =
+              const activeLine =
                 toProgressLine(split.partialLine) ??
-                split.lines.map(toProgressLine).findLast((value) => value !== null);
-              return line ? Ref.set(pendingProgress, line) : Effect.void;
+                split.lines.map(toProgressLine).findLast((value) => value !== null) ??
+                null;
+              const output = appendLiveOutput(split.lines, activeLine);
+              if (!activeLine) return Effect.void;
+              return Ref.set(pendingProgress, { line: activeLine, output });
             }),
           );
         };
@@ -301,17 +382,27 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
   const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
   const serviceScope = yield* Effect.scope;
   const installationGate = yield* ProviderInstallationGate.ProviderInstallationGate;
+  const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
+  const readConfiguredRegistry = Option.isSome(serverSettings)
+    ? serverSettings.value.getSettings.pipe(
+        Effect.map((settings) => normalizeProviderNpmRegistry(settings.providerNpmRegistry)),
+        Effect.orElseSucceed(() => null),
+      )
+    : Effect.succeed(null);
   const runMaintenanceCommand = (
     update: ProviderMaintenanceCommandAction,
-    onProgress: (line: string) => Effect.Effect<void>,
-  ) =>
-    runProviderMaintenanceCommandWithSpawner({
+    configuredRegistry: string | null,
+    onProgress: (progress: ProviderMaintenanceCommandProgress) => Effect.Effect<void>,
+  ) => {
+    const commandEnv = buildMaintenanceCommandEnv(update.env, configuredRegistry, update);
+    return runProviderMaintenanceCommandWithSpawner({
       spawner,
       command: update.executable,
       args: update.args,
       onProgress,
-      ...(update.env ? { env: update.env } : {}),
+      ...(commandEnv ? { env: commandEnv } : {}),
     });
+  };
   // Instances with other homes or accounts can still run the binary this update replaces. The
   // lock key names the package manager location, so other drivers there keep their own package.
   const instancesSharingInstallation = Effect.fn(
@@ -348,6 +439,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
     maintenanceCapabilities: ProviderMaintenanceCapabilities,
     instanceId: ProviderInstanceId,
     phase: "pre-update" | "post-update",
+    registryUrl?: string | null,
   ): Effect.Effect<VerifiedProviderRefresh> =>
     refresh.pipe(
       Effect.flatMap((providers) => {
@@ -364,10 +456,10 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
         return Effect.forEach(
           refreshedProviders,
           (refreshedProvider) =>
-            enrichProviderSnapshotWithVersionAdvisory(
-              refreshedProvider,
-              maintenanceCapabilities,
-            ).pipe(
+            enrichProviderSnapshotWithVersionAdvisory(refreshedProvider, maintenanceCapabilities, {
+              enableProviderUpdateChecks: true,
+              registryUrl,
+            }).pipe(
               Effect.provideService(HttpClient.HttpClient, httpClient),
               Effect.provideService(ProviderLatestVersions.ProviderLatestVersions, latestVersions),
             ),
@@ -451,15 +543,17 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
           function* () {
             const startedAt = yield* nowIso;
             yield* Ref.set(startedAtRef, startedAt);
-            const setRunningMessage = (message: string) =>
+            const setRunningProgress = (message: string, output: string | null = null) =>
               setUpdateState(
                 makeUpdateState({
                   status: "running",
                   startedAt,
                   finishedAt: null,
                   message,
+                  output,
                 }),
               ).pipe(Effect.asVoid);
+            const setRunningMessage = (message: string) => setRunningProgress(message, null);
             yield* setRunningMessage("Checking for the latest version");
 
             // Recheck ownership after acquiring the cached lock in case the executable changed.
@@ -479,12 +573,17 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
               );
             }
 
+            const configuredRegistry = yield* readConfiguredRegistry;
             const manifest = yield* manifestService.current;
             // Check compatibility against what an unpinned command would install now.
             const candidateVersion =
               targetVersion ??
-              (yield* invalidateLatestProviderVersion(fresh).pipe(
-                Effect.andThen(resolveLatestProviderVersion(fresh)),
+              (yield* invalidateLatestProviderVersion(fresh, {
+                registryUrl: configuredRegistry,
+              }).pipe(
+                Effect.andThen(
+                  resolveLatestProviderVersion(fresh, { registryUrl: configuredRegistry }),
+                ),
                 Effect.provideService(HttpClient.HttpClient, httpClient),
                 Effect.provideService(
                   ProviderLatestVersions.ProviderLatestVersions,
@@ -515,7 +614,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                   message:
                     targetVersion !== undefined
                       ? "This version is no longer recommended or this installer cannot install a specific version. Refresh provider settings."
-                      : "The latest provider version is incompatible with this T3 Code release. Review provider settings.",
+                      : "The latest provider version is incompatible with this Vela release. Review provider settings.",
                 }),
               );
             }
@@ -530,6 +629,7 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                 fresh,
                 instanceId,
                 "pre-update",
+                configuredRegistry,
               );
               const alreadyCurrent =
                 precheck.advisoryEnriched &&
@@ -565,7 +665,11 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
             const result = yield* installationGate.update(
               sharingInstances,
               setRunningMessage(`Running ${describeCommand(command)}`).pipe(
-                Effect.andThen(runMaintenanceCommand(command, setRunningMessage)),
+                Effect.andThen(
+                  runMaintenanceCommand(command, configuredRegistry, ({ line, output }) =>
+                    setRunningProgress(line, output),
+                  ),
+                ),
               ),
             );
             const finishedAt = yield* nowIso;
@@ -593,15 +697,20 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
               provider,
               { fresh: true },
             );
-            yield* invalidateLatestProviderVersion(verified).pipe(
+            yield* invalidateLatestProviderVersion(verified, {
+              registryUrl: configuredRegistry,
+            }).pipe(
               Effect.provideService(ProviderLatestVersions.ProviderLatestVersions, latestVersions),
             );
             const { verifiedProviders } = yield* verifyFromRefresh(
-              providerRegistry.refreshAfterUpdate(provider, instanceId),
+              providerRegistry.refreshAfterUpdate(provider, instanceId, {
+                skipMaintenanceRefresh: true,
+              }),
               provider,
               verified,
               instanceId,
               "post-update",
+              configuredRegistry,
             );
             // Cursor about probes can fail transiently; missing versions alone do not imply failure.
             const couldNotVerify =
@@ -629,9 +738,9 @@ export const make = Effect.fn("ProviderMaintenanceRunner.make")(function* () {
                 startedAt,
                 finishedAt,
                 message: couldNotVerify
-                  ? "Update command completed, but T3 Code could not verify the provider version."
+                  ? "Update command completed, but Vela could not verify the provider version."
                   : stillOutdated
-                    ? "Update command completed, but T3 Code still detects an outdated provider version."
+                    ? "Update command completed, but Vela still detects an outdated provider version."
                     : needsOpenCodeServerRestart(verifiedProviders)
                       ? OPENCODE_SERVER_RESTART_MESSAGE
                       : "Provider updated.",

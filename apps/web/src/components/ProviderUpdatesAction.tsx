@@ -78,6 +78,10 @@ export function useProviderUpdates() {
   const updateProvider = useAtomCommand(serverEnvironment.updateProvider, {
     reportFailure: false,
   });
+  const [progress, setProgress] = useState<{
+    readonly completed: number;
+    readonly total: number;
+  } | null>(null);
   const machines = environments.flatMap((environment) => {
     const providers = providersByEnvironment.get(environment.environmentId) ?? [];
     if (
@@ -95,37 +99,53 @@ export function useProviderUpdates() {
   });
 
   const updateAll = async ({ quiet = false }: { readonly quiet?: boolean } = {}) => {
-    const runs = await Promise.all(
-      machines.flatMap(({ environmentId, label, candidates }) =>
-        candidates.map(async (candidate): Promise<ProviderUpdateRun> => ({
-          environmentId,
-          machineLabel: label,
-          driver: candidate.driver,
-          instanceId: candidate.instanceId,
-          result: await updateProvider({
-            environmentId,
-            input: { provider: candidate.driver, instanceId: candidate.instanceId },
-          }),
-        })),
-      ),
+    const tasks = machines.flatMap(({ environmentId, label, candidates }) =>
+      candidates.map((candidate) => ({ environmentId, label, candidate })),
     );
-    const view = quiet ? null : getProviderUpdateRunToastView(runs);
-    if (view) {
-      toastManager.add(
-        stackedThreadToast({
-          ...view,
-          description: <span className="whitespace-pre-line">{view.description}</span>,
+    const total = tasks.length;
+    let completed = 0;
+    setProgress(total > 0 ? { completed: 0, total } : null);
+    try {
+      const runs = await Promise.all(
+        tasks.map(async ({ environmentId, label, candidate }): Promise<ProviderUpdateRun> => {
+          try {
+            return {
+              environmentId,
+              machineLabel: label,
+              driver: candidate.driver,
+              instanceId: candidate.instanceId,
+              result: await updateProvider({
+                environmentId,
+                input: { provider: candidate.driver, instanceId: candidate.instanceId },
+              }),
+            };
+          } finally {
+            completed += 1;
+            setProgress({ completed, total });
+          }
         }),
       );
+      const view = quiet ? null : getProviderUpdateRunToastView(runs);
+      if (view) {
+        toastManager.add(
+          stackedThreadToast({
+            ...view,
+            description: <span className="whitespace-pre-line">{view.description}</span>,
+          }),
+        );
+      }
+      return runs;
+    } finally {
+      setProgress(null);
     }
-    return runs;
   };
 
-  return { machines, updateAll };
+  return { machines, updateAll, progress };
 }
 
 export function ProviderUpdatesAction() {
-  const { machines, updateAll } = useProviderUpdates();
+  const gt = useGT();
+  const { machines, updateAll, progress } = useProviderUpdates();
   const pending = useRef(false);
   const [isPending, setIsPending] = useState(false);
   if (machines.length === 0 && !isPending) {
@@ -151,7 +171,18 @@ export function ProviderUpdatesAction() {
             disabled={isPending}
             onClick={() => void handleUpdate()}
           >
-            {isPending ? <T>Updating…</T> : <T>Update all</T>}
+            {isPending ? (
+              progress && progress.total > 1 ? (
+                gt("Updating ({completed}/{total})…", {
+                  completed: progress.completed,
+                  total: progress.total,
+                })
+              ) : (
+                <T>Updating…</T>
+              )
+            ) : (
+              <T>Update all</T>
+            )}
           </Button>
         }
       />

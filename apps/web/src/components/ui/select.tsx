@@ -129,7 +129,7 @@ function SelectPopup({
       >
         <SelectPrimitive.Popup
           // Electron drag hit-testing ignores z-index; items over a drag region would swallow clicks.
-          className="origin-(--transform-origin) rounded-lg text-foreground outline-none [-webkit-app-region:no-drag]"
+          className="origin-(--transform-origin) rounded-lg text-foreground outline-none transition-[scale,opacity,translate] duration-170 ease-out-expo data-ending-style:duration-110 data-ending-style:ease-in-quick data-starting-style:scale-96 data-ending-style:scale-96 data-starting-style:opacity-0 data-ending-style:opacity-0 data-[side=bottom]:data-starting-style:-translate-y-1 data-[side=bottom]:data-ending-style:-translate-y-1 data-[side=top]:data-starting-style:translate-y-1 data-[side=top]:data-ending-style:translate-y-1 data-instant:transition-none motion-reduce:transition-none [-webkit-app-region:no-drag]"
           data-slot="select-popup"
           {...props}
         >

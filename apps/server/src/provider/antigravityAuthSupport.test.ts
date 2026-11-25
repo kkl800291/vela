@@ -690,7 +690,7 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
   );
 
   it.effect.skipIf(!symlinksSupported)(
-    "links the user's global rule files and never replaces the profile's own",
+    "links the user's global rule and MCP config files, replacing 0-byte placeholders without overwriting profile-owned files",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -700,12 +700,19 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         const profileDirectory = path.join(temporaryDirectory, "profile");
         const userGemini = path.join(userHome, ".gemini");
         yield* fs.makeDirectory(path.join(userGemini, "config"), { recursive: true });
+        yield* fs.makeDirectory(path.join(profileDirectory, "config"), { recursive: true });
         yield* fs.writeFileString(path.join(userGemini, "AGENTS.md"), "global agents rule");
         yield* fs.writeFileString(path.join(userGemini, "GEMINI.md"), "global gemini rule");
         yield* fs.writeFileString(
           path.join(userGemini, "config", "skills.json"),
           JSON.stringify({ entries: [{ path: "/tmp/shared-skills" }] }),
         );
+        yield* fs.writeFileString(
+          path.join(userGemini, "config", "mcp_config.json"),
+          JSON.stringify({ mcpServers: { lanhu: { serverUrl: "https://mcp.lanhuapp.com" } } }),
+        );
+        // Simulate the 0-byte placeholder written by the Antigravity CLI on an earlier launch.
+        yield* fs.writeFileString(path.join(profileDirectory, "config", "mcp_config.json"), "");
 
         yield* prepareAntigravityProfile({ profileDirectory, userHome });
         expect(yield* fs.readLink(path.join(profileDirectory, "AGENTS.md"))).toBe(
@@ -717,58 +724,119 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         expect(yield* fs.readLink(path.join(profileDirectory, "config", "skills.json"))).toBe(
           path.join(userGemini, "config", "skills.json"),
         );
+        expect(yield* fs.readLink(path.join(profileDirectory, "config", "mcp_config.json"))).toBe(
+          path.join(userGemini, "config", "mcp_config.json"),
+        );
 
         yield* fs.remove(path.join(userGemini, "AGENTS.md"));
         yield* fs.remove(path.join(userGemini, "config", "skills.json"));
+        yield* fs.remove(path.join(userGemini, "config", "mcp_config.json"));
         yield* fs.remove(path.join(profileDirectory, "GEMINI.md"));
         yield* fs.writeFileString(path.join(profileDirectory, "GEMINI.md"), "profile's own rule");
         yield* prepareAntigravityProfile({ profileDirectory, userHome });
         expect(yield* fs.exists(path.join(profileDirectory, "AGENTS.md"))).toBe(false);
         expect(yield* fs.exists(path.join(profileDirectory, "config", "skills.json"))).toBe(false);
+        expect(yield* fs.exists(path.join(profileDirectory, "config", "mcp_config.json"))).toBe(
+          false,
+        );
         expect(yield* fs.readFileString(path.join(profileDirectory, "GEMINI.md"))).toBe(
           "profile's own rule",
         );
+
+        yield* fs.writeFileString(
+          path.join(userGemini, "config", "mcp_config.json"),
+          JSON.stringify({ mcpServers: { lanhu: { serverUrl: "https://mcp.lanhuapp.com" } } }),
+        );
+        yield* fs.writeFileString(
+          path.join(profileDirectory, "config", "mcp_config.json"),
+          '{"mcpServers":{"profileOnly":{"command":"echo"}}}',
+        );
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(
+          yield* fs.readFileString(path.join(profileDirectory, "config", "mcp_config.json")),
+        ).toBe('{"mcpServers":{"profileOnly":{"command":"echo"}}}');
       }),
   );
 
-  it.effect("copies the user's global rule files on Windows and keeps the profile's own", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
-      const userHome = path.join(temporaryDirectory, "home");
-      const profileDirectory = path.join(temporaryDirectory, "profile");
-      const userGemini = path.join(userHome, ".gemini");
-      const prepare = prepareAntigravityProfile({ profileDirectory, userHome, platform: "win32" });
-      const profileAgents = path.join(profileDirectory, "AGENTS.md");
-      const profileGemini = path.join(profileDirectory, "GEMINI.md");
-      const profileSkillsJson = path.join(profileDirectory, "config", "skills.json");
-      const userSkillsJson = path.join(userGemini, "config", "skills.json");
-      yield* fs.makeDirectory(path.join(userGemini, "config"), { recursive: true });
-      yield* fs.writeFileString(path.join(userGemini, "AGENTS.md"), "global agents rule");
-      yield* fs.writeFileString(path.join(userGemini, "GEMINI.md"), "global gemini rule");
-      yield* fs.writeFileString(userSkillsJson, '{"entries":[]}');
+  it.effect(
+    "copies the user's global rule and MCP config files on Windows, replacing 0-byte placeholders and keeping profile-owned files",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const userHome = path.join(temporaryDirectory, "home");
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+        const userGemini = path.join(userHome, ".gemini");
+        const prepare = prepareAntigravityProfile({
+          profileDirectory,
+          userHome,
+          platform: "win32",
+        });
+        const profileAgents = path.join(profileDirectory, "AGENTS.md");
+        const profileGemini = path.join(profileDirectory, "GEMINI.md");
+        const profileSkillsJson = path.join(profileDirectory, "config", "skills.json");
+        const userSkillsJson = path.join(userGemini, "config", "skills.json");
+        const profileMcpJson = path.join(profileDirectory, "config", "mcp_config.json");
+        const userMcpJson = path.join(userGemini, "config", "mcp_config.json");
+        yield* fs.makeDirectory(path.join(userGemini, "config"), { recursive: true });
+        yield* fs.makeDirectory(path.join(profileDirectory, "config"), { recursive: true });
+        yield* fs.writeFileString(path.join(userGemini, "AGENTS.md"), "global agents rule");
+        yield* fs.writeFileString(path.join(userGemini, "GEMINI.md"), "global gemini rule");
+        yield* fs.writeFileString(userSkillsJson, '{"entries":[]}');
+        yield* fs.writeFileString(
+          userMcpJson,
+          '{"mcpServers":{"lanhu":{"serverUrl":"https://mcp.lanhuapp.com"}}}',
+        );
+        yield* fs.writeFileString(profileMcpJson, "");
 
-      yield* prepare;
-      expect(yield* fs.readFileString(profileAgents)).toBe("global agents rule");
-      expect(yield* fs.readFileString(profileGemini)).toBe("global gemini rule");
-      expect(yield* fs.readFileString(profileSkillsJson)).toBe('{"entries":[]}');
+        yield* prepare;
+        expect(yield* fs.readFileString(profileAgents)).toBe("global agents rule");
+        expect(yield* fs.readFileString(profileGemini)).toBe("global gemini rule");
+        expect(yield* fs.readFileString(profileSkillsJson)).toBe('{"entries":[]}');
+        expect(yield* fs.readFileString(profileMcpJson)).toBe(
+          '{"mcpServers":{"lanhu":{"serverUrl":"https://mcp.lanhuapp.com"}}}',
+        );
 
-      yield* fs.writeFileString(path.join(userGemini, "AGENTS.md"), "edited agents rule");
-      yield* fs.remove(path.join(userGemini, "GEMINI.md"));
-      yield* fs.writeFileString(userSkillsJson, '{"entries":[{"path":"/skills"}]}');
-      yield* prepare;
-      expect(yield* fs.readFileString(profileAgents)).toBe("edited agents rule");
-      expect(yield* fs.exists(profileGemini)).toBe(false);
-      expect(yield* fs.readFileString(profileSkillsJson)).toBe('{"entries":[{"path":"/skills"}]}');
+        yield* fs.writeFileString(path.join(userGemini, "AGENTS.md"), "edited agents rule");
+        yield* fs.remove(path.join(userGemini, "GEMINI.md"));
+        yield* fs.writeFileString(userSkillsJson, '{"entries":[{"path":"/skills"}]}');
+        yield* fs.writeFileString(
+          userMcpJson,
+          '{"mcpServers":{"lanhu":{"serverUrl":"https://updated"}}}',
+        );
+        yield* prepare;
+        expect(yield* fs.readFileString(profileAgents)).toBe("edited agents rule");
+        expect(yield* fs.exists(profileGemini)).toBe(false);
+        expect(yield* fs.readFileString(profileSkillsJson)).toBe(
+          '{"entries":[{"path":"/skills"}]}',
+        );
+        expect(yield* fs.readFileString(profileMcpJson)).toBe(
+          '{"mcpServers":{"lanhu":{"serverUrl":"https://updated"}}}',
+        );
 
-      yield* fs.writeFileString(profileGemini, "profile's own rule");
-      yield* fs.writeFileString(path.join(userGemini, "GEMINI.md"), "global gemini rule");
-      yield* fs.remove(userSkillsJson);
-      yield* prepare;
-      expect(yield* fs.readFileString(profileGemini)).toBe("profile's own rule");
-      expect(yield* fs.exists(profileSkillsJson)).toBe(false);
-    }),
+        yield* fs.writeFileString(profileGemini, "profile's own rule");
+        yield* fs.writeFileString(path.join(userGemini, "GEMINI.md"), "global gemini rule");
+        yield* fs.remove(userSkillsJson);
+        yield* fs.remove(userMcpJson);
+        yield* prepare;
+        expect(yield* fs.readFileString(profileGemini)).toBe("profile's own rule");
+        expect(yield* fs.exists(profileSkillsJson)).toBe(false);
+        expect(yield* fs.exists(profileMcpJson)).toBe(false);
+
+        yield* fs.writeFileString(
+          profileMcpJson,
+          '{"mcpServers":{"profileOnly":{"command":"echo"}}}',
+        );
+        yield* fs.writeFileString(
+          userMcpJson,
+          '{"mcpServers":{"lanhu":{"serverUrl":"https://mcp.lanhuapp.com"}}}',
+        );
+        yield* prepare;
+        expect(yield* fs.readFileString(profileMcpJson)).toBe(
+          '{"mcpServers":{"profileOnly":{"command":"echo"}}}',
+        );
+      }),
   );
 
   it.effect("rewrites the GCP block on every launch and never stores the API key", () =>

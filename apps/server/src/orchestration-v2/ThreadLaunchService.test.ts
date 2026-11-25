@@ -534,6 +534,23 @@ it.effect("leaves delegated tasks and workflow agent steps out of the top-level 
         step: "agent",
       },
     });
+    const dispatchSubagent = yield* launches.launch({
+      ...launchInput({ command: "command:dispatch-subagent", thread: "thread:dispatch-subagent" }),
+      createdBy: "agent",
+      creationSource: "mcp",
+      subagentParentThreadId: ThreadId.make("thread:top-level"),
+      workflowRun: {
+        environmentId: EnvironmentId.make("environment:local"),
+        runId: "dispatch:thread:top-level:S1",
+        workflow: "vela-dispatch",
+        step: "S1",
+      },
+    });
+    assert.deepEqual(dispatchSubagent.projection.thread.lineage, {
+      parentThreadId: ThreadId.make("thread:top-level"),
+      relationshipToParent: "subagent",
+      rootThreadId: ThreadId.make("thread:top-level"),
+    });
     const listed = yield* threads.listProjectThreads({ projectId, includeSubagents: false });
     assert.deepEqual(
       listed.map((thread) => thread.id),
@@ -542,7 +559,7 @@ it.effect("leaves delegated tasks and workflow agent steps out of the top-level 
     const all = yield* threads.listProjectThreads({ projectId, includeSubagents: true });
     assert.includeMembers(
       all.map((thread) => thread.id),
-      [delegated.threadId, workflowStep.threadId],
+      [delegated.threadId, workflowStep.threadId, dispatchSubagent.threadId],
     );
   }).pipe(Effect.provide(harness.layer));
 });

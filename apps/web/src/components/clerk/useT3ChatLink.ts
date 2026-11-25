@@ -69,7 +69,7 @@ export function useT3ChatLink() {
       setLinkUrl(null);
       linkState.refresh();
     } else if (!isAtomCommandInterrupted(result)) {
-      reportFailure(m(msg("Could not unlink T3 Chat")), squashAtomCommandFailure(result));
+      reportFailure(m(msg("Could not unlink Vela Chat")), squashAtomCommandFailure(result));
     }
     setPending(null);
   };

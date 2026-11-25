@@ -17,10 +17,12 @@ import {
   type SidebarProjectGroupingMode,
 } from "@t3tools/contracts";
 import {
+  DEFAULT_NPM_MIRROR_REGISTRY,
   DEFAULT_UNIFIED_SETTINGS,
   type DiffLayout,
   MAX_SIDEBAR_AUTO_SETTLE_AFTER_DAYS,
   MIN_SIDEBAR_AUTO_SETTLE_AFTER_DAYS,
+  normalizeProviderNpmRegistry,
   type ResponseStreamingMode,
   type QuitConfirmationMode,
   SidebarProjectSortOrder,
@@ -612,6 +614,9 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.enableProviderUpdateChecks !== DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks
       ? [gt("Provider update checks")]
       : []),
+    ...(settings.providerNpmRegistry !== DEFAULT_UNIFIED_SETTINGS.providerNpmRegistry
+      ? [gt("Package registry mirror")]
+      : []),
     ...(settings.continueThreadsAfterServerUpdate !==
     DEFAULT_UNIFIED_SETTINGS.continueThreadsAfterServerUpdate
       ? [gt("Continue threads after restarts")]
@@ -747,6 +752,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       snoozePresets: DEFAULT_UNIFIED_SETTINGS.snoozePresets,
       responseStreamingMode: DEFAULT_UNIFIED_SETTINGS.responseStreamingMode,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
+      providerNpmRegistry: DEFAULT_UNIFIED_SETTINGS.providerNpmRegistry,
       continueThreadsAfterServerUpdate: DEFAULT_UNIFIED_SETTINGS.continueThreadsAfterServerUpdate,
       backgroundActivity: DEFAULT_UNIFIED_SETTINGS.backgroundActivity,
       keepAwakeWhileAgentsWork: DEFAULT_UNIFIED_SETTINGS.keepAwakeWhileAgentsWork,
@@ -2385,6 +2391,8 @@ export function MaintenanceSettingsPanel() {
   const environmentId = environment?.environmentId ?? null;
   const isEnvironmentScope = scope.environmentIds.length === 1 && environmentId !== null;
   const hasServerTargets = connectedEnvironments.length > 0;
+  const mixedProviderNpmRegistry = useScopedSettingsMixed(["providerNpmRegistry"]);
+  const normalizedProviderNpmRegistry = normalizeProviderNpmRegistry(settings.providerNpmRegistry);
 
   return (
     <SettingsPageContainer>
@@ -2418,6 +2426,86 @@ export function MaintenanceSettingsPanel() {
               }
               aria-label={gt("Check provider versions")}
             />
+          }
+        />
+        <SettingsRow
+          serverScoped
+          settingKeys={["providerNpmRegistry"]}
+          {...setting("provider-npm-registry")}
+          description={gt(
+            "Override the npm registry URL used when updating npm, pnpm, bun, or ACP provider CLIs and checking versions (e.g. https://registry.npmmirror.com). Leave blank to use the system default.",
+          )}
+          resetAction={
+            settings.providerNpmRegistry !== DEFAULT_UNIFIED_SETTINGS.providerNpmRegistry ? (
+              <SettingResetButton
+                ariaLabel={gt("Reset package registry mirror to default")}
+                onClick={() =>
+                  updateSettings({
+                    providerNpmRegistry: DEFAULT_UNIFIED_SETTINGS.providerNpmRegistry,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <div className="flex w-full flex-wrap items-center justify-end gap-1.5 sm:w-auto">
+              <div className="flex items-center gap-1">
+                <Button
+                  type="button"
+                  size="xs"
+                  variant={
+                    !mixedProviderNpmRegistry && normalizedProviderNpmRegistry === null
+                      ? "secondary"
+                      : "outline"
+                  }
+                  onClick={() => updateSettings({ providerNpmRegistry: "" })}
+                >
+                  <T>Default</T>
+                </Button>
+                <Button
+                  type="button"
+                  size="xs"
+                  variant={
+                    !mixedProviderNpmRegistry &&
+                    normalizedProviderNpmRegistry === DEFAULT_NPM_MIRROR_REGISTRY
+                      ? "secondary"
+                      : "outline"
+                  }
+                  onClick={() =>
+                    updateSettings({ providerNpmRegistry: DEFAULT_NPM_MIRROR_REGISTRY })
+                  }
+                >
+                  npmmirror
+                </Button>
+              </div>
+              <DraftInput
+                size="sm"
+                className="w-full sm:w-64"
+                value={mixedProviderNpmRegistry ? "" : settings.providerNpmRegistry}
+                onCommit={(next) => {
+                  const trimmed = next.trim();
+                  if (trimmed.length === 0) {
+                    updateSettings({ providerNpmRegistry: "" });
+                    return;
+                  }
+                  const normalized = normalizeProviderNpmRegistry(trimmed);
+                  if (!normalized) {
+                    toastManager.add({
+                      type: "error",
+                      title: gt("Invalid package registry URL"),
+                      description: gt(
+                        "Enter a valid http:// or https:// URL, or leave blank for default.",
+                      ),
+                    });
+                    return;
+                  }
+                  updateSettings({ providerNpmRegistry: normalized });
+                }}
+                placeholder={mixedProviderNpmRegistry ? gt("Mixed") : DEFAULT_NPM_MIRROR_REGISTRY}
+                spellCheck={false}
+                aria-label={gt("Package registry mirror URL")}
+              />
+            </div>
           }
         />
         <SettingsRow
@@ -2526,52 +2614,20 @@ export function MaintenanceSettingsPanel() {
 export function AboutSettingsPanel() {
   const setting = useSearchableSetting();
   const gt = useGT();
-  const messages = useMessages();
-  const primaryPolicy = usePrimaryManagedPolicy();
   // The Welcome page sets up this computer, so it needs one.
   const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const telemetryOff = managedTelemetryOffMessage(primaryPolicy, messages);
   return (
     <SettingsPageContainer>
       <SettingsSection id="about" title={gt("App")}>
-        {primaryPolicy ? (
-          <SettingsRow
-            title={gt("Organization")}
-            description={gt(
-              "This environment is managed by {organization}. Some settings and features follow its policy.",
-              { organization: primaryPolicy.organization },
-            )}
-            control={
-              primaryPolicy.supportUrl ? (
-                <Button
-                  render={
-                    <a href={primaryPolicy.supportUrl} target="_blank" rel="noreferrer noopener" />
-                  }
-                  size="sm"
-                  variant="outline"
-                >
-                  <T>Get help</T>
-                </Button>
-              ) : null
-            }
-          />
-        ) : null}
-        {isElectron || HOSTED_APP_CHANNEL ? (
-          <AboutVersionSection />
-        ) : (
-          <>
-            <SettingsRow
-              id={setting("app-version").id}
-              title={<AboutVersionTitle />}
-              description={gt("Current version of the application.")}
-            />
-          </>
-        )}
-        <MobileAppSettingsRow />
+        <SettingsRow
+          id={setting("app-version").id}
+          title={<AboutVersionTitle />}
+          description={gt("Current version of the application.")}
+        />
         {primaryEnvironmentId === null ? null : (
           <SettingsRow
             {...setting("welcome-page")}
-            description={gt("See your agents, import projects, and set up your phone.")}
+            description={gt("See your agents and import local projects.")}
             control={
               <Button size="sm" variant="outline" render={<Link to="/welcome" />}>
                 <T context="verb, opens a page">Open</T>
@@ -2583,25 +2639,8 @@ export function AboutSettingsPanel() {
 
       <SettingsSection id="legal" title={gt("Legal")}>
         <SettingsRow
-          {...setting("privacy-policy")}
-          description={
-            telemetryOff === undefined
-              ? gt("How we handle your data, including the anonymous usage data T3 Code collects.")
-              : gt("How we handle your data. {telemetryOff}", { telemetryOff })
-          }
-          control={
-            <Button
-              render={<a href={PRIVACY_POLICY_URL} target="_blank" rel="noreferrer noopener" />}
-              size="sm"
-              variant="outline"
-            >
-              <T>View policy</T>
-            </Button>
-          }
-        />
-        <SettingsRow
           {...setting("open-source-licenses")}
-          description={gt("Notices for dependencies, assets, and optional tools used by T3 Code.")}
+          description={gt("Notices for dependencies, assets, and optional tools used by Vela.")}
           control={
             <Button
               render={<Link to="/settings/open-source-licenses" />}

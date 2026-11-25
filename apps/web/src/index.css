@@ -195,6 +195,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --inset-shadow-control-highlight: 0 1px rgb(255 255 255 / 16%);
   --inset-shadow-control-pressed: 0 1px rgb(0 0 0 / 8%);
   --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-quick: cubic-bezier(0.4, 0, 1, 1);
   /* The composer's elevation: a soft drop pulled in under the surface, shared
      by the composer, its context strip and attached banners. */
   --shadow-composer: 0 1px 2px rgb(0 0 0 / 5%);
@@ -236,6 +238,10 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --animate-step-in: step-in 180ms ease-out;
   --animate-step-ping: step-ping 520ms ease-out;
   --animate-check-draw: check-draw 200ms ease-out;
+  --animate-dispatch-sweep: dispatch-sweep 1.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  --animate-dispatch-flow-v: dispatch-flow-v 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  --animate-dispatch-orbit: dispatch-orbit 2.4s linear infinite;
+  --animate-dispatch-ping: dispatch-ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
   --color-warning-foreground: var(--warning-foreground);
   --color-warning: var(--warning);
   --color-warning-surface: var(--warning-surface);
@@ -369,6 +375,41 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   @keyframes check-draw {
     from {
       stroke-dashoffset: 12;
+    }
+  }
+  @keyframes dispatch-sweep {
+    from {
+      transform: translate3d(-100%, 0, 0);
+    }
+    to {
+      transform: translate3d(300%, 0, 0);
+    }
+  }
+  @keyframes dispatch-flow-v {
+    from {
+      transform: translate3d(0, -100%, 0);
+    }
+    to {
+      transform: translate3d(0, 300%, 0);
+    }
+  }
+  @keyframes dispatch-orbit {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes dispatch-ping {
+    0% {
+      opacity: 0.75;
+      transform: scale(0.85);
+    }
+    65%,
+    100% {
+      opacity: 0;
+      transform: scale(1.9);
     }
   }
   @keyframes status-ping {
@@ -608,6 +649,54 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   animation: var(--animate-spin);
   animation-play-state: var(--visible-animation-state, paused);
   will-change: var(--visible-animation-will-change, auto);
+}
+
+@utility visible-animate-dispatch-ping {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: var(--animate-dispatch-ping);
+    animation-play-state: var(--visible-animation-state, paused);
+    will-change: var(--visible-animation-will-change, auto);
+  }
+}
+
+@utility visible-animate-dispatch-sweep {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: var(--animate-dispatch-sweep);
+    animation-play-state: var(--visible-animation-state, paused);
+    will-change: var(--visible-animation-will-change, auto);
+  }
+}
+
+@utility visible-animate-dispatch-flow-v {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: var(--animate-dispatch-flow-v);
+    animation-play-state: var(--visible-animation-state, paused);
+    will-change: var(--visible-animation-will-change, auto);
+  }
+}
+
+@utility visible-animate-dispatch-orbit {
+  @media (prefers-reduced-motion: no-preference) {
+    animation: var(--animate-dispatch-orbit);
+    animation-play-state: var(--visible-animation-state, paused);
+    will-change: var(--visible-animation-will-change, auto);
+  }
+}
+
+@utility visible-animate-dispatch-shine {
+  @media (prefers-reduced-motion: no-preference) and (forced-colors: none) {
+    color: transparent;
+    background-image:
+      linear-gradient(to right, transparent, var(--contrast-foreground), transparent),
+      linear-gradient(var(--contrast-secondary-label), var(--contrast-secondary-label));
+    background-size:
+      4.5rem 100%,
+      100% 100%;
+    background-repeat: no-repeat;
+    background-clip: text;
+    animation: live-tool-shine 2.2s linear infinite;
+    animation-play-state: var(--visible-animation-state, paused);
+  }
 }
 
 @keyframes live-activity-focus {

@@ -13,6 +13,7 @@ import {
   type ServerProvider,
   type ServerProviderVersionAdvisory,
 } from "@t3tools/contracts";
+import { normalizeProviderNpmRegistry } from "@t3tools/contracts/settings";
 import { compareSemverVersions, satisfiesSemverRange } from "@t3tools/shared/semver";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { causeErrorTag } from "@t3tools/shared/observability";
@@ -744,7 +745,7 @@ export const resolveMiseProviderMaintenance = Effect.fn("resolveMiseProviderMain
     // Asked even off mise's usual paths, since `MISE_DATA_DIR` can put installs anywhere.
     const which = nonEmptyString(yield* runProbe(misePath, ["which", miseTool], context.env));
     const resolvedPath = which ? yield* realPath(which) : null;
-    // Through a shim T3 Code runs whatever mise resolves; otherwise the configured binary.
+    // Through a shim Vela runs whatever mise resolves; otherwise the configured binary.
     const binaryPath = isShim ? resolvedPath : context.realCommandPath;
     if (!binaryPath) return manual(context.realCommandPath);
     const binary = normalizeCommandPath(binaryPath);
@@ -1400,7 +1401,7 @@ export const makeCachedProviderMaintenanceResolution = Effect.fn(
 
 function manualUpdateMessage(latestVersion: string, installPath: string | undefined): string {
   return installPath
-    ? `Version ${latestVersion} is out. T3 Code runs ${installPath}; update it with the app or tool that installed it.`
+    ? `Version ${latestVersion} is out. Vela runs ${installPath}; update it with the app or tool that installed it.`
     : `Version ${latestVersion} is out. Update it with the app or tool that installed it.`;
 }
 
@@ -1463,10 +1464,23 @@ export function createProviderVersionAdvisory(input: {
   };
 }
 
-const fetchNpmLatestVersion = Effect.fn("fetchNpmLatestVersion")(function* (packageName: string) {
+const DEFAULT_NPM_REGISTRY_URL = "https://registry.npmjs.org";
+
+const fetchNpmLatestVersion = Effect.fn("fetchNpmLatestVersion")(function* (
+  packageName: string,
+  registryUrl?: string | null,
+) {
   const client = yield* HttpClient.HttpClient;
+  const envRegistry = yield* Config.String("VELA_NPM_REGISTRY").pipe(
+    Config.option,
+    Effect.orElseSucceed(() => Option.none<string>()),
+  );
+  const baseRegistryUrl =
+    normalizeProviderNpmRegistry(registryUrl) ??
+    normalizeProviderNpmRegistry(Option.getOrNull(envRegistry)) ??
+    DEFAULT_NPM_REGISTRY_URL;
   const request = HttpClientRequest.get(
-    `https://registry.npmjs.org/${encodeURIComponent(packageName)}/latest`,
+    `${baseRegistryUrl}/${encodeURIComponent(packageName)}/latest`,
   ).pipe(HttpClientRequest.setHeader("accept", "application/json"));
   // The deadline covers the body too: headers can arrive before the JSON stalls.
   const payload = yield* client.execute(request).pipe(
@@ -1502,8 +1516,19 @@ export function latestProviderVersionCacheKeys(
 
 export const resolveLatestProviderVersion = Effect.fn("resolveLatestProviderVersion")(function* (
   maintenanceCapabilities: ProviderMaintenanceCapabilities,
+  options?: {
+    readonly registryUrl?: string | null | undefined;
+  },
 ) {
   const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
+  const configuredRegistry = normalizeProviderNpmRegistry(options?.registryUrl);
+  const packageName = maintenanceCapabilities.packageName;
+  if (configuredRegistry && packageName) {
+    return yield* latestVersions.cached(
+      `${packageName}\0${configuredRegistry}`,
+      fetchNpmLatestVersion(packageName, configuredRegistry),
+    );
+  }
   const installerKey = installerLatestVersionKey(maintenanceCapabilities);
   if (installerKey && maintenanceCapabilities.lookupLatestVersion) {
     const installable = yield* latestVersions.cached(
@@ -1515,7 +1540,6 @@ export const resolveLatestProviderVersion = Effect.fn("resolveLatestProviderVers
   if (maintenanceCapabilities.latestVersion !== undefined) {
     return maintenanceCapabilities.latestVersion;
   }
-  const packageName = maintenanceCapabilities.packageName;
   if (!packageName) {
     return null;
   }
@@ -1524,13 +1548,21 @@ export const resolveLatestProviderVersion = Effect.fn("resolveLatestProviderVers
 });
 
 export const invalidateLatestProviderVersion = Effect.fn("invalidateLatestProviderVersion")(
-  function* (maintenanceCapabilities: ProviderMaintenanceCapabilities) {
+  function* (
+    maintenanceCapabilities: ProviderMaintenanceCapabilities,
+    options?: {
+      readonly registryUrl?: string | null | undefined;
+    },
+  ) {
     const latestVersions = yield* ProviderLatestVersions.ProviderLatestVersions;
-    yield* Effect.forEach(
-      latestProviderVersionCacheKeys(maintenanceCapabilities),
-      latestVersions.invalidate,
-      { discard: true },
-    );
+    const configuredRegistry = normalizeProviderNpmRegistry(options?.registryUrl);
+    const keys = [
+      ...latestProviderVersionCacheKeys(maintenanceCapabilities),
+      ...(configuredRegistry && maintenanceCapabilities.packageName
+        ? [`${maintenanceCapabilities.packageName}\0${configuredRegistry}`]
+        : []),
+    ];
+    yield* Effect.forEach(keys, latestVersions.invalidate, { discard: true });
   },
 );
 
@@ -1541,6 +1573,7 @@ export const enrichProviderSnapshotWithVersionAdvisory = Effect.fn(
   maintenanceCapabilities?: ProviderMaintenanceCapabilities,
   options?: {
     readonly enableProviderUpdateChecks: boolean | undefined;
+    readonly registryUrl?: string | null | undefined;
   },
 ) {
   const capabilities =
@@ -1564,7 +1597,9 @@ export const enrichProviderSnapshotWithVersionAdvisory = Effect.fn(
     };
   }
 
-  const latestVersion = yield* resolveLatestProviderVersion(capabilities);
+  const latestVersion = yield* resolveLatestProviderVersion(capabilities, {
+    registryUrl: options?.registryUrl,
+  });
   return {
     ...snapshot,
     versionAdvisory: createProviderVersionAdvisory({

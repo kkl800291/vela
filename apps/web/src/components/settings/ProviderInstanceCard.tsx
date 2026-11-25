@@ -40,6 +40,7 @@ import {
 } from "@t3tools/shared/model";
 import { cn } from "../../lib/utils";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
+import { useNowSecond } from "../../hooks/useNowSecond";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { normalizeProviderAccentColor } from "../../providerInstances";
 import { Badge } from "../ui/badge";
@@ -88,6 +89,40 @@ import {
 } from "./providerStatus";
 
 const ENVIRONMENT_VARIABLE_NAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const SLOW_UPDATE_HINT_AFTER_MS = 45_000;
+
+function resolveUpdateElapsedSeconds(startedAtIso: string, nowMs: number): number | null {
+  const startedMs = Date.parse(startedAtIso);
+  if (!Number.isFinite(startedMs)) return null;
+  return Math.max(0, Math.floor((nowMs - startedMs) / 1000));
+}
+
+function formatUpdateElapsed(elapsedSeconds: number): string {
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  return `${minutes}m ${seconds}s`;
+}
+
+function ProviderUpdateElapsedLabel({ startedAt }: { readonly startedAt: string }) {
+  const nowMs = useNowSecond();
+  const elapsedSeconds = resolveUpdateElapsedSeconds(startedAt, nowMs);
+  if (elapsedSeconds === null) return null;
+  return <span>{formatUpdateElapsed(elapsedSeconds)}</span>;
+}
+
+function ProviderUpdateSlowMirrorHint({ startedAt }: { readonly startedAt: string }) {
+  const nowMs = useNowSecond();
+  const startedMs = Date.parse(startedAt);
+  if (!Number.isFinite(startedMs) || nowMs - startedMs < SLOW_UPDATE_HINT_AFTER_MS) {
+    return null;
+  }
+  return (
+    <p className="text-2xs leading-snug text-muted-foreground">
+      <T>Slow download? Configure a package registry mirror in Settings → Maintenance.</T>
+    </p>
+  );
+}
 
 function ProviderStatusDiagnostic({
   detail,
@@ -1122,15 +1157,43 @@ export function ProviderInstanceCard({
             </Button>
           ) : null}
           {updateProgress || updateProblem ? (
-            <p
-              aria-live="polite"
-              className={cn(
-                "text-xs leading-snug [overflow-wrap:anywhere]",
-                updateProblem ? "text-warning" : "text-muted-foreground",
-              )}
-            >
-              {updateProgress ?? updateProblem}
-            </p>
+            <div className="grid gap-1.5">
+              <p
+                aria-live="polite"
+                className={cn(
+                  "text-xs leading-snug [overflow-wrap:anywhere]",
+                  updateProblem ? "text-warning" : "text-muted-foreground",
+                )}
+              >
+                {updateProgress ? (
+                  <>
+                    {updateProgress}
+                    {updateState?.startedAt ? (
+                      <>
+                        {" ("}
+                        <ProviderUpdateElapsedLabel startedAt={updateState.startedAt} />
+                        {")"}
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  updateProblem
+                )}
+              </p>
+              {updateProgress && updateState?.startedAt ? (
+                <ProviderUpdateSlowMirrorHint startedAt={updateState.startedAt} />
+              ) : null}
+            </div>
+          ) : null}
+          {updateState?.output ? (
+            <details className="min-w-0">
+              <summary className="cursor-pointer select-none text-2xs font-medium text-muted-foreground hover:text-foreground">
+                <T>Output</T>
+              </summary>
+              <pre className="mt-1.5 max-h-40 overflow-auto rounded-md border border-border/70 bg-muted/40 p-2 font-mono text-2xs whitespace-pre-wrap break-all text-muted-foreground">
+                {updateState.output}
+              </pre>
+            </details>
           ) : null}
           {onRunVersionAction && updateCommand ? (
             <div className="flex items-center gap-2 text-3xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -1214,7 +1277,17 @@ export function ProviderInstanceCard({
                   className="pointer-events-auto line-clamp-2 [overflow-wrap:anywhere]"
                 >
                   {updateProgress ? (
-                    gt("Updating · {progress}", { progress: updateProgress })
+                    <>
+                      {gt("Updating")}
+                      {updateState?.startedAt ? (
+                        <>
+                          {" ("}
+                          <ProviderUpdateElapsedLabel startedAt={updateState.startedAt} />
+                          {")"}
+                        </>
+                      ) : null}
+                      {` · ${updateProgress}`}
+                    </>
                   ) : (
                     <>
                       {summary.headline}

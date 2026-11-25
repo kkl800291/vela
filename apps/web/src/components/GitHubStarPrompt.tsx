@@ -45,7 +45,7 @@ function showStarPrompt(environmentId: EnvironmentId) {
       toastManager.update(id, {
         type: "success",
         title: m(msg("Thanks for the star!")),
-        description: m(msg("It really helps T3 Code grow.")),
+        description: m(msg("It really helps Vela grow.")),
         timeout: 5_000,
         actionProps: undefined,
         data: {},
@@ -61,7 +61,7 @@ function showStarPrompt(environmentId: EnvironmentId) {
     });
   };
   const id = toastManager.add({
-    title: m(msg("Enjoying T3 Code?")),
+    title: m(msg("Enjoying Vela?")),
     description: m(msg("Give us a star on GitHub to let us know!")),
     timeout: 0,
     onClose: dismiss,
@@ -146,27 +146,6 @@ async function starRepository(environmentId: EnvironmentId) {
  * Counts a sent prompt. After more than five, asks once per session for a star until dismissed,
  * unless the environment's GitHub account already starred the repo. Waits until the user is idle.
  */
-export async function recordPromptSent(environmentId: EnvironmentId): Promise<void> {
-  if (shownThisSession) return;
-  try {
-    if (getLocalStorageItem(DISMISSED_KEY, Schema.Boolean)) return;
-    const sent = (getLocalStorageItem(SENT_KEY, Schema.Number) ?? 0) + 1;
-    setLocalStorageItem(SENT_KEY, sent, Schema.Number);
-    if (sent <= PROMPTS_BEFORE_ASKING) return;
-  } catch {
-    // Storage that cannot be read or written could not keep a dismissal, so never ask.
-    return;
-  }
-  shownThisSession = true;
-  const starred = await alreadyStarred(environmentId);
-  if (starred === undefined) return;
-  if (starred) return dismiss();
-  await waitForIdle();
-  try {
-    // Another tab can dismiss while the check or the idle wait runs.
-    if (getLocalStorageItem(DISMISSED_KEY, Schema.Boolean)) return;
-  } catch {
-    return;
-  }
-  showStarPrompt(environmentId);
+export async function recordPromptSent(_environmentId: EnvironmentId): Promise<void> {
+  return;
 }

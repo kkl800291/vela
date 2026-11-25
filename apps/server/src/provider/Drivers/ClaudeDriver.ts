@@ -325,6 +325,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           Effect.flatMap((maintenanceCapabilities) =>
             enrichProviderSnapshotWithVersionAdvisory(snapshot, maintenanceCapabilities, {
               enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
+              registryUrl: settings.providerNpmRegistry,
             }),
           ),
           Effect.flatMap((enrichedSnapshot) =>

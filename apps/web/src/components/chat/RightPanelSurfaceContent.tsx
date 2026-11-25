@@ -37,6 +37,9 @@ const DevicePanel = lazy(() =>
   import("../device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
 const FilePreviewPanel = lazy(() => import("../files/FilePreviewPanel"));
+const DispatchRightPanel = lazy(() =>
+  import("./DispatchRightPanel").then((module) => ({ default: module.DispatchRightPanel })),
+);
 
 type RightPanelTerminalProps = Omit<
   PersistentThreadTerminalPanelProps,
@@ -86,6 +89,10 @@ export function RightPanelSurfaceContent(props: {
   readonly issuesSupported: boolean;
   readonly files: RightPanelFileProps;
   readonly sideChatParentPanel: SideChatParentPanel;
+  readonly dispatch: {
+    readonly isServerThread: boolean;
+    readonly sendPrompt: (prompt: string) => Promise<boolean>;
+  };
 }) {
   const { surface, threadRef, visible, onCloseSurface } = props;
   const gt = useGT();
@@ -132,7 +139,7 @@ export function RightPanelSurfaceContent(props: {
         return (
           <PullRequestsUnavailableState
             title={gt("Pull requests unavailable")}
-            error={gt("Update this environment's T3 Code server to browse pull requests.")}
+            error={gt("Update this environment's Vela server to browse pull requests.")}
           />
         );
       }
@@ -190,7 +197,7 @@ export function RightPanelSurfaceContent(props: {
         return (
           <PullRequestsUnavailableState
             title={gt("Issues unavailable")}
-            error={gt("Update this environment's T3 Code server to browse issues.")}
+            error={gt("Update this environment's Vela server to browse issues.")}
           />
         );
       }
@@ -265,6 +272,18 @@ export function RightPanelSurfaceContent(props: {
               props.onCloseSurface(surface);
               useRightPanelStore.getState().show(threadRef);
             }}
+          />
+        </Suspense>
+      );
+    case "dispatch":
+      return (
+        <Suspense fallback={null}>
+          <DispatchRightPanel
+            key={threadRef.threadId}
+            workspaceRoot={props.files.workspaceRoot}
+            threadRef={threadRef}
+            isServerThread={props.dispatch.isServerThread}
+            sendPrompt={props.dispatch.sendPrompt}
           />
         </Suspense>
       );

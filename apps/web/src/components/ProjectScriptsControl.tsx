@@ -179,7 +179,7 @@ export default function ProjectScriptsControl({
       <MenuGroup>
         <MenuGroupLabel>
           <T>
-            From <Var>t3.json</Var>
+            From <Var>vela.json</Var>
           </T>
         </MenuGroupLabel>
         {importableScripts.map((fileScript) => (

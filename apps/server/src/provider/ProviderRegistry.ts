@@ -92,6 +92,7 @@ export class ProviderRegistry extends Context.Service<
     readonly refreshAfterUpdate: (
       provider: ProviderDriverKind,
       selectedInstanceId: ProviderInstanceId,
+      options?: { readonly skipMaintenanceRefresh?: boolean },
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
     readonly refreshWorkspaceSnapshot: (input: {
@@ -903,8 +904,10 @@ export const layer = Layer.effect(
     const refreshAfterUpdate = Effect.fn("refreshAfterUpdate")(function* (
       provider: ProviderDriverKind,
       selectedInstanceId: ProviderInstanceId,
+      options?: { readonly skipMaintenanceRefresh?: boolean },
     ) {
-      yield* manifestService.forceRefresh;
+      // Reuse the 5-minute TTL / failure backoff so consecutive updates do not stall on GitHub fetches.
+      yield* manifestService.refreshOnDemand;
       const instances = (yield* instanceRegistry.listInstances).filter(
         (instance) =>
           instance.driverKind === provider &&
@@ -956,6 +959,9 @@ export const layer = Layer.effect(
         (instance) =>
           Effect.gen(function* () {
             yield* instance.invalidateCaches ?? Effect.void;
+            if (options?.skipMaintenanceRefresh && instance.instanceId === selectedInstanceId) {
+              return;
+            }
             const maintenance = yield* instance.snapshot.resolveMaintenance({ fresh: true });
             yield* Effect.forEach(
               latestProviderVersionCacheKeys(maintenance),

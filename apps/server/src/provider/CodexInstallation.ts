@@ -4,6 +4,7 @@ import {
   type ProviderInstallState,
   type ServerProviderCompatibilityAdvisory,
 } from "@t3tools/contracts";
+import { normalizeProviderNpmRegistry } from "@t3tools/contracts/settings";
 import { cliArchiveTarCommand, parseChecksums } from "@t3tools/shared/cliRelease";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -29,6 +30,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as NodeCrypto from "node:crypto";
 import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import { selectManagedRelease } from "./managedRelease.ts";
 import * as ModelManifest from "./ModelManifest.ts";
 
@@ -36,7 +38,7 @@ const DRIVER = ProviderDriverKind.make("codex");
 const STAGING_STALE_AFTER_MS = 24 * 60 * 60_000;
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60_000;
 const UPDATE_CHECK_TIMEOUT = "20 seconds";
-const UPSTREAM_LATEST_URL = "https://registry.npmjs.org/@openai/codex/latest";
+const UPSTREAM_REGISTRY_BASE_URL = "https://registry.npmjs.org";
 const UPSTREAM_RELEASES_URL = "https://github.com/openai/codex/releases/download";
 // An upstream release has no recorded size; current packages are about 160 MB.
 const UPSTREAM_MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024;
@@ -198,6 +200,7 @@ export const makeCodexInstallation = Effect.fn("makeCodexInstallation")(function
   const http = yield* HttpClient.HttpClient;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const serviceScope = yield* Effect.scope;
+  const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
   const platform = yield* HostProcess.Platform;
   const environment = yield* HostProcess.Environment;
   const arch = yield* HostProcess.Architecture;
@@ -327,8 +330,18 @@ export const makeCodexInstallation = Effect.fn("makeCodexInstallation")(function
   // checksums, so an upstream update stays SHA-256 verified.
   const lookupUpstream = Effect.gen(function* () {
     if (!asset) return null;
+    const configuredRegistry = Option.isSome(serverSettings)
+      ? yield* serverSettings.value.getSettings.pipe(
+          Effect.map((current) => normalizeProviderNpmRegistry(current.providerNpmRegistry)),
+          Effect.orElseSucceed(() => null),
+        )
+      : null;
+    const registryBaseUrl =
+      configuredRegistry ??
+      normalizeProviderNpmRegistry(environment.VELA_NPM_REGISTRY) ??
+      UPSTREAM_REGISTRY_BASE_URL;
     const latest = yield* http
-      .execute(HttpClientRequest.get(UPSTREAM_LATEST_URL))
+      .execute(HttpClientRequest.get(`${registryBaseUrl}/@openai/codex/latest`))
       .pipe(Effect.flatMap(HttpClientResponse.filterStatusOk));
     const { version } = yield* latest.json.pipe(Effect.flatMap(decodeNpmLatest));
     // Managed resolution refuses anything else, so offering it would break sessions.
@@ -388,7 +401,7 @@ export const makeCodexInstallation = Effect.fn("makeCodexInstallation")(function
       return executable;
     },
     Effect.mapError(
-      wrapFailure("resolve", "Codex is not installed in T3 Code. Install it to continue."),
+      wrapFailure("resolve", "Codex is not installed in Vela. Install it to continue."),
     ),
   );
   const acquire = Effect.fn("CodexInstallation.acquire")(function* () {

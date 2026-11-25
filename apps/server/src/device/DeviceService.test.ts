@@ -1070,6 +1070,17 @@ it.effect(
     }),
 );
 
+it.effect("suppresses apple-utils simctl discovery warnings when iOS is unavailable", () =>
+  Effect.gen(function* () {
+    const { service, discoveryErrors, iosAvailable } = yield* fixture();
+    yield* Ref.set(iosAvailable, false);
+    yield* service.configure({ enabled: true });
+    yield* Ref.set(discoveryErrors, [{ message: simctlMessage, error: simctlError }]);
+    const listed = yield* service.list;
+    expect(listed.hostStatuses.local).toEqual({ status: "ready" });
+  }),
+);
+
 it.effect.each([
   {
     ios: true,
