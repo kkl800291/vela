@@ -40,6 +40,7 @@ import {
 } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+import { resolveCodexUnavailableMcpOverrides } from "./codexUnavailableMcpOverrides.ts";
 import {
   buildServerProvider,
   COMPACT_SLASH_COMMAND,
@@ -647,9 +648,13 @@ export const withCodexAppServerClient = Effect.fn("withCodexAppServerClient")(fu
 }) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const environment = yield* codexProcessEnvironment(input);
+  const unavailableMcpOverrides = yield* resolveCodexUnavailableMcpOverrides({
+    homePath: input.homePath,
+    environment,
+  });
   const spawnCommand = yield* resolveSpawnCommand(
     input.binaryPath,
-    codexAppServerArgs(input.launchArgs),
+    codexAppServerArgs(input.launchArgs, unavailableMcpOverrides),
     { env: environment, extendEnv: true },
   );
   const child = yield* spawner

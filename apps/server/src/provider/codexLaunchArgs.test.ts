@@ -42,6 +42,24 @@ describe("codexAppServerArgs", () => {
       ...row.expected,
     ]);
   });
+
+  it("places extra config overrides after thread_unload_delay_secs and before user launchArgs", () => {
+    NodeAssert.deepStrictEqual(
+      codexAppServerArgs('-c mcp_servers={"node_repl"={enabled=true}}', [
+        "-c",
+        'mcp_servers={"node_repl"={enabled=false}}',
+      ]),
+      [
+        "app-server",
+        "-c",
+        "thread_unload_delay_secs=0",
+        "-c",
+        'mcp_servers={"node_repl"={enabled=false}}',
+        "-c",
+        "mcp_servers={node_repl={enabled=true}}",
+      ],
+    );
+  });
 });
 
 describe("codexExecLaunchArgs", () => {
