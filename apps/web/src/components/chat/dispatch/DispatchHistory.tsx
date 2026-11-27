@@ -41,6 +41,7 @@ export function DispatchHistory({
   const [sectionOpen, setSectionOpen] = useState(false);
   const [expandedArchives, setExpandedArchives] = useState<ReadonlySet<string>>(() => new Set());
   const [expandedReports, setExpandedReports] = useState<ReadonlySet<string>>(() => new Set());
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   if (history.length === 0) {
     return null;
@@ -127,17 +128,41 @@ export function DispatchHistory({
                     </div>
                   </button>
 
-                  <Button
-                    size="sm"
-                    variant="ghost-destructive"
-                    aria-label={`删除历史计划 ${item.planTitle}`}
-                    disabled={busyKey !== null}
-                    onClick={() => onDeleteArchive(item.id)}
-                    className="shrink-0"
-                  >
-                    <Trash2Icon className="size-3.5" />
-                    {isDeleting ? "删除中" : "删除"}
-                  </Button>
+                  {confirmDeleteId === item.id ? (
+                    <div className="flex shrink-0 items-center gap-1">
+                      <Button
+                        size="xs"
+                        variant="destructive"
+                        disabled={busyKey !== null}
+                        onClick={() => {
+                          setConfirmDeleteId(null);
+                          onDeleteArchive(item.id);
+                        }}
+                      >
+                        确认删除
+                      </Button>
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        disabled={busyKey !== null}
+                        onClick={() => setConfirmDeleteId(null)}
+                      >
+                        取消
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="ghost-destructive"
+                      aria-label={`删除历史计划 ${item.planTitle}`}
+                      disabled={busyKey !== null}
+                      onClick={() => setConfirmDeleteId(item.id)}
+                      className="shrink-0"
+                    >
+                      <Trash2Icon className="size-3.5" />
+                      {isDeleting ? "删除中" : "删除"}
+                    </Button>
+                  )}
                 </div>
 
                 <Collapsible open={isExpanded}>

@@ -21,7 +21,7 @@ import {
   UnlockIcon,
   XCircleIcon,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import ChatMarkdown from "~/components/ChatMarkdown";
 import { ProviderInstanceIcon } from "~/components/chat/ProviderInstanceIcon";
@@ -33,6 +33,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
 import { useRightPanelStore } from "~/rightPanelStore";
 import {
+  subscribeFocusDispatchStep,
   useVelaDispatchProviders,
   type DispatchEscalationRecord,
   type DispatchProviderSummary,
@@ -43,8 +44,10 @@ import {
   type VelaDispatchState,
 } from "~/state/velaDispatch";
 import { AgentTargetPicker } from "./AgentTargetPicker";
+import { CollabV2Card } from "./CollabV2Card";
 import { DispatchDecisionPicker } from "./DispatchDecisionPicker";
 import { DispatchElapsedTimer } from "./DispatchElapsedTimer";
+import { DispatchStepDiffDialog } from "./DispatchStepDiffDialog";
 import {
   computeBatches,
   isActiveProgressStatus,
@@ -57,6 +60,7 @@ import {
   resolveStepKind,
   STATUS_LABEL,
   stripMarkdownPreview,
+  summarizeStepVerification,
 } from "./dispatchModel";
 import { useDispatchActions } from "./useDispatchActions";
 
@@ -91,6 +95,7 @@ function InlineStepGlyph({ status }: { readonly status: DispatchStepStatus }) {
 
 function InlinePlanStepRow({
   workspaceRoot,
+  currentBranch,
   step,
   run,
   escalation,
@@ -100,7 +105,7 @@ function InlinePlanStepRow({
   onToggleExpand,
   onOpenThread,
   onOpenFile,
-  onOpenDiff,
+  onOpenStepDiff,
   onRun,
   onCancel,
   onAccept,
@@ -110,6 +115,7 @@ function InlinePlanStepRow({
   onUpdate,
 }: {
   readonly workspaceRoot: string;
+  readonly currentBranch?: string | null | undefined;
   readonly step: DispatchTaskCard;
   readonly run: DispatchStepRun | undefined;
   readonly escalation: DispatchEscalationRecord | undefined;
@@ -119,7 +125,7 @@ function InlinePlanStepRow({
   readonly onToggleExpand: () => void;
   readonly onOpenThread: (threadId: string) => void;
   readonly onOpenFile: (relativePath: string) => void;
-  readonly onOpenDiff: () => void;
+  readonly onOpenStepDiff: () => void;
   readonly onRun: () => void;
   readonly onCancel: () => void;
   readonly onAccept: () => void;
@@ -148,6 +154,10 @@ function InlinePlanStepRow({
   const hasBoundaryIssues = run?.boundaryAudit?.ok === false;
   const hasFailedGate = run?.hardGate?.ok === false;
   const hasDiagnostics = Boolean(run?.lastError || hasBoundaryIssues || hasFailedGate);
+  const verification =
+    step.status === "ready_to_accept" && kind !== "research"
+      ? summarizeStepVerification(step, run, currentBranch)
+      : null;
   const hasSpecDetails =
     Boolean(step.goal?.trim()) ||
     Boolean(step.contractNote?.trim()) ||
@@ -179,6 +189,7 @@ function InlinePlanStepRow({
 
   return (
     <div
+      data-inline-step-id={step.id}
       className={cn(
         "px-4 py-2.5 transition-colors",
         isActive && "bg-foreground/[0.025]",
@@ -252,9 +263,9 @@ function InlinePlanStepRow({
 
           {step.status === "ready_to_accept" && (
             <>
-              {changedFiles.length > 0 && (
-                <Button size="xs" variant="ghost" onClick={onOpenDiff}>
-                  Diff
+              {(changedFiles.length > 0 || Boolean(run?.diffSummary?.patch.trim())) && (
+                <Button size="xs" variant="ghost" onClick={onOpenStepDiff}>
+                  本步改动
                 </Button>
               )}
               <Button size="xs" variant="ghost" disabled={busy} onClick={onRevert}>
@@ -398,6 +409,87 @@ function InlinePlanStepRow({
         )}
       </div>
 
+      {/* 4-Fact Step Acceptance Card shown directly when step awaits confirmation */}
+      {verification && (
+        <div className="mt-2.5 ml-6 space-y-2 rounded-xl border border-border/65 bg-muted/25 p-3 text-xs">
+          {verification.summaryText && (
+            <div className="space-y-0.5">
+              <div className="text-2xs font-medium text-muted-foreground">本步实现了什么</div>
+              <p className="leading-relaxed text-foreground/90">{verification.summaryText}</p>
+            </div>
+          )}
+
+          <div className="space-y-1">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-2xs font-medium text-muted-foreground">
+                改动文件（{verification.changedFiles.length}）
+              </span>
+              {(verification.changedFiles.length > 0 || verification.hasPatch) && (
+                <button
+                  type="button"
+                  onClick={onOpenStepDiff}
+                  className="inline-flex items-center gap-1 text-2xs font-medium text-foreground underline underline-offset-2 hover:opacity-80"
+                >
+                  <FileDiffIcon className="size-3" />
+                  查看本步改动
+                </button>
+              )}
+            </div>
+            {verification.changedFiles.length > 0 ? (
+              <div className="flex flex-wrap gap-1.5">
+                {verification.changedFiles.slice(0, 6).map((filePath) => (
+                  <button
+                    key={filePath}
+                    type="button"
+                    onClick={() => onOpenFile(filePath)}
+                    className="rounded border border-border/60 bg-background/70 px-1.5 py-0.5 font-mono text-2xs text-foreground/85 hover:border-border hover:bg-accent/50"
+                  >
+                    {filePath}
+                  </button>
+                ))}
+                {verification.changedFiles.length > 6 && (
+                  <span className="px-1 py-0.5 text-2xs text-muted-foreground">
+                    +{verification.changedFiles.length - 6} 个文件
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="text-2xs text-muted-foreground">无文件改动记录</div>
+            )}
+          </div>
+
+          <div className="space-y-1">
+            <div className="text-2xs font-medium text-muted-foreground">实际运行检查</div>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-foreground/85">
+              <span>{verification.checkLabel}</span>
+              <span className="text-muted-foreground">·</span>
+              <span className="text-muted-foreground">{verification.reviewLabel}</span>
+            </div>
+            {run?.hardGate && run.hardGate.results.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 pt-0.5">
+                {run.hardGate.results.map((item) => (
+                  <code
+                    key={item.command}
+                    className={cn(
+                      "rounded border px-1.5 py-0.5 font-mono text-2xs",
+                      item.ok
+                        ? "border-border/60 bg-background/70 text-foreground/85"
+                        : "border-destructive/40 bg-destructive/10 text-destructive",
+                    )}
+                  >
+                    {item.ok ? "✓" : "✗"} {item.command}
+                  </code>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="text-2xs text-muted-foreground">
+            确认后影响：<span className="text-foreground/85">{verification.targetBranchLabel}</span>
+          </div>
+        </div>
+      )}
+
       {/* Expandable Detail Drawer: Spec, Gates, Decision Picker, Escalation, Diagnostics */}
       <Collapsible open={showDetails}>
         <CollapsiblePanel>
@@ -443,10 +535,11 @@ function InlinePlanStepRow({
                     disabled={busy || !customEscalationReply.trim()}
                     onClick={() => {
                       const decision = customEscalationReply.trim();
-                      setCustomEscalationReply("");
                       void onReplyEscalation({
                         escalationId: escalation.id,
                         decision,
+                      }).then((ok) => {
+                        if (ok) setCustomEscalationReply("");
                       });
                     }}
                   >
@@ -559,10 +652,10 @@ function InlinePlanStepRow({
                 </span>
                 <button
                   type="button"
-                  onClick={onOpenDiff}
+                  onClick={onOpenStepDiff}
                   className="text-foreground/80 underline underline-offset-2 hover:text-foreground"
                 >
-                  查看 Diff
+                  查看本步改动
                 </button>
               </div>
               <div className="flex flex-wrap gap-1.5">
@@ -606,22 +699,81 @@ function InlinePlanStepRow({
  * reviewer, isolation, and gate rules transparent and editable before/during execution without
  * auto-opening right-panel subagent tabs.
  */
-export function DispatchInlinePlanCard({
+export function DispatchInlinePlanCard(
+  props: Parameters<typeof LegacyDispatchInlinePlanCard>[0] & {
+    readonly onFocusComposer?: (() => void) | undefined;
+  },
+) {
+  const { state, threadRef, workspaceRoot, onFocusComposer } = props;
+  return state.collab ? (
+    <CollabV2Card
+      key={state.collab.planId}
+      collab={state.collab}
+      threadRef={threadRef}
+      workspaceRoot={workspaceRoot}
+      onFocusComposer={onFocusComposer}
+    />
+  ) : (
+    <LegacyDispatchInlinePlanCard {...props} />
+  );
+}
+
+function LegacyDispatchInlinePlanCard({
   workspaceRoot,
   threadRef,
   state,
+  currentBranch,
 }: {
   readonly workspaceRoot: string;
   readonly threadRef: ScopedThreadRef;
   readonly state: VelaDispatchState;
+  readonly currentBranch?: string | null | undefined;
 }) {
-  const providers = useVelaDispatchProviders();
+  const providers = useVelaDispatchProviders(threadRef.environmentId);
   const { busyKey, runAction, openChildThread, openFileInPanel, openDiffInPanel } =
     useDispatchActions(workspaceRoot, threadRef);
 
   const [collapsed, setCollapsed] = useState(false);
   const [blindFactsOpen, setBlindFactsOpen] = useState(false);
   const [expandedStepIds, setExpandedStepIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [diffStepId, setDiffStepId] = useState<string | null>(null);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- expands and scrolls to the target dispatch step requested by sidebar attention navigation
+  useEffect(() => {
+    return subscribeFocusDispatchStep(threadRef.threadId, (stepId) => {
+      setCollapsed(false);
+      setExpandedStepIds((prev) => {
+        if (prev.has(stepId)) return prev;
+        const next = new Set(prev);
+        next.add(stepId);
+        return next;
+      });
+      if (typeof document !== "undefined") {
+        requestAnimationFrame(() => {
+          document
+            .querySelector(`[data-inline-step-id="${CSS.escape(stepId)}"]`)
+            ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        });
+      }
+    });
+  }, [threadRef.threadId]);
+
+  const focusInlineStep = (stepId: string) => {
+    setCollapsed(false);
+    setExpandedStepIds((prev) => {
+      if (prev.has(stepId)) return prev;
+      const next = new Set(prev);
+      next.add(stepId);
+      return next;
+    });
+    if (typeof document !== "undefined") {
+      requestAnimationFrame(() => {
+        document
+          .querySelector(`[data-inline-step-id="${CSS.escape(stepId)}"]`)
+          ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+    }
+  };
 
   const toggleStepExpand = (stepId: string) => {
     setExpandedStepIds((prev) => {
@@ -856,19 +1008,51 @@ export function DispatchInlinePlanCard({
         </div>
       </div>
 
-      {/* Hairline progress segments */}
-      <div className="flex h-0.5 w-full gap-px bg-border/35">
+      {/* Interactive hairline progress segments */}
+      <div
+        className="flex w-full gap-0.5 bg-border/20 px-4 py-1"
+        role="progressbar"
+        aria-label="分步执行进度"
+        aria-valuemin={0}
+        aria-valuemax={orderedSteps.length}
+        aria-valuenow={doneCount}
+      >
         {orderedSteps.map((step) => {
           const seg = progressSegmentTone(step.status);
+          const run = state.runs[step.id];
           return (
-            <div
-              key={step.id}
-              className={cn("relative h-full flex-1 overflow-hidden", seg.className)}
-            >
-              {seg.sweep && (
-                <div className="pointer-events-none absolute inset-y-0 left-0 w-1/2 bg-gradient-to-r from-transparent via-foreground/45 to-transparent visible-animate-dispatch-sweep" />
-              )}
-            </div>
+            <Tooltip key={step.id}>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    onClick={() => focusInlineStep(step.id)}
+                    aria-label={`${step.id} ${step.title}：${STATUS_LABEL[step.status]}`}
+                    className="group/seg relative flex min-w-0 flex-1 cursor-pointer items-center py-1.5 -my-1 focus-visible:outline-1 focus-visible:outline-ring"
+                  >
+                    <span
+                      className={cn(
+                        "relative block h-1 w-full overflow-hidden rounded-full transition-all group-hover/seg:h-1.5",
+                        seg.className,
+                      )}
+                    >
+                      {seg.sweep && (
+                        <span className="pointer-events-none absolute inset-y-0 left-0 w-1/2 rounded-full bg-gradient-to-r from-transparent via-foreground/45 to-transparent visible-animate-dispatch-sweep" />
+                      )}
+                    </span>
+                  </button>
+                }
+              />
+              <TooltipPopup side="top">
+                <div>
+                  <span className="font-mono">{step.id}</span> {step.title} ·{" "}
+                  {STATUS_LABEL[step.status]}
+                </div>
+                {run?.headline && (
+                  <div className="mt-0.5 text-muted-foreground">{run.headline}</div>
+                )}
+              </TooltipPopup>
+            </Tooltip>
           );
         })}
       </div>
@@ -959,6 +1143,7 @@ export function DispatchInlinePlanCard({
                       <InlinePlanStepRow
                         key={step.id}
                         workspaceRoot={workspaceRoot}
+                        currentBranch={currentBranch}
                         step={step}
                         run={state.runs[step.id]}
                         escalation={stepEscalation}
@@ -968,7 +1153,7 @@ export function DispatchInlinePlanCard({
                         onToggleExpand={() => toggleStepExpand(step.id)}
                         onOpenThread={openChildThread}
                         onOpenFile={openFileInPanel}
-                        onOpenDiff={openDiffInPanel}
+                        onOpenStepDiff={() => setDiffStepId(step.id)}
                         onRun={() =>
                           void runAction(`run:${step.id}`, "/api/vela/dispatch/step/run", {
                             stepId: step.id,
@@ -1126,6 +1311,15 @@ export function DispatchInlinePlanCard({
           </div>
         </CollapsiblePanel>
       </Collapsible>
+
+      <DispatchStepDiffDialog
+        step={diffStepId ? (steps.find((s) => s.id === diffStepId) ?? null) : null}
+        run={diffStepId ? state.runs[diffStepId] : undefined}
+        onClose={() => setDiffStepId(null)}
+        onOpenFile={openFileInPanel}
+        onOpenWorkspaceDiff={openDiffInPanel}
+        onOpenChildThread={openChildThread}
+      />
     </div>
   );
 }

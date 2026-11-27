@@ -9,6 +9,7 @@ import { AsyncResult } from "effect/reactivity";
 import {
   ADD_PROJECT_SCOPE_ITEM_VALUE,
   filterSidebarProjectScopeItems,
+  filterSidebarV2VisibleThreads,
   shouldCreateNewThreadInCurrentProject,
   resolveScopedNewThreadProjectRef,
   deleteSelectedThreadEntries,
@@ -65,6 +66,29 @@ import {
 } from "./sidebar/routeReveal";
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
+
+describe("filterSidebarV2VisibleThreads", () => {
+  it("keeps collaboration workers and auditors under their parent thread", () => {
+    const parent = makeThread({ id: ThreadId.make("collab-parent") });
+    const children = ["develop", "audit", "second-opinion"].map((role) =>
+      makeThread({
+        id: ThreadId.make(role),
+        lineage: {
+          parentThreadId: parent.id,
+          rootThreadId: parent.id,
+          relationshipToParent: "subagent",
+        },
+      }),
+    );
+    const separateFork = makeThread({
+      id: ThreadId.make("regular-fork"),
+      lineage: { parentThreadId: parent.id, rootThreadId: parent.id, relationshipToParent: "fork" },
+    });
+    expect(
+      filterSidebarV2VisibleThreads([parent, ...children, separateFork], null, new Set()),
+    ).toEqual([parent, separateFork]);
+  });
+});
 
 describe("deleteSelectedThreadEntries", () => {
   const entries = [{ threadKey: "one" }, { threadKey: "two" }, { threadKey: "three" }] as const;

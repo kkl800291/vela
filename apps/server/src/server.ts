@@ -39,6 +39,9 @@ import { withRootRequestSpans, withUntracedRequests } from "./http.ts";
 import * as ServerHttp from "./http.ts";
 import * as UnifiedMcpRoutes from "./mcp/unifiedMcpRoutes.ts";
 import * as VelaDispatchRoutes from "./dispatch/velaDispatchRoutes.ts";
+import * as VelaMobileApkRoutes from "./mobile/velaMobileApkRoutes.ts";
+import * as VelaCollabEngine from "./dispatch/VelaCollabEngine.ts";
+import * as VelaCollabStore from "./dispatch/VelaCollabStore.ts";
 import * as VelaDispatchService from "./dispatch/VelaDispatchService.ts";
 import {
   guardHttpResponseWriteErrors,
@@ -917,6 +920,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerHttp.layerAttachmentUploadRoute,
     UnifiedMcpRoutes.layer,
     VelaDispatchRoutes.layer,
+    VelaMobileApkRoutes.layer,
     GuestHttp.layer,
     LinkThreadHttp.layer,
     DeviceHubProxy.layer,
@@ -1426,6 +1430,7 @@ const layerMakeServer = Layer.unwrap(
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
       Layer.provide(VelaDispatchService.layer),
+      Layer.provideMerge(VelaCollabEngine.layer.pipe(Layer.provideMerge(VelaCollabStore.layer))),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(

@@ -78,3 +78,5 @@ export * from "./agentFeedback.ts";
 export * from "./secretReference.ts";
 export * from "./settingsSecretValue.ts";
 export * from "./clientRpcPermissions.ts";
+
+export type * from "./velaCollab.ts";

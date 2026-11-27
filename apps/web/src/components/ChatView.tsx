@@ -68,6 +68,14 @@ import { useWorktreeSetup } from "./chat/useWorktreeSetup";
 import { useChatShortcuts } from "./chat/useChatShortcuts";
 import { ChatBannerLane } from "./chat/ChatBannerLane";
 import { DispatchInlinePlanCard } from "./chat/dispatch/DispatchInlinePlanCard";
+import {
+  formatCollabAttentionShort,
+  isCollabStepActive,
+  isCollabStepDone,
+} from "./chat/dispatch/dispatchModel";
+import { requestFocusDispatchStep } from "../state/velaDispatch";
+import { Button, InlineButton } from "./ui/button";
+import { Spinner } from "./ui/spinner";
 import { useVelaDispatchState } from "../state/velaDispatch";
 import * as Schema from "effect/Schema";
 import {
@@ -315,6 +323,11 @@ import type { MessagesTimelineHistoryControls } from "./chat/MessagesTimeline";
 import { ThreadTimeline } from "./chat/ThreadTimeline";
 import { NativeChildWorkDialog } from "./chat/NativeChildWorkDialog";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
+import {
+  ReadOnlyComposerBar,
+  ReadOnlyComposerLead,
+  ReadOnlyComposerStatus,
+} from "./chat/ReadOnlyComposerBar";
 import { getTriggerDisplayModelName } from "./chat/providerIconUtils";
 import { resolveScrollToEndClearance } from "./composerFooterLayout";
 import { ChatHeader } from "./chat/ChatHeader";
@@ -1888,9 +1901,14 @@ export default function ChatView(props: ChatViewProps) {
     isGitRepo ||
     (activeProject?.trackedFolders?.length ?? 0) > 0 ||
     turnDiffSummaries.some((summary) => summary.repositories !== undefined);
-  // Provider-native subagents cannot take messages; approvals and questions go to the top-level parent.
+  // Provider-native subagents and managed parallel-task subagents cannot take direct messages;
+  // follow-ups go through the main orchestrator thread to protect frozen snapshots.
+  const isDispatchSubagent =
+    (activeThread?.workflowRun?.workflow ?? serverThread?.workflowRun?.workflow) ===
+    "vela-dispatch";
   const showProviderSubagentBar = isProviderSubagent;
-  const composerMounted = !showProviderSubagentBar;
+  const showDispatchSubagentBar = isDispatchSubagent && !showProviderSubagentBar;
+  const composerMounted = !showProviderSubagentBar && !showDispatchSubagentBar;
   const providerSubagentModels = selectedProviderEntry?.models ?? EMPTY_PROVIDER_MODELS;
   // Providers can report dated model ids or aliases.
   const providerSubagentModelSlug = selectedProviderEntry
@@ -2536,7 +2554,6 @@ export default function ChatView(props: ChatViewProps) {
     activateRightPanelSurfaceStable,
     addDeviceSurfaceStable,
     addDiffSurfaceStable,
-    addDispatchSurfaceStable,
     addFilesSurfaceStable,
     addPullRequestSurfaceStable,
     addPullRequestsSurfaceStable,
@@ -3380,17 +3397,74 @@ export default function ChatView(props: ChatViewProps) {
   const { state: inlineDispatchState } = useVelaDispatchState(
     dispatchInlineWorkspaceRoot,
     dispatchInlineWorkspaceRoot ? routeThreadRef.threadId : undefined,
+    dispatchInlineWorkspaceRoot ? routeThreadRef.environmentId : undefined,
   );
   const hasInlineDispatchCard =
-    !isWorking &&
     inlineDispatchState !== null &&
-    (inlineDispatchState.steps.length > 0 || inlineDispatchState.blindCheck !== null);
+    (Boolean(inlineDispatchState.collab) ||
+      (!isWorking &&
+        (inlineDispatchState.steps.length > 0 || inlineDispatchState.blindCheck !== null)));
+  const activeCollab = inlineDispatchState?.collab ?? null;
+  const collabWorkNow = (() => {
+    if (!activeCollab || (activeCollab.status !== "running" && activeCollab.status !== "batch_verifying")) {
+      return null;
+    }
+    const doneCount = activeCollab.steps.filter((s) => isCollabStepDone(s.status)).length;
+    const totalCount = activeCollab.steps.length;
+    const reviewingStep =
+      activeCollab.steps.find((s) => s.status === "reviewing") ??
+      (activeCollab.activeInbox?.kind === "review" && activeCollab.activeInbox.status === "dispatched"
+        ? activeCollab.steps.find((s) => s.stepId === activeCollab.activeInbox?.stepId)
+        : undefined);
+    const attentionStepIndex = activeCollab.steps.findIndex((s) => s.status === "needs_attention");
+    const attentionStep = attentionStepIndex >= 0 ? activeCollab.steps[attentionStepIndex] : undefined;
+    const runningCount = activeCollab.steps.filter((s) => isCollabStepActive(s.status)).length;
+
+    let title: string;
+    let description: string | undefined;
+    if (activeCollab.status === "batch_verifying") {
+      title = `并行任务 ${totalCount}/${totalCount}`;
+      description =
+        activeCollab.batchGateSummary?.passed && activeCollab.config.enableBatchAudit
+          ? "· 应用前独立审查中"
+          : "· 整体验证中";
+    } else if (attentionStep) {
+      title = `第 ${attentionStepIndex + 1} 步${formatCollabAttentionShort(attentionStep)}`;
+      description = runningCount > 0 ? "· 其余步骤继续执行" : undefined;
+    } else if (reviewingStep) {
+      title = `并行任务 ${doneCount}/${totalCount}`;
+      description = `· 正在审查「${reviewingStep.title}」`;
+    } else {
+      title = `并行任务 ${doneCount}/${totalCount}`;
+      description = runningCount > 0 ? `· ${runningCount} 个步骤执行中` : undefined;
+    }
+
+    return {
+      id: `collab-now:${activeCollab.planId}`,
+      icon: attentionStep ? (
+        <span aria-hidden className="size-1.5 rounded-full bg-muted-foreground/70" />
+      ) : (
+        <Spinner size="xs" />
+      ),
+      title,
+      ...(description ? { description } : {}),
+      actions: (
+        <InlineButton
+          onClick={() => requestFocusDispatchStep(routeThreadRef.threadId, "__plan__")}
+        >
+          {/* oxlint-disable-next-line t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */}
+          查看任务
+        </InlineButton>
+      ),
+    };
+  })();
   // The end of the timeline holds the thread's present and next turns: inline dispatch plan card,
   // what it is doing now, its lifecycle status, guest messages awaiting you, then your queued messages.
   const timelineFooter =
     !hasInlineDispatchCard &&
     pendingHandoff === null &&
     !hasThreadNow &&
+    collabWorkNow === null &&
     threadStatusLine === null &&
     pendingGuestMessageCount === 0 &&
     !hasQueuedTurns ? null : (
@@ -3401,6 +3475,8 @@ export default function ChatView(props: ChatViewProps) {
               workspaceRoot={dispatchInlineWorkspaceRoot}
               threadRef={routeThreadRef}
               state={inlineDispatchState}
+              currentBranch={activeThread?.branch ?? gitStatusQuery.data?.refName ?? null}
+              onFocusComposer={() => composerRef.current?.focusAtEnd()}
             />
           </div>
         ) : null}
@@ -3417,7 +3493,7 @@ export default function ChatView(props: ChatViewProps) {
         <ThreadNow
           key={routeThreadKey}
           attention={attentionNow}
-          work={workNow}
+          work={workNow ?? collabWorkNow}
           syncPhase={shownThreadSyncPhase}
           goal={goalNow}
         />
@@ -3504,6 +3580,8 @@ export default function ChatView(props: ChatViewProps) {
       sideChatParentPanel={sideChatParentPanel}
       dispatch={{
         isServerThread,
+        hasConversationMessages: !timelineEmpty,
+        currentBranch: activeThread.branch ?? gitStatusQuery.data?.refName ?? null,
         sendPrompt: sendDispatchPromptStable,
       }}
       terminal={{
@@ -3893,6 +3971,44 @@ export default function ChatView(props: ChatViewProps) {
                                   ) : null
                                 }
                               />
+                            ) : null}
+                            {showDispatchSubagentBar ? (
+                              /* oxlint-disable t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */
+                              <ReadOnlyComposerBar
+                                actions={
+                                  <>
+                                    <span className="shrink-0 text-muted-foreground @max-[560px]/composer-surface:sr-only">
+                                      补充要求请在主会话中说明
+                                    </span>
+                                    {parentSubagentThreadId ? (
+                                      <Button
+                                        size="xs"
+                                        variant="ghost"
+                                        onClick={() => {
+                                          parentThreadLink?.open?.();
+                                          requestFocusDispatchStep(
+                                            parentSubagentThreadId,
+                                            activeThread?.workflowRun?.step ?? "__plan__",
+                                          );
+                                        }}
+                                      >
+                                        定位到步骤
+                                      </Button>
+                                    ) : null}
+                                  </>
+                                }
+                              >
+                                <ReadOnlyComposerLead>
+                                  {isWorking ? <Spinner size="xs" /> : null}
+                                  <span className="min-w-0 truncate font-medium text-foreground">
+                                    {activeThread?.title ?? "子会话"}
+                                  </span>
+                                </ReadOnlyComposerLead>
+                                <ReadOnlyComposerStatus>
+                                  {isWorking ? "执行中" : "只读子会话"}
+                                </ReadOnlyComposerStatus>
+                              </ReadOnlyComposerBar>
+                              /* oxlint-enable t3code/no-untranslated-copy */
                             ) : null}
                             {!composerMounted ? null : (
                               <ChatComposer
@@ -4320,7 +4436,6 @@ export default function ChatView(props: ChatViewProps) {
           onAddPullRequests={addPullRequestsSurfaceStable}
           onAddDevice={addDeviceSurfaceStable}
           onAddSideChat={sideChatsOffered ? openSideChatStable : undefined}
-          onAddDispatch={addDispatchSurfaceStable}
           browserAvailable={canOperatePreview && browserAvailable}
           terminalAvailable={activeProject !== null && canOperateTerminal}
           diffAvailable={isServerThread && diffAvailable}
@@ -4329,7 +4444,6 @@ export default function ChatView(props: ChatViewProps) {
           pullRequestsAvailable={linkedItemsSurfaceAvailable}
           deviceAvailable={activeThreadRef !== null}
           sideChatAvailable={sideChat.available}
-          dispatchAvailable={activeProject !== null}
           sideChatDisabledReason={sideChatDisabledReason}
         >
           {rightPanelContent}

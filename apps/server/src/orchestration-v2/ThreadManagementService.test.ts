@@ -7,6 +7,8 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2ProviderThread,
   ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   ProviderDriverKind,
   ProviderSessionId,
   type OrchestrationV2StoredEvent,
@@ -129,6 +131,44 @@ const layerDispatchChokepointTest =
       Layer.provide(settingsLayer),
       Layer.provideMerge(layerReceiptsTest),
     );
+
+it.effect("resolves a caller run from its active provider session and attempt", () => {
+  const providerInstanceId = ProviderInstanceId.make("codex");
+  const providerSessionId = ProviderSessionId.make("credential-session");
+  const providerThreadId = ProviderThreadId.make("provider-thread");
+  const runId = RunId.make("dedicated-review-run");
+  const attemptId = RunAttemptId.make("active-attempt");
+  const turnId = ProviderTurnId.make("active-turn");
+  const threadId = ThreadId.make("caller-thread");
+  const run = { id: runId, providerInstanceId, providerThreadId, activeAttemptId: attemptId, status: "running" };
+  const turn = { id: turnId, runAttemptId: attemptId, providerThreadId, status: "running" };
+  let projection = {
+    thread: { id: threadId, archivedAt: null, deletedAt: null },
+    runs: [run],
+    providerThreads: [{ id: providerThreadId, appThreadId: threadId, providerSessionId, providerInstanceId }],
+    attempts: [{ id: attemptId, runId, providerThreadId, providerTurnId: null }],
+    providerTurns: [turn],
+  };
+  const layer = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({
+      getThreadRecords: () => Effect.sync(() => projection as unknown as OrchestrationV2ThreadProjection),
+    })),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+  return Effect.gen(function* () {
+    const threads = yield* ThreadManagementService.ThreadManagementService;
+    const caller = { threadId, providerSessionId, providerInstanceId };
+    expect(yield* threads.resolveCallerRunId(caller)).toBe(runId);
+    expect(yield* threads.resolveCallerRunId({ ...caller, providerSessionId: "earlier-session" })).toBeUndefined();
+    expect(yield* threads.resolveCallerRunId({ ...caller, providerInstanceId: ProviderInstanceId.make("other-provider") })).toBeUndefined();
+    yield* Effect.sync(() => { projection = { ...projection, providerTurns: [{ ...turn, status: "completed" }] }; });
+    expect(yield* threads.resolveCallerRunId(caller)).toBeUndefined();
+    yield* Effect.sync(() => { projection = { ...projection, providerTurns: [turn], runs: [{ ...run, status: "completed" }] }; });
+    expect(yield* threads.resolveCallerRunId(caller)).toBeUndefined();
+  }).pipe(Effect.provide(layer));
+});
 
 it.effect(
   "the dispatch chokepoint refuses a continuation message.dispatch on a project-disabled instance before reaching the orchestrator",

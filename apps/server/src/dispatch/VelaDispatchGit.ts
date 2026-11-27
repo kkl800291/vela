@@ -100,17 +100,35 @@ export async function isValidGitTree(projectRoot: string, treeSha: string): Prom
   return res.exitCode === 0 && res.stdout.trim() === "tree";
 }
 
+export interface WorkspaceDeltaWithTree {
+  readonly diff: DispatchDiffSummary;
+  readonly currentTree: string | null;
+}
+
+export interface SafeRevertConflict {
+  readonly file: string;
+  readonly reason: string;
+}
+
+export interface SafeRevertResult {
+  readonly restoredFiles: ReadonlyArray<string>;
+  readonly removedFiles: ReadonlyArray<string>;
+  readonly mergedFiles: ReadonlyArray<string>;
+  readonly skippedFiles: ReadonlyArray<string>;
+  readonly conflicts: ReadonlyArray<SafeRevertConflict>;
+}
+
 /**
  * Computes exact incremental changed files + patch relative to `baselineTree` (direct mode)
- * or `HEAD` (worktree mode), automatically excluding `.vela/` and `.harness/` metadata.
+ * or `HEAD` (worktree mode), plus the captured `currentTree` SHA, excluding `.vela/` and `.harness/`.
  */
-export async function inspectWorkspaceDelta(
+export async function inspectWorkspaceDeltaWithTree(
   cwd: string,
   baselineTree: string | null,
-): Promise<DispatchDiffSummary> {
+): Promise<WorkspaceDeltaWithTree> {
   const inside = await runGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
   if (inside.exitCode !== 0 || inside.stdout.trim() !== "true") {
-    return { changedFiles: [], patch: "", truncated: false };
+    return { diff: { changedFiles: [], patch: "", truncated: false }, currentTree: null };
   }
 
   const tmpDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vela-dispatch-diff-"));
@@ -124,11 +142,11 @@ export async function inspectWorkspaceDelta(
     await runGit(cwd, ["add", "-A", "--", ".", ":(exclude).vela", ":(exclude).harness"], env);
     const currentTreeRes = await runGit(cwd, ["write-tree"], env);
     if (currentTreeRes.exitCode !== 0) {
-      return { changedFiles: [], patch: "", truncated: false };
+      return { diff: { changedFiles: [], patch: "", truncated: false }, currentTree: null };
     }
-    const currentTree = currentTreeRes.stdout.trim();
+    const currentTree = currentTreeRes.stdout.trim() || null;
     if (!currentTree || currentTree === baseRef) {
-      return { changedFiles: [], patch: "", truncated: false };
+      return { diff: { changedFiles: [], patch: "", truncated: false }, currentTree };
     }
 
     const [namesRes, patchRes] = await Promise.all([
@@ -147,10 +165,22 @@ export async function inspectWorkspaceDelta(
       ? `${rawPatch.slice(0, MAX_PATCH_CHARS)}\n\n... [diff truncated at ${MAX_PATCH_CHARS} chars]`
       : rawPatch;
 
-    return { changedFiles, patch, truncated };
+    return { diff: { changedFiles, patch, truncated }, currentTree };
   } finally {
     await NodeFSP.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/**
+ * Computes exact incremental changed files + patch relative to `baselineTree` (direct mode)
+ * or `HEAD` (worktree mode), automatically excluding `.vela/` and `.harness/` metadata.
+ */
+export async function inspectWorkspaceDelta(
+  cwd: string,
+  baselineTree: string | null,
+): Promise<DispatchDiffSummary> {
+  const { diff } = await inspectWorkspaceDeltaWithTree(cwd, baselineTree);
+  return diff;
 }
 
 /**
@@ -218,6 +248,273 @@ export async function revertWorkspaceToSnapshot(
     }
 
     return { restoredFiles: toRestore, removedFiles: toRemove };
+  } finally {
+    await NodeFSP.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function getBlobShaInTree(cwd: string, treeSha: string, relPath: string): Promise<string | null> {
+  const res = await runGit(cwd, ["rev-parse", "--verify", "-q", `${treeSha}:${relPath}`]);
+  return res.exitCode === 0 ? res.stdout.trim() || null : null;
+}
+
+async function getWorktreeFileBlobSha(cwd: string, relPath: string): Promise<string | null> {
+  const absPath = NodePath.join(cwd, relPath);
+  if (!NodeFS.existsSync(absPath)) return null;
+  const stat = await NodeFSP.lstat(absPath).catch(() => null);
+  if (!stat || stat.isDirectory()) return null;
+  const res = await runGit(cwd, ["hash-object", "--", absPath]);
+  return res.exitCode === 0 ? res.stdout.trim() || null : null;
+}
+
+async function readBlobBuffer(cwd: string, blobSha: string): Promise<Buffer> {
+  const { stdout } = await execFileAsync("git", ["cat-file", "blob", blobSha], {
+    cwd,
+    encoding: "buffer",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+async function tryThreeWayReverseMerge(
+  cwd: string,
+  tmpDir: string,
+  absCurrentPath: string,
+  completedBlob: string,
+  baselineBlob: string,
+  idx: number,
+): Promise<Buffer | null> {
+  const completedPath = NodePath.join(tmpDir, `completed-${idx}`);
+  const baselinePath = NodePath.join(tmpDir, `baseline-${idx}`);
+  const [completedBuf, baselineBuf] = await Promise.all([
+    readBlobBuffer(cwd, completedBlob),
+    readBlobBuffer(cwd, baselineBlob),
+  ]);
+  await Promise.all([
+    NodeFSP.writeFile(completedPath, completedBuf),
+    NodeFSP.writeFile(baselinePath, baselineBuf),
+  ]);
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["merge-file", "-p", absCurrentPath, completedPath, baselinePath],
+      { cwd, encoding: "buffer", maxBuffer: 16 * 1024 * 1024 },
+    );
+    return stdout;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Incrementally reverts only the changes introduced by a single dispatch step (`baselineTree` ->
+ * `completedTree`), leaving unrelated manual edits and newly created user files intact. When the
+ * user edited a file touched by the step, performs a 3-way reverse merge (`completed -> baseline`
+ * onto current) and aborts without touching disk if any conflict exists (unless `force` is true).
+ */
+export async function revertStepSnapshotSafely(
+  cwd: string,
+  input: {
+    readonly baselineTree: string;
+    readonly completedTree?: string | null | undefined;
+    readonly trackedFiles?: ReadonlyArray<string> | undefined;
+    readonly force?: boolean | undefined;
+  },
+): Promise<SafeRevertResult> {
+  const { baselineTree, completedTree, trackedFiles, force = false } = input;
+  if (!(await isValidGitTree(cwd, baselineTree))) {
+    throw new Error(`无效的快照树 (${baselineTree})，无法安全撤回`);
+  }
+
+  const hasCompletedTree = Boolean(completedTree && (await isValidGitTree(cwd, completedTree)));
+  const tmpDir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vela-dispatch-safe-revert-"));
+
+  try {
+    if (hasCompletedTree && completedTree) {
+      if (completedTree === baselineTree) {
+        return {
+          restoredFiles: [],
+          removedFiles: [],
+          mergedFiles: [],
+          skippedFiles: [],
+          conflicts: [],
+        };
+      }
+
+      const statusRes = await runGit(cwd, [
+        "diff-tree",
+        "-r",
+        "--name-status",
+        "--no-commit-id",
+        baselineTree,
+        completedTree,
+      ]);
+
+      const toRestore: string[] = [];
+      const toRemove: string[] = [];
+      const toMergeWrite: Array<{ readonly relPath: string; readonly content: Buffer }> = [];
+      const skippedFiles: string[] = [];
+      const conflicts: SafeRevertConflict[] = [];
+
+      let mergeIdx = 0;
+      for (const line of statusRes.stdout.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        const parts = line.split("\t");
+        const code = parts[0]?.trim() ?? "";
+        const relPath = parts[1]?.trim() ?? "";
+        if (!relPath || isInternalDispatchPath(relPath)) continue;
+
+        const absPath = NodePath.join(cwd, relPath);
+        const [baselineBlob, completedBlob, currentBlob] = await Promise.all([
+          getBlobShaInTree(cwd, baselineTree, relPath),
+          getBlobShaInTree(cwd, completedTree, relPath),
+          getWorktreeFileBlobSha(cwd, relPath),
+        ]);
+
+        if (code.startsWith("A")) {
+          if (currentBlob === null) {
+            skippedFiles.push(relPath);
+          } else if (currentBlob === completedBlob || force) {
+            toRemove.push(relPath);
+          } else {
+            conflicts.push({ file: relPath, reason: "该新增文件在任务完成后被手工修改" });
+          }
+          continue;
+        }
+
+        if (code.startsWith("D")) {
+          if (currentBlob === baselineBlob) {
+            skippedFiles.push(relPath);
+          } else if (currentBlob === null || force) {
+            toRestore.push(relPath);
+          } else {
+            conflicts.push({ file: relPath, reason: "该文件在任务删除后又被手工重建或修改" });
+          }
+          continue;
+        }
+
+        // Modified / typechanged by step
+        if (currentBlob === baselineBlob) {
+          skippedFiles.push(relPath);
+        } else if (currentBlob === completedBlob || force) {
+          toRestore.push(relPath);
+        } else if (baselineBlob && completedBlob && currentBlob !== null) {
+          const merged = await tryThreeWayReverseMerge(
+            cwd,
+            tmpDir,
+            absPath,
+            completedBlob,
+            baselineBlob,
+            mergeIdx,
+          );
+          mergeIdx += 1;
+          if (merged !== null) {
+            toMergeWrite.push({ relPath, content: merged });
+          } else {
+            conflicts.push({ file: relPath, reason: "与你在任务后的手工修改存在冲突" });
+          }
+        } else {
+          conflicts.push({ file: relPath, reason: "文件在任务完成后被删除或修改，存在冲突" });
+        }
+      }
+
+      if (conflicts.length > 0 && !force) {
+        return {
+          restoredFiles: [],
+          removedFiles: [],
+          mergedFiles: [],
+          skippedFiles: [],
+          conflicts,
+        };
+      }
+
+      for (const rel of toRemove) {
+        await NodeFSP.rm(NodePath.join(cwd, rel), { recursive: true, force: true });
+      }
+      if (toRestore.length > 0) {
+        const restoreIdx = NodePath.join(tmpDir, "restore-index");
+        const restoreEnv = { GIT_INDEX_FILE: restoreIdx };
+        await runGit(cwd, ["read-tree", baselineTree], restoreEnv);
+        await runGit(cwd, ["checkout-index", "-f", "--", ...toRestore], restoreEnv);
+      }
+      for (const item of toMergeWrite) {
+        const absPath = NodePath.join(cwd, item.relPath);
+        await NodeFSP.mkdir(NodePath.dirname(absPath), { recursive: true });
+        await NodeFSP.writeFile(absPath, item.content);
+      }
+
+      return {
+        restoredFiles: toRestore,
+        removedFiles: toRemove,
+        mergedFiles: toMergeWrite.map((m) => m.relPath),
+        skippedFiles,
+        conflicts: [],
+      };
+    }
+
+    // Fallback when completedTree was not captured yet (e.g. legacy run or cancelled mid-run)
+    const scopedPaths = (trackedFiles ?? []).filter((f) => Boolean(f) && !isInternalDispatchPath(f));
+    if (scopedPaths.length > 0) {
+      const toRestore: string[] = [];
+      const toRemove: string[] = [];
+      const skippedFiles: string[] = [];
+
+      for (const relPath of scopedPaths) {
+        const [baselineBlob, currentBlob] = await Promise.all([
+          getBlobShaInTree(cwd, baselineTree, relPath),
+          getWorktreeFileBlobSha(cwd, relPath),
+        ]);
+        if (baselineBlob === currentBlob) {
+          skippedFiles.push(relPath);
+        } else if (baselineBlob === null) {
+          if (currentBlob !== null) toRemove.push(relPath);
+        } else {
+          toRestore.push(relPath);
+        }
+      }
+
+      for (const rel of toRemove) {
+        await NodeFSP.rm(NodePath.join(cwd, rel), { recursive: true, force: true });
+      }
+      if (toRestore.length > 0) {
+        const restoreIdx = NodePath.join(tmpDir, "restore-index");
+        const restoreEnv = { GIT_INDEX_FILE: restoreIdx };
+        await runGit(cwd, ["read-tree", baselineTree], restoreEnv);
+        await runGit(cwd, ["checkout-index", "-f", "--", ...toRestore], restoreEnv);
+      }
+
+      return {
+        restoredFiles: toRestore,
+        removedFiles: toRemove,
+        mergedFiles: [],
+        skippedFiles,
+        conflicts: [],
+      };
+    }
+
+    if (!force) {
+      return {
+        restoredFiles: [],
+        removedFiles: [],
+        mergedFiles: [],
+        skippedFiles: [],
+        conflicts: [
+          {
+            file: ".",
+            reason: "该任务步尚未记录完成快照，无法确定精确改动范围；如需全量回滚请确认强制撤回",
+          },
+        ],
+      };
+    }
+
+    const fallback = await revertWorkspaceToSnapshot(cwd, baselineTree);
+    return {
+      restoredFiles: fallback.restoredFiles,
+      removedFiles: fallback.removedFiles,
+      mergedFiles: [],
+      skippedFiles: [],
+      conflicts: [],
+    };
   } finally {
     await NodeFSP.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
   }

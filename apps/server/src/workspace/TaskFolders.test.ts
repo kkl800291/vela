@@ -1493,6 +1493,55 @@ it.live.each([
   ),
 );
 
+it.effect(
+  "reads worktreeLayout from vela.json and falls back to t3.json only when it is absent",
+  () =>
+    withState((state) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.realPath(
+          yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-task-folders-layout-file-" }),
+        );
+        state.workspaceRoot = root;
+        const commands = () =>
+          Effect.flatMap(TaskFolders.TaskFolders, (taskFolders) =>
+            taskFolders
+              .layoutCommands(projectId)
+              .pipe(Effect.map(({ commands }) => commands.map((command) => command.command))),
+          );
+
+        yield* fileSystem.writeFileString(
+          path.join(root, "t3.json"),
+          JSON.stringify({ worktreeLayout: { create: "echo legacy" } }),
+        );
+        assert.deepEqual(yield* commands(), ["echo legacy"]);
+
+        yield* fileSystem.writeFileString(
+          path.join(root, "vela.json"),
+          JSON.stringify({
+            worktreeLayout: { create: "echo primary", remove: "echo primary-remove" },
+          }),
+        );
+        assert.deepEqual(yield* commands(), ["echo primary", "echo primary-remove"]);
+
+        yield* fileSystem.writeFileString(path.join(root, "vela.json"), "{}");
+        assert.deepEqual(yield* commands(), []);
+
+        yield* fileSystem.writeFileString(path.join(root, "vela.json"), "{ not json");
+        assert.deepEqual(yield* commands(), []);
+
+        yield* fileSystem.remove(path.join(root, "vela.json"));
+        yield* fileSystem.remove(path.join(root, "t3.json"));
+        yield* fileSystem.writeFileString(
+          path.join(root, "vela.json"),
+          JSON.stringify({ worktreeLayout: { create: "echo only-vela" } }),
+        );
+        assert.deepEqual(yield* commands(), ["echo only-vela"]);
+      }),
+    ),
+);
+
 it.live("leaves an approved layout command unrun when policy turns layout commands off", () =>
   withState(
     (state) =>

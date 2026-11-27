@@ -216,6 +216,40 @@ function renderTimeline(entries: ReadonlyArray<Entry>, props: Partial<TimelinePr
   );
 }
 
+it("expands collaboration review details while keeping delivery visible", async () => {
+  const reviewRun = RunId.make("collab-review-run");
+  const deliveryRun = RunId.make("collab-delivery-run");
+  const system = { createdBy: "system", creationSource: "server" } as const;
+  await using screen = await renderTimeline([
+    message(
+      "[Vela collaboration review]\n{}",
+      { ...system, runId: reviewRun },
+      "vela-collab:review",
+    ),
+    message(
+      "Frozen snapshot review complete.",
+      { role: "assistant", runId: reviewRun },
+      "review-reply",
+    ),
+    message(
+      "[Vela collaboration delivery_ready]\n{}",
+      { ...system, runId: deliveryRun },
+      "vela-collab:delivery",
+    ),
+    message(
+      "Delivery ready for confirmation.",
+      { role: "assistant", runId: deliveryRun },
+      "delivery-reply",
+    ),
+  ]);
+  await expect.poll(screen.text).toContain("Delivery ready for confirmation.");
+  expect(screen.text()).not.toContain("Frozen snapshot review complete.");
+  await click(screen.button("主控协作审查 · 1 轮"));
+  await expect.poll(screen.text).toContain("Frozen snapshot review complete.");
+  await click(screen.button("主控协作审查 · 1 轮"));
+  await expect.poll(screen.text).not.toContain("Frozen snapshot review complete.");
+});
+
 async function click(element: HTMLElement) {
   await act(async () => element.click());
 }

@@ -77,4 +77,79 @@ describe("writeTextToClipboard", () => {
     expect(html).toContain(rich);
     expect(html).toContain("data-t3-context-fragment=");
   });
+
+  it("keeps empty strings as no-ops by default but allows explicit empty copies with fallback", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    await expect(writeTextToClipboard("")).resolves.toBe(false);
+    expect(writeText).not.toHaveBeenCalled();
+
+    await expect(
+      writeTextToClipboard("", undefined, undefined, { allowEmpty: true }),
+    ).resolves.toBe(true);
+    expect(writeText).toHaveBeenCalledWith("");
+
+    writeText.mockRejectedValueOnce(new Error("denied"));
+    await expect(
+      writeTextToClipboard("", undefined, undefined, { allowEmpty: true }),
+    ).rejects.toMatchObject({ _tag: "ClipboardWriteError" });
+  });
+
+  it("falls back to execCommand for empty text and TSV when navigator.clipboard is unavailable", async () => {
+    const setupDom = (execResult: boolean) => {
+      let copyListener: ((event: unknown) => void) | undefined;
+      const setData = vi.fn();
+      const preventDefault = vi.fn();
+      const previousFocus = vi.fn();
+      const textarea = {
+        value: "",
+        style: {} as Record<string, string>,
+        setAttribute: vi.fn(),
+        addEventListener: vi.fn((type: string, cb: (event: unknown) => void) => {
+          if (type === "copy") copyListener = cb;
+        }),
+        removeEventListener: vi.fn(),
+        focus: vi.fn(),
+        select: vi.fn(),
+        setSelectionRange: vi.fn(),
+        remove: vi.fn(),
+      };
+      const execCommand = vi.fn(() => {
+        copyListener?.({ clipboardData: { setData }, preventDefault });
+        return execResult;
+      });
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("navigator", {});
+      vi.stubGlobal("document", {
+        activeElement: { focus: previousFocus },
+        body: { appendChild: vi.fn() },
+        createElement: vi.fn(() => textarea),
+        execCommand,
+      });
+      return { execCommand, setData, preventDefault, previousFocus };
+    };
+
+    const empty = setupDom(true);
+    await expect(
+      writeTextToClipboard("", undefined, undefined, { allowEmpty: true }),
+    ).resolves.toBe(true);
+    expect(empty.execCommand).toHaveBeenCalledWith("copy");
+    expect(empty.setData).toHaveBeenCalledWith("text/plain", "");
+    expect(empty.preventDefault).toHaveBeenCalledOnce();
+    expect(empty.previousFocus).toHaveBeenCalledOnce();
+
+    const tsv = setupDom(true);
+    await expect(
+      writeTextToClipboard("a\tb\r\nc\td", undefined, undefined, { allowEmpty: true }),
+    ).resolves.toBe(true);
+    expect(tsv.execCommand).toHaveBeenCalledWith("copy");
+    expect(tsv.setData).toHaveBeenCalledWith("text/plain", "a\tb\r\nc\td");
+
+    const failing = setupDom(false);
+    await expect(
+      writeTextToClipboard("a\tb", undefined, undefined, { allowEmpty: true }),
+    ).rejects.toMatchObject({ _tag: "ClipboardApiUnavailableError" });
+    expect(failing.execCommand).toHaveBeenCalledWith("copy");
+  });
 });

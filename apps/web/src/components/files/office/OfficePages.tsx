@@ -4,6 +4,7 @@ import { observeResize } from "~/lib/observeResize";
 import {
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
@@ -22,6 +23,36 @@ export type PaintPage = (
   signal: AbortSignal,
 ) => Promise<void>;
 
+type PendingScroll = {
+  readonly index: number;
+  readonly y: number;
+  readonly pages: readonly PageSize[];
+};
+
+function pageScale(page: PageSize, width: number) {
+  return page.width > 0 ? Math.min(1, Math.max(0, width - 48) / page.width) : 0;
+}
+
+function tryScrollToPage(options: {
+  readonly root: HTMLDivElement | null;
+  readonly rows: ReadonlyMap<number, HTMLDivElement>;
+  readonly pages: readonly PageSize[];
+  readonly mounted: number;
+  readonly width: number;
+  readonly index: number;
+  readonly y: number;
+}): boolean {
+  const { root, rows, pages, mounted, width, index, y } = options;
+  const row = rows.get(index);
+  const page = pages[index];
+  if (!root || !row || !page || width <= 0) return false;
+  const top = Math.max(0, row.offsetTop + y * pageScale(page, width) - 24);
+  const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+  if (mounted < pages.length && top > maxScrollTop) return false;
+  root.scrollTo({ top });
+  return true;
+}
+
 export function OfficePages(props: {
   pages: readonly PageSize[];
   paint: PaintPage;
@@ -34,6 +65,7 @@ export function OfficePages(props: {
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const rows = useRef(new Map<number, HTMLDivElement>());
+  const pendingScroll = useRef<PendingScroll | null>(null);
   const [width, setWidth] = useState(0);
   const [settledWidth, setSettledWidth] = useState(0);
   const [mounted, setMounted] = useState(6);
@@ -52,6 +84,7 @@ export function OfficePages(props: {
     return () => {
       clearTimeout(timer);
       unobserve();
+      pendingScroll.current = null;
     };
   }, []);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Yield between page mounting batches with a timer so large documents do not block the browser.
@@ -64,15 +97,48 @@ export function OfficePages(props: {
     props.scrollRef,
     () =>
       (index: number, y = 0) => {
-        const row = rows.current.get(index);
-        const page = props.pages[index];
-        if (row && page)
-          scroller.current?.scrollTo({
-            top: row.offsetTop + y * Math.min(1, Math.max(0, width - 48) / page.width) - 24,
-          });
+        if (!props.pages[index]) return;
+        const offsetY = Number.isFinite(y) ? y : 0;
+        if (
+          tryScrollToPage({
+            root: scroller.current,
+            rows: rows.current,
+            pages: props.pages,
+            mounted,
+            width,
+            index,
+            y: offsetY,
+          })
+        ) {
+          pendingScroll.current = null;
+          return;
+        }
+        pendingScroll.current = { index, y: offsetY, pages: props.pages };
       },
-    [props.pages, width],
+    [mounted, props.pages, width],
   );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Flush a deferred imperative scroll to the DOM scroll container once the target page is mounted and measured.
+  useLayoutEffect(() => {
+    const pending = pendingScroll.current;
+    if (!pending) return;
+    if (pending.pages !== props.pages) {
+      pendingScroll.current = null;
+      return;
+    }
+    if (
+      tryScrollToPage({
+        root: scroller.current,
+        rows: rows.current,
+        pages: props.pages,
+        mounted,
+        width,
+        index: pending.index,
+        y: pending.y,
+      })
+    ) {
+      pendingScroll.current = null;
+    }
+  }, [mounted, props.pages, width]);
   return (
     <div
       ref={scroller}
@@ -107,8 +173,8 @@ export function OfficePages(props: {
               if (el) rows.current.set(index, el);
               else rows.current.delete(index);
             }}
-            scale={Math.min(1, Math.max(0, width - 48) / page.width)}
-            rasterScale={Math.min(1, Math.max(0, (settledWidth || width) - 48) / page.width)}
+            scale={pageScale(page, width)}
+            rasterScale={pageScale(page, settledWidth || width)}
             {...props}
           />
         ))}

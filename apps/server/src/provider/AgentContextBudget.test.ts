@@ -12,6 +12,7 @@ import { AssetSigner } from "../assets/AssetSigner.ts";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerConfig } from "../config.ts";
 import { DeviceService } from "../device/DeviceService.ts";
+import { VelaCollabEngine } from "../dispatch/VelaCollabEngine.ts";
 import { VelaDispatchService } from "../dispatch/VelaDispatchService.ts";
 import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import { GitManager } from "../git/GitManager.ts";
@@ -101,7 +102,8 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ThreadManagementService)({}),
   Layer.mock(ThreadSearch)({}),
   Layer.mock(VcsStatusBroadcaster)({}),
-  Layer.mock(VelaDispatchService)({ subscribe: () => () => {} }),
+  Layer.mock(VelaCollabEngine)({ subscribe: () => () => {}, subscribeAll: () => () => {} }),
+  Layer.mock(VelaDispatchService)({ subscribe: () => () => {}, subscribeAll: () => () => {} }),
 ).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
 
 const utf8Bytes = (text: string) => Buffer.byteLength(text, "utf8");

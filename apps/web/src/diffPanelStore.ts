@@ -13,11 +13,21 @@ export interface ToolCallDiffTarget {
   readonly revision: string;
 }
 
+export type CollabDiffTarget =
+  | { readonly reviewId: string }
+  | { readonly deliveryId: string };
+
 export type DiffPanelSelection =
   | ({ kind: "tool-call" } & ToolCallDiffTarget)
   | { kind: "branch"; baseRef: string | null }
   | { kind: "unstaged" }
   | { kind: "commit"; sha: string; baseRef: string | null }
+  | {
+      kind: "collab";
+      planId: string;
+      target: CollabDiffTarget;
+      label: string;
+    }
   | {
       kind: "turn";
       turnId: RunId;
@@ -36,6 +46,10 @@ interface DiffPanelStoreState {
   selectGitScope: (ref: ScopedThreadRef, scope: "branch" | "unstaged") => void;
   selectBranchBaseRef: (ref: ScopedThreadRef, baseRef: string | null) => void;
   selectToolCall: (ref: ScopedThreadRef, target: ToolCallDiffTarget) => void;
+  selectCollabEvidence: (
+    ref: ScopedThreadRef,
+    selection: { readonly planId: string; readonly target: CollabDiffTarget; readonly label: string },
+  ) => void;
   selectTurn: (ref: ScopedThreadRef, turnId: RunId, filePath?: string) => void;
   selectTurnRepository: (ref: ScopedThreadRef, turnId: RunId, repository: string | null) => void;
   selectCommit: (ref: ScopedThreadRef, sha: string) => void;
@@ -102,6 +116,13 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
           byThreadKey: {
             ...state.byThreadKey,
             [scopedThreadKey(ref)]: { kind: "tool-call", ...target },
+          },
+        })),
+      selectCollabEvidence: (ref, selection) =>
+        set((state) => ({
+          byThreadKey: {
+            ...state.byThreadKey,
+            [scopedThreadKey(ref)]: { kind: "collab", ...selection },
           },
         })),
       selectTurn: (ref, turnId, filePath) =>

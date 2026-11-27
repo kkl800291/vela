@@ -18,7 +18,6 @@ import {
   type VcsCreateWorktreeResult,
   type WorkspaceLayoutCommandsResult,
   type WorktreeLayoutCommandKind,
-  T3_PROJECT_FILE_NAME,
 } from "@t3tools/contracts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { flattenTemporaryWorktreeBranchName, isTemporaryWorktreeBranch } from "@t3tools/shared/git";
@@ -40,6 +39,7 @@ import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../config.ts";
+import { readT3ProjectFile } from "../project/T3ProjectFileLoader.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
@@ -203,7 +203,7 @@ export class TaskFolders extends Context.Service<
       readonly branch: string;
       readonly recreate: (checkout: TaskFolderCheckout) => Effect.Effect<void, E>;
     }) => Effect.Effect<void, TaskFolderError | E>;
-    /** The project's layout commands as its `t3.json` holds them now, and whether each is approved. */
+    /** The project's layout commands as its project file holds them now, and whether each is approved. */
     readonly layoutCommands: (
       projectId: ProjectId,
     ) => Effect.Effect<WorkspaceLayoutCommandsResult, TaskFolderError>;
@@ -261,14 +261,18 @@ const cleared: unique symbol = Symbol("t3/workspace/TaskFolders/cleared");
 interface ClearedLayoutCommand {
   readonly [cleared]: true;
   readonly text: string;
+  /** `vela.json`, or `t3.json` when that file supplied the command. */
+  readonly fileName: string;
   /** The same check again, for the moment the command's turn comes. */
   readonly recheck: Effect.Effect<
-    { readonly command: ClearedLayoutCommand } | { readonly refusal: string } | null
+    | { readonly command: ClearedLayoutCommand }
+    | { readonly fileName: string; readonly refusal: string }
+    | null
   >;
 }
 
-const layoutRefusedDetail = (refusal: string) =>
-  `This project lays out its worktrees with its own command (worktreeLayout in ${T3_PROJECT_FILE_NAME}), ${refusal}`;
+const layoutRefusedDetail = (fileName: string, refusal: string) =>
+  `This project lays out its worktrees with its own command (worktreeLayout in ${fileName}), ${refusal}`;
 
 const failureDetail = (cause: unknown) =>
   typeof cause === "object" &&
@@ -380,14 +384,26 @@ const make = Effect.gen(function* () {
     (cause: unknown): TaskFolderError =>
       new TaskFolderError({ operation, detail: `${prefix}: ${failureDetail(cause)}`, cause });
 
-  // A project that lays its own thread folder out says so in its `t3.json`.
-  const projectFile = (projectRoot: string) =>
-    fileSystem.readFileString(path.join(projectRoot, T3_PROJECT_FILE_NAME)).pipe(
-      Effect.map(parseT3ProjectFile),
+  // `vela.json` wins. `t3.json` is read only when `vela.json` is absent, even if the winner is empty or invalid.
+  const readProjectFile = (projectRoot: string) =>
+    readT3ProjectFile(projectRoot).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.map((source) =>
+        Option.match(source, {
+          onNone: () => null,
+          onSome: ({ fileName, content }) => ({
+            fileName,
+            file: parseT3ProjectFile(content),
+          }),
+        }),
+      ),
       Effect.orElseSucceed(() => null),
     );
   const worktreeLayout = (projectRoot: string) =>
-    projectFile(projectRoot).pipe(Effect.map((config) => config?.worktreeLayout ?? null));
+    readProjectFile(projectRoot).pipe(
+      Effect.map((config) => config?.file?.worktreeLayout ?? null),
+    );
   /**
    * The project's command for `kind` as its file holds it now: cleared to run, or the reason it
    * stays unrun, worded to end a sentence about the command. Null when the project declares none.
@@ -400,9 +416,11 @@ const make = Effect.gen(function* () {
     projectCommands: ProjectCommandsNow,
   ) => ClearedLayoutCommand["recheck"] = Effect.fnUntraced(
     function* (project, kind, projectCommands) {
-      const text = (yield* worktreeLayout(project.projectRoot))?.[kind];
-      if (text === undefined) return null;
-      const refuse = (refusal: string) => ({ refusal }) as const;
+      const config = yield* readProjectFile(project.projectRoot);
+      const text = config?.file?.worktreeLayout?.[kind];
+      if (config === null || config.file === null || text === undefined) return null;
+      const fileName = config.fileName;
+      const refuse = (refusal: string) => ({ fileName, refusal }) as const;
       const asked = typeof projectCommands === "string" ? projectCommands : yield* projectCommands;
       if (asked === "request-not-permitted")
         return refuse("which this request is not permitted to run.");
@@ -435,6 +453,7 @@ const make = Effect.gen(function* () {
       const command: ClearedLayoutCommand = {
         [cleared]: true,
         text,
+        fileName,
         recheck: Effect.suspend(() => layoutCommand(project, kind, projectCommands)),
       };
       return { command } as const;
@@ -469,6 +488,7 @@ const make = Effect.gen(function* () {
           return yield* new TaskFolderError({
             operation,
             detail: layoutRefusedDetail(
+              now !== null && "refusal" in now ? now.fileName : command.fileName,
               now !== null && "refusal" in now
                 ? now.refusal
                 : "which changed while this request waited for its turn. Try again.",
@@ -1166,7 +1186,7 @@ const make = Effect.gen(function* () {
         if (layout !== null && "refusal" in layout) {
           return yield* new TaskFolderError({
             operation: "create",
-            detail: layoutRefusedDetail(layout.refusal),
+            detail: layoutRefusedDetail(layout.fileName, layout.refusal),
           });
         }
         if (layout !== null) {
@@ -1603,10 +1623,10 @@ const make = Effect.gen(function* () {
     const restoreFailed = fail("create", "Could not restore the worktrees");
     // A project that lays its own folder out rebuilds it; whatever is still missing after that
     // comes back as a plain checkout below.
-    const config = yield* projectFile(taskFolder.projectRoot);
+    const config = yield* readProjectFile(taskFolder.projectRoot);
     // A package manager may replace an excluded dependency's worktree with its own clone. The
     // thread resumes without it instead of refusing the clone, unless the project tracks it by hand.
-    const ignored = (config?.ignoreRepositories ?? []).map((entry) =>
+    const ignored = (config?.file?.ignoreRepositories ?? []).map((entry) =>
       path.resolve(taskFolder.projectRoot, entry),
     );
     const cloned = yield* Effect.filter(taskFolder.repositories, (repository) =>

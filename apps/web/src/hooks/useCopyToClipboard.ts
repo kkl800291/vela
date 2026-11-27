@@ -117,12 +117,14 @@ function writeTextWithExecCommand(
   const previouslyFocused = document.activeElement;
   let copiedHtml = false;
   const copy = (event: ClipboardEvent) => {
-    if (!extraFlavors || !event.clipboardData) return;
+    if (!event.clipboardData) return;
     event.clipboardData.setData("text/plain", value);
-    for (const [type, data] of Object.entries(extraFlavors))
-      event.clipboardData.setData(type, data);
+    if (extraFlavors) {
+      for (const [type, data] of Object.entries(extraFlavors))
+        event.clipboardData.setData(type, data);
+    }
     event.preventDefault();
-    copiedHtml = Boolean(extraFlavors["text/html"]);
+    copiedHtml = Boolean(extraFlavors?.["text/html"]);
   };
   document.body.appendChild(textarea);
   textarea.addEventListener("copy", copy);
@@ -147,13 +149,13 @@ export async function writeTextToClipboard(
   value: string,
   target?: ClipboardTarget,
   extraFlavors?: Readonly<Record<string, string>>,
-  options?: { requireHtml?: boolean },
+  options?: { requireHtml?: boolean; allowEmpty?: boolean },
 ) {
   if (typeof window === "undefined") {
     throw new ClipboardApiUnavailableError(clipboardTargetFields(target, "unavailable"));
   }
 
-  if (!value) return false;
+  if (!value && !options?.allowEmpty) return false;
   if (extraFlavors) {
     extraFlavors = Object.fromEntries(
       Object.entries(extraFlavors).filter(([type]) => type !== "text/plain"),

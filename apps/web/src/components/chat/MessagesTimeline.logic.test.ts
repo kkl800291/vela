@@ -60,6 +60,90 @@ describe("resolveAssistantMessageCopyState", () => {
 });
 
 describe("deriveMessagesTimelineRows", () => {
+  it("collapses consecutive collaboration review runs and keeps escalation, delivery and ordinary messages visible", () => {
+    const date = "2026-03-17T19:12:28.000Z";
+    const message = (
+      id: string,
+      text: string,
+      runId: string,
+      overrides: Partial<Extract<TimelineEntry, { kind: "message" }>["message"]> = {},
+    ): TimelineEntry => ({
+      id,
+      kind: "message",
+      createdAt: date,
+      message: {
+        id: MessageId.make(id),
+        text,
+        role: "user",
+        runId: RunId.make(runId),
+        createdBy: "system",
+        creationSource: "server",
+        streaming: false,
+        createdAt: date,
+        updatedAt: date,
+        ...overrides,
+      },
+    });
+    const reviewA = message("vela-collab:one", "[Vela collaboration review]\n{}", "review-a");
+    const replyA = message("reply-a", "internal verdict", "review-a", { role: "assistant" });
+    const reviewB = message("vela-collab:two", "[Vela collaboration review]\n{}", "review-b");
+    const replyB = message("reply-b", "internal repair review", "review-b", { role: "assistant" });
+    const escalation = message(
+      "vela-collab:escalation",
+      "[Vela collaboration orchestrator_escalation]\n{}",
+      "escalation",
+    );
+    const delivery = message(
+      "vela-collab:delivery",
+      "[Vela collaboration delivery_ready]\n{}",
+      "delivery",
+    );
+    const deliveryReply = message("delivery-reply", "Delivery summary", "delivery", {
+      role: "assistant",
+    });
+    const ordinary = message("ordinary", "[Vela collaboration review]\n{}", "ordinary");
+    const userSteer = message("vela-collab:user", "[Vela collaboration review]\n{}", "review-a", {
+      createdBy: "user",
+    });
+    const input = {
+      timelineEntries: [
+        reviewA,
+        replyA,
+        reviewB,
+        replyB,
+        escalation,
+        delivery,
+        deliveryReply,
+        ordinary,
+        userSteer,
+      ],
+      isWorking: false,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    };
+    const rows = deriveMessagesTimelineRows(input);
+    const fold = rows[0];
+    expect(fold).toMatchObject({ kind: "collab-review-fold", count: 2, expanded: false });
+    expect(rows.slice(1).map(({ id }) => id)).toEqual([
+      escalation.id,
+      delivery.id,
+      deliveryReply.id,
+      ordinary.id,
+      userSteer.id,
+    ]);
+
+    const expanded = deriveMessagesTimelineRows({
+      ...input,
+      expandedCollabReviewIds: new Set([fold!.id]),
+    });
+    expect(expanded.map(({ id }) => id)).toEqual([
+      fold!.id,
+      ...input.timelineEntries.map(({ id }) => id),
+    ]);
+    const revealed = deriveMessagesTimelineRows({ ...input, revealedCollabEntryId: replyB.id });
+    expect(revealed.map(({ id }) => id)).toContain(replyB.id);
+  });
+
   it.each([
     ["html-render", "reply-run", true],
     ["mcp-app", "reply-run", true],

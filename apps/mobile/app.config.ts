@@ -77,28 +77,44 @@ const RELEASE_ASSETS = {
   androidNotificationColor: "#FFFFFF",
 } as const;
 
+const APP_BUNDLE_BASE =
+  repoEnv.VELA_MOBILE_BUNDLE_ID?.trim() ||
+  process.env.VELA_MOBILE_BUNDLE_ID?.trim() ||
+  "com.vela.mobile";
+
+const customUpdatesUrl =
+  repoEnv.VELA_MOBILE_UPDATES_URL?.trim() || process.env.VELA_MOBILE_UPDATES_URL?.trim();
+const customEasProjectId =
+  repoEnv.VELA_MOBILE_EXPO_PROJECT_ID?.trim() || process.env.VELA_MOBILE_EXPO_PROJECT_ID?.trim();
+const customExpoOwner =
+  repoEnv.VELA_MOBILE_EXPO_OWNER?.trim() || process.env.VELA_MOBILE_EXPO_OWNER?.trim();
+const appleTeamId =
+  repoEnv.VELA_MOBILE_APPLE_TEAM_ID?.trim() ||
+  process.env.VELA_MOBILE_APPLE_TEAM_ID?.trim() ||
+  undefined;
+
 const VARIANT_CONFIG = {
   development: {
     appName: "Vela Dev",
-    scheme: "t3code-dev",
-    iosBundleIdentifier: "com.t3tools.t3code.dev",
-    androidPackage: "com.t3tools.t3code.dev",
+    scheme: "vela-dev",
+    iosBundleIdentifier: `${APP_BUNDLE_BASE}.dev`,
+    androidPackage: `${APP_BUNDLE_BASE}.dev`,
     relyingParty: "clerk.t3.codes",
     assets: DEVELOPMENT_ASSETS,
   },
   preview: {
     appName: "Vela Preview",
-    scheme: "t3code-preview",
-    iosBundleIdentifier: "com.t3tools.t3code.preview",
-    androidPackage: "com.t3tools.t3code.preview",
+    scheme: "vela-preview",
+    iosBundleIdentifier: `${APP_BUNDLE_BASE}.preview`,
+    androidPackage: `${APP_BUNDLE_BASE}.preview`,
     relyingParty: "clerk.t3.codes",
     assets: PREVIEW_ASSETS,
   },
   production: {
     appName: "Vela",
-    scheme: "t3code",
-    iosBundleIdentifier: "com.t3tools.t3code",
-    androidPackage: "com.t3tools.t3code",
+    scheme: "vela",
+    iosBundleIdentifier: APP_BUNDLE_BASE,
+    androidPackage: APP_BUNDLE_BASE,
     relyingParty: "clerk.t3.codes",
     assets: RELEASE_ASSETS,
   },
@@ -143,7 +159,7 @@ const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
       {
         name: "SubscriptionUsage",
         displayName: "Subscription usage",
-        description: "Subscription quotas from your connected T3 Code environments.",
+        description: "Subscription quotas from your connected Vela environments.",
         ios: {
           configuration: {
             title: "Subscription usage",
@@ -193,7 +209,7 @@ const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
       {
         name: "AgentActivity",
         displayName: "Agent Activity",
-        description: "Shows the current state of active T3 Code agents.",
+        description: "Shows the current state of active Vela agents.",
         android: null,
         ios: {
           supportedFamilies: ["systemSmall", "systemMedium", "accessoryRectangular"],
@@ -234,7 +250,7 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
 
 const config: ExpoConfig = {
   name: variant.appName,
-  slug: "t3-code",
+  slug: "vela",
   platforms: ["ios", "android"],
   scheme: variant.scheme,
   version: repoEnv.T3CODE_MOBILE_VERSION ?? "2.3.0",
@@ -246,8 +262,8 @@ const config: ExpoConfig = {
   icon: variant.assets.appIcon,
   userInterfaceStyle: "automatic",
   updates: {
-    enabled: repoEnv.T3CODE_MOBILE_UPDATES_ENABLED === "1",
-    url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
+    enabled: repoEnv.T3CODE_MOBILE_UPDATES_ENABLED === "1" && Boolean(customUpdatesUrl),
+    ...(customUpdatesUrl ? { url: customUpdatesUrl } : {}),
     checkAutomatically: "ON_LOAD",
     fallbackToCacheTimeout: 0,
   },
@@ -256,8 +272,7 @@ const config: ExpoConfig = {
     supportsTablet: true,
     requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
     bundleIdentifier: iosBundleIdentifier,
-    // Avoid Personal Team fallback: it cannot sign App Groups, Apple sign-in or push entitlements.
-    appleTeamId: "ARK85ZXQ4Z",
+    ...(appleTeamId ? { appleTeamId } : {}),
     associatedDomains: [
       `applinks:${variant.relyingParty}`,
       `webcredentials:${variant.relyingParty}`,
@@ -276,10 +291,10 @@ const config: ExpoConfig = {
         NSAllowsArbitraryLoads: true,
       },
       NSLocalNetworkUsageDescription:
-        "Allow T3 Code to connect to T3 Code servers on your local network or tailnet.",
+        "Allow Vela to connect to Vela servers on your local network or tailnet.",
       // Built with the iOS 27 SDK, only view controllers can hide or style the status bar.
       UIViewControllerBasedStatusBarAppearance: true,
-      NSPhotoLibraryAddUsageDescription: "Allow T3 Code to save images to your photo library.",
+      NSPhotoLibraryAddUsageDescription: "Allow Vela to save images to your photo library.",
       // System picture in picture needs background audio to start and survive outside the app.
       UIBackgroundModes: ["audio"],
       ITSAppUsesNonExemptEncryption: false,
@@ -390,7 +405,7 @@ const config: ExpoConfig = {
     [
       "expo-audio",
       {
-        microphonePermission: "Allow T3 Code to use your microphone for voice input.",
+        microphonePermission: "Allow Vela to use your microphone for voice input.",
         recordAudioAndroid: true,
         enableBackgroundPlayback: false,
         enableBackgroundRecording: false,
@@ -399,7 +414,7 @@ const config: ExpoConfig = {
     [
       "expo-camera",
       {
-        cameraPermission: "Allow T3 Code to access your camera so you can scan pairing QR codes.",
+        cameraPermission: "Allow Vela to access your camera so you can scan pairing QR codes.",
         microphonePermission: false,
         barcodeScannerEnabled: true,
         recordAudioAndroid: false,
@@ -410,7 +425,7 @@ const config: ExpoConfig = {
       {
         photosPermission: false,
         // `false` makes this plugin add RECORD_AUDIO to blockedPermissions, breaking Android dictation.
-        microphonePermission: "Allow T3 Code to use your microphone for voice input.",
+        microphonePermission: "Allow Vela to use your microphone for voice input.",
       },
     ],
     [
@@ -490,11 +505,11 @@ const config: ExpoConfig = {
       tracesToken: repoEnv.EXPO_PUBLIC_OTLP_TRACES_TOKEN ?? null,
     },
     eas: {
-      projectId: "d763fcb8-d37c-41ea-a773-b54a0ab4a454",
+      ...(customEasProjectId ? { projectId: customEasProjectId } : {}),
       observe: { endpointUrl: observeEndpointUrl },
     },
   },
-  owner: "pingdotgg",
+  ...(customExpoOwner ? { owner: customExpoOwner } : {}),
   experiments: {
     // Metro only runs babel-plugin-react-compiler when this is set; see src/reactCompilerCoverage.test.ts.
     reactCompiler: true,

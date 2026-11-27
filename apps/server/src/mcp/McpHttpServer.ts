@@ -306,6 +306,7 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
   );
   const pullRequests = yield* Effect.serviceOption(PullRequestService.PullRequestService);
   const projections = yield* Effect.serviceOption(ProjectionStore.ProjectionStoreV2);
+  const threadManagement = yield* Effect.serviceOption(ThreadManagementService.ThreadManagementService);
   const sessions = yield* Effect.serviceOption(SessionStore.SessionStore);
   // Auth runs once per request, so a response that streams on ends when the outside client's
   // session is revoked or expires. `events/stream` ends itself first with
@@ -383,8 +384,24 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
       limited.thread === undefined
         ? undefined
         : yield* Cache.get(forgeOfThread, limited.thread.threadId);
+    const authenticatedThread = limited.thread;
+    const callerRunId =
+      authenticatedThread === undefined || Option.isNone(threadManagement)
+        ? undefined
+        : yield* threadManagement.value.resolveCallerRunId(authenticatedThread).pipe(
+            Effect.orElseSucceed(() => undefined),
+          );
+    // Only the server's current provider-turn binding can supply a run identity.
+    const thread = authenticatedThread === undefined ? undefined : {
+      threadId: authenticatedThread.threadId,
+      providerSessionId: authenticatedThread.providerSessionId,
+      providerInstanceId: authenticatedThread.providerInstanceId,
+      ...(authenticatedThread.subagent === undefined ? {} : { subagent: authenticatedThread.subagent }),
+      ...(callerRunId === undefined ? {} : { runId: callerRunId }),
+    };
     return {
       ...limited,
+      thread,
       linkedEnvironments,
       agentFeedback,
       workflows,
@@ -1415,6 +1432,7 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
+// The application provides the same collaboration engine to MCP and the HTTP routes.
 export const layerVelaDispatchToolkit = toolkitRegistration(
   VelaDispatchToolkit,
   VelaDispatchHandlers.layer,

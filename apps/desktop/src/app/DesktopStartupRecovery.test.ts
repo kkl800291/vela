@@ -283,3 +283,87 @@ it.effect("installs the build the update action downloaded, not the one it offer
     }),
   ).pipe(Effect.provide(DesktopState.layer)),
 );
+
+it.effect("refreshes rendered details and copy payload when a subsequent retry fails with a new reason", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const firstRendered = yield* Deferred.make<void>();
+      const secondRendered = yield* Deferred.make<void>();
+      const copied = yield* Deferred.make<string>();
+      const loadedUrls: string[] = [];
+      let navigate: ((event: { preventDefault: () => void }, url: string) => void) | undefined;
+      const recovery = {
+        isDestroyed: () => false,
+        loadURL: (url: string) => {
+          loadedUrls.push(url);
+          if (loadedUrls.length === 1) Deferred.doneUnsafe(firstRendered, Effect.void);
+          if (loadedUrls.length === 2) Deferred.doneUnsafe(secondRendered, Effect.void);
+          return Promise.resolve();
+        },
+        once: () => {},
+        webContents: {
+          setWindowOpenHandler: () => {},
+          on: (_event: string, listener: typeof navigate) => {
+            navigate = listener;
+          },
+        },
+      } as unknown as Electron.BrowserWindow;
+      const disabledUpdates = updateState({ status: "disabled" });
+      const state = yield* DesktopState.DesktopState;
+      yield* listen.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            FileSystem.layerNoop({ readFileString: () => Effect.succeed("0.1.3") }),
+            Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
+              appVersion: "0.1.3",
+              stateDir: "/task/state",
+              logDir: "/task/logs",
+              path: { join: (...parts: string[]) => parts.join("/") },
+            } as unknown as DesktopEnvironment.DesktopEnvironment["Service"]),
+            Layer.succeed(ElectronApp.ElectronApp, {
+              on: () => Effect.void,
+            } as unknown as ElectronApp.ElectronApp["Service"]),
+            Layer.succeed(ElectronShell.ElectronShell, {
+              copyText: (text: string) => Deferred.succeed(copied, text),
+            } as unknown as ElectronShell.ElectronShell["Service"]),
+            Layer.succeed(ElectronTheme.ElectronTheme, {
+              shouldUseDarkColors: Effect.succeed(false),
+            } as ElectronTheme.ElectronTheme["Service"]),
+            Layer.succeed(ElectronWindow.ElectronWindow, {
+              main: Effect.succeedNone,
+              create: () => Effect.succeed(recovery),
+              reveal: () => Effect.void,
+            } as unknown as ElectronWindow.ElectronWindow["Service"]),
+            Layer.succeed(DesktopUpdates.DesktopUpdates, {
+              subscribe: Effect.succeed({ latest: disabledUpdates, changes: Stream.empty }),
+              check: () => Effect.void,
+              getState: Effect.succeed(disabledUpdates),
+            } as unknown as DesktopUpdates.DesktopUpdates["Service"]),
+          ),
+        ),
+      );
+      yield* SubscriptionRef.set(state.primaryBackendStartup, {
+        _tag: "Failing",
+        reason: "First startup failure",
+        managedPolicy: false,
+        output: "First output",
+      });
+      yield* Deferred.await(firstRendered);
+
+      yield* SubscriptionRef.set(state.primaryBackendStartup, {
+        _tag: "Failing",
+        reason: "Second retry failure",
+        managedPolicy: false,
+        output: "Second output",
+      });
+      yield* Deferred.await(secondRendered);
+
+      expect(decodeURIComponent(loadedUrls[1]!)).toContain("Second startup failure".replace("startup", "retry"));
+      expect(decodeURIComponent(loadedUrls[1]!)).toContain("Second output");
+      navigate!({ preventDefault: () => {} }, "https://startup-recovery.invalid/copy");
+      const copiedText = yield* Deferred.await(copied);
+      expect(copiedText).toContain("Second retry failure");
+      expect(copiedText).toContain("Second output");
+    }),
+  ).pipe(Effect.provide(DesktopState.layer)),
+);

@@ -37,9 +37,6 @@ const DevicePanel = lazy(() =>
   import("../device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
 const FilePreviewPanel = lazy(() => import("../files/FilePreviewPanel"));
-const DispatchRightPanel = lazy(() =>
-  import("./DispatchRightPanel").then((module) => ({ default: module.DispatchRightPanel })),
-);
 
 type RightPanelTerminalProps = Omit<
   PersistentThreadTerminalPanelProps,
@@ -91,6 +88,8 @@ export function RightPanelSurfaceContent(props: {
   readonly sideChatParentPanel: SideChatParentPanel;
   readonly dispatch: {
     readonly isServerThread: boolean;
+    readonly hasConversationMessages?: boolean | undefined;
+    readonly currentBranch?: string | null | undefined;
     readonly sendPrompt: (prompt: string) => Promise<boolean>;
   };
 }) {
@@ -276,17 +275,7 @@ export function RightPanelSurfaceContent(props: {
         </Suspense>
       );
     case "dispatch":
-      return (
-        <Suspense fallback={null}>
-          <DispatchRightPanel
-            key={threadRef.threadId}
-            workspaceRoot={props.files.workspaceRoot}
-            threadRef={threadRef}
-            isServerThread={props.dispatch.isServerThread}
-            sendPrompt={props.dispatch.sendPrompt}
-          />
-        </Suspense>
-      );
+      return null;
     case "files":
     case "file": {
       const files = props.files;

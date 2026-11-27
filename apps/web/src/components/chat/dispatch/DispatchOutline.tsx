@@ -68,6 +68,7 @@ export function DispatchOutline({
   providers,
   onOpenThread,
   onOpenDiff,
+  onOpenStepDiff,
   onEditStep,
 }: {
   readonly steps: ReadonlyArray<DispatchTaskCard>;
@@ -76,6 +77,7 @@ export function DispatchOutline({
   readonly providers: ReadonlyArray<DispatchProviderSummary>;
   readonly onOpenThread: (threadId: string) => void;
   readonly onOpenDiff: () => void;
+  readonly onOpenStepDiff?: ((stepId: string) => void) | undefined;
   readonly onEditStep: (step: DispatchTaskCard) => void;
 }) {
   const orderedSteps = [...steps].toSorted((a, b) => a.order - b.order);
@@ -282,7 +284,11 @@ export function DispatchOutline({
                         </Button>
                       )}
                       {fileCount > 0 && (
-                        <Button size="micro" variant="ghost" onClick={onOpenDiff}>
+                        <Button
+                          size="micro"
+                          variant="ghost"
+                          onClick={() => (onOpenStepDiff ? onOpenStepDiff(step.id) : onOpenDiff())}
+                        >
                           {fileCount} 文件
                         </Button>
                       )}

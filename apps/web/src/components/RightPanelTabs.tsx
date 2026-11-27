@@ -423,19 +423,6 @@ function RightPanelEmptyState(props: {
       disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.device),
       onClick: props.onAddDevice,
     },
-    ...(props.onAddDispatch
-      ? [
-          {
-            label: msg("Dispatch"),
-            description: msg("Run gated task cards with hard gates, independent review, and rollback."),
-            icon: Layers,
-            shortcut: "G",
-            available: props.dispatchAvailable === true,
-            disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.files),
-            onClick: props.onAddDispatch,
-          },
-        ]
-      : []),
     ...(props.onAddSideChat
       ? [
           {
@@ -1282,18 +1269,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: messages(SURFACE_DISABLED_REASONS.device),
       onClick: props.onAddDevice,
     },
-    ...(props.onAddDispatch
-      ? [
-          {
-            label: msg("Dispatch"),
-            icon: Layers,
-            shortcut: "G",
-            available: props.dispatchAvailable === true,
-            disabledReason: messages(SURFACE_DISABLED_REASONS.files),
-            onClick: props.onAddDispatch,
-          },
-        ]
-      : []),
     ...(props.onAddSideChat
       ? [
           {

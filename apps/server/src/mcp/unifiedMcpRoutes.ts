@@ -54,7 +54,7 @@ function jsonError(message: string, status = 400) {
   return HttpServerResponse.jsonUnsafe({ error: message }, { status });
 }
 
-function parseUpsertPayload(body: unknown): UpsertMcpServerInput | string {
+export function parseUpsertPayload(body: unknown): UpsertMcpServerInput | string {
   if (!isPlainObject(body)) return "Request body must be a JSON object";
   const name = typeof body.name === "string" ? body.name.trim() : "";
   if (!name) return "Server name is required";
@@ -89,7 +89,7 @@ function parseUpsertPayload(body: unknown): UpsertMcpServerInput | string {
     name,
     ...(originalName ? { originalName } : {}),
     transport,
-    enabled: typeof body.enabled === "boolean" ? body.enabled : true,
+    ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
     ...(command ? { command } : {}),
     ...(args ? { args } : {}),
     ...(url ? { url } : {}),

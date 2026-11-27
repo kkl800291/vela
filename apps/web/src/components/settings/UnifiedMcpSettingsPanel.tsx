@@ -35,8 +35,10 @@ import {
   type EngineMcpState,
   type McpEngineId,
   type McpPluginEntry,
+  type McpSyncEngineResult,
   type McpTestResult,
   type McpTransport,
+  type SyncMcpServerResult,
   type UnifiedMcpServerEntry,
   type UnifiedMcpSnapshot,
 } from "~/state/unifiedMcp";
@@ -98,10 +100,16 @@ interface KeyValuePair {
   value: string;
 }
 
+type CrossEngineParity = "equivalent" | "different" | "masked" | "mixed";
+
 interface EditorState {
   mode: "create" | "edit";
   originalName?: string;
   preserveSecretsFromEngineId?: McpEngineId;
+  primaryEngineId?: McpEngineId;
+  divergentEngines: McpEngineId[];
+  crossEngineParity: CrossEngineParity;
+  enabledTouched: boolean;
   name: string;
   transport: McpTransport;
   enabled: boolean;
@@ -145,9 +153,9 @@ const ENGINE_SHORT_LABEL: Record<McpEngineId, string> = {
   kimi: "Kimi",
 };
 
-// Shared CSS Grid template guarantees pixel-perfect alignment between header and every row.
+// Shared CSS Grid template guarantees pixel-perfect alignment between header and every row when wide enough.
 const MATRIX_GRID_CLASS =
-  "grid grid-cols-1 items-center gap-y-2.5 sm:grid-cols-[minmax(0,1fr)_repeat(6,52px)_104px] sm:gap-x-1 sm:gap-y-0";
+  "grid grid-cols-1 items-center gap-y-2.5 @[680px]:grid-cols-[minmax(0,1fr)_repeat(6,52px)_104px] @[680px]:gap-x-1 @[680px]:gap-y-0";
 
 let kvCounter = 0;
 function nextKvId(): string {
@@ -181,9 +189,83 @@ function serverSummary(entry: UnifiedMcpServerEntry): string {
   return [entry.command, ...(entry.args ?? [])].filter(Boolean).join(" ");
 }
 
+function areRecordsEqual(
+  a: Readonly<Record<string, string>> | undefined,
+  b: Readonly<Record<string, string>> | undefined,
+): boolean {
+  const entriesA = Object.entries(a ?? {});
+  const entriesB = Object.entries(b ?? {});
+  if (entriesA.length !== entriesB.length) return false;
+  for (const [k, v] of entriesA) {
+    if ((b ?? {})[k] !== v) return false;
+  }
+  return true;
+}
+
+function hasMaskedCredentials(entry: UnifiedMcpServerEntry): boolean {
+  return entry.maskedEnvKeys.length > 0 || entry.maskedHeaderKeys.length > 0;
+}
+
+function areVisibleMcpEntriesEquivalent(a: UnifiedMcpServerEntry, b: UnifiedMcpServerEntry): boolean {
+  if (a.transport !== b.transport) return false;
+  if ((a.command ?? "") !== (b.command ?? "")) return false;
+  if ((a.url ?? "") !== (b.url ?? "")) return false;
+  if ((a.bearerTokenEnvVar ?? "") !== (b.bearerTokenEnvVar ?? "")) return false;
+  const argsA = a.args ?? [];
+  const argsB = b.args ?? [];
+  if (argsA.length !== argsB.length || argsA.some((arg, i) => arg !== argsB[i])) return false;
+  if (!areRecordsEqual(a.env, b.env)) return false;
+  if (!areRecordsEqual(a.headers, b.headers)) return false;
+  return true;
+}
+
+/** Masked header/env values are the same sentinel on every engine, so they cannot prove equality. */
+function describeCrossEngineParity(
+  primary: UnifiedMcpServerEntry,
+  primaryEngineId: McpEngineId,
+  configuredEngines: readonly McpEngineId[],
+  byEngine: ReadonlyMap<McpEngineId, UnifiedMcpServerEntry>,
+): { engines: McpEngineId[]; parity: CrossEngineParity } {
+  let sawDifferent = false;
+  let sawMasked = false;
+  const engines: McpEngineId[] = [];
+  for (const id of configuredEngines) {
+    if (id === primaryEngineId) continue;
+    const other = byEngine.get(id);
+    if (!other) continue;
+    const visibleMatch = areVisibleMcpEntriesEquivalent(primary, other);
+    const masked = hasMaskedCredentials(primary) || hasMaskedCredentials(other);
+    if (visibleMatch && !masked) continue;
+    engines.push(id);
+    if (!visibleMatch) sawDifferent = true;
+    if (masked) sawMasked = true;
+  }
+  const parity: CrossEngineParity =
+    sawDifferent && sawMasked ? "mixed" : sawDifferent ? "different" : sawMasked ? "masked" : "equivalent";
+  return { engines, parity };
+}
+
+function formatCrossEngineWarning(
+  parity: Exclude<CrossEngineParity, "equivalent">,
+  otherLabels: string,
+  primaryLabel: string,
+  saveLabel: string,
+): string {
+  const relation =
+    parity === "masked"
+      ? `${otherLabels} 含已脱敏凭据，无法确认是否与 ${primaryLabel} 一致`
+      : parity === "mixed"
+        ? `${otherLabels} 中的同名配置与 ${primaryLabel} 不同或包含已脱敏凭据`
+        : `${otherLabels} 中的同名配置与 ${primaryLabel} 不同`;
+  return `${relation}，默认仅保存到 ${saveLabel}；勾选其他引擎将会覆盖其原配置。`;
+}
+
 function createEmptyEditor(defaultTargets: McpEngineId[]): EditorState {
   return {
     mode: "create",
+    divergentEngines: [],
+    crossEngineParity: "equivalent",
+    enabledTouched: true,
     name: "",
     transport: "stdio",
     enabled: true,
@@ -201,11 +283,17 @@ function createEditEditor(
   entry: UnifiedMcpServerEntry,
   sourceEngineId: McpEngineId,
   targets: McpEngineId[],
+  divergentEngines: McpEngineId[] = [],
+  crossEngineParity: CrossEngineParity = "equivalent",
 ): EditorState {
   return {
     mode: "edit",
     originalName: entry.name,
     preserveSecretsFromEngineId: sourceEngineId,
+    primaryEngineId: sourceEngineId,
+    divergentEngines,
+    crossEngineParity,
+    enabledTouched: false,
     name: entry.name,
     transport: entry.transport,
     enabled: entry.enabled,
@@ -215,7 +303,61 @@ function createEditEditor(
     bearerTokenEnvVar: entry.bearerTokenEnvVar ?? "",
     envPairs: recordToPairs(entry.env),
     headerPairs: recordToPairs(entry.headers),
-    targets,
+    targets: crossEngineParity === "equivalent" ? targets : [sourceEngineId],
+  };
+}
+
+function resolveMatrixRowHealthBadge(
+  rowName: string,
+  primaryEngineId: McpEngineId,
+  configuredEngines: ReadonlyArray<McpEngineId>,
+  testResults: Readonly<Record<string, McpTestResult>>,
+): {
+  readonly result: McpTestResult | undefined;
+  readonly engineId: McpEngineId;
+  readonly badgeNote: string | undefined;
+} {
+  let errorEntry: { engineId: McpEngineId; result: McpTestResult } | undefined;
+  let authEntry: { engineId: McpEngineId; result: McpTestResult } | undefined;
+  let connectedEntry: { engineId: McpEngineId; result: McpTestResult } | undefined;
+  let testedCount = 0;
+
+  for (const engineId of configuredEngines) {
+    const res = testResults[`${engineId}:${rowName}`];
+    if (!res) continue;
+    testedCount += 1;
+    if (res.status === "error" && !errorEntry) {
+      errorEntry = { engineId, result: res };
+    } else if (res.status === "auth_required" && !authEntry) {
+      authEntry = { engineId, result: res };
+    } else if (res.status === "connected" && !connectedEntry) {
+      connectedEntry = { engineId, result: res };
+    }
+  }
+
+  const picked =
+    errorEntry ??
+    authEntry ??
+    connectedEntry ??
+    (testResults[rowName] ? { engineId: primaryEngineId, result: testResults[rowName] } : undefined);
+
+  if (!picked) {
+    return { result: undefined, engineId: primaryEngineId, badgeNote: undefined };
+  }
+
+  const multiEngine = configuredEngines.length > 1;
+  const noteParts: string[] = [];
+  if (multiEngine && picked.result.status !== "connected") {
+    noteParts.push(ENGINE_SHORT_LABEL[picked.engineId]);
+  }
+  if (multiEngine && testedCount > 0 && testedCount < configuredEngines.length) {
+    noteParts.push(`${testedCount}/${configuredEngines.length} 引擎已测`);
+  }
+
+  return {
+    result: picked.result,
+    engineId: picked.engineId,
+    badgeNote: noteParts.length > 0 ? noteParts.join(" · ") : undefined,
   };
 }
 
@@ -240,6 +382,11 @@ export function UnifiedMcpSettingsPanel() {
   const [testingAll, setTestingAll] = useState(false);
   const [authDialog, setAuthDialog] = useState<AuthDialogState | null>(null);
   const [authSaving, setAuthSaving] = useState(false);
+  const [syncReport, setSyncReport] = useState<{
+    readonly sourceEngineId: McpEngineId;
+    readonly name: string;
+    readonly results: ReadonlyArray<McpSyncEngineResult>;
+  } | null>(null);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -308,15 +455,16 @@ export function UnifiedMcpSettingsPanel() {
     const rows: MatrixRow[] = [];
     for (const [name, data] of grouped.entries()) {
       if (normalizedQuery) {
-        const haystack = [
-          name,
-          data.primaryEntry.command ?? "",
-          ...(data.primaryEntry.args ?? []),
-          data.primaryEntry.url ?? "",
-          data.primaryEntry.bearerTokenEnvVar ?? "",
-        ]
-          .join(" ")
-          .toLowerCase();
+        const haystackParts: string[] = [name];
+        for (const entry of data.byEngine.values()) {
+          haystackParts.push(
+            entry.command ?? "",
+            ...(entry.args ?? []),
+            entry.url ?? "",
+            entry.bearerTokenEnvVar ?? "",
+          );
+        }
+        const haystack = haystackParts.join(" ").toLowerCase();
         if (!haystack.includes(normalizedQuery)) continue;
       }
       rows.push({
@@ -349,10 +497,14 @@ export function UnifiedMcpSettingsPanel() {
   const activeEngine = useMemo(() => {
     const found = engines.find((engine) => engine.id === activeEngineTab) ?? engines[0];
     if (!found) return null;
+    const unfilteredServerCount = found.servers.length;
     const normalizedQuery = searchQuery.trim().toLowerCase();
-    if (!normalizedQuery) return found;
+    if (!normalizedQuery) {
+      return { ...found, unfilteredServerCount };
+    }
     return {
       ...found,
+      unfilteredServerCount,
       servers: found.servers.filter((server) =>
         `${server.name} ${serverSummary(server)} ${server.bearerTokenEnvVar ?? ""}`
           .toLowerCase()
@@ -400,19 +552,42 @@ export function UnifiedMcpSettingsPanel() {
     const key = `sync:${name}:${targetEngineIds.join(",")}`;
     setBusyKey(key);
     try {
-      const next = await fetchMcpApi<UnifiedMcpSnapshot>("/api/vela/mcp/sync", {
+      const res = await fetchMcpApi<SyncMcpServerResult>("/api/vela/mcp/sync", {
         method: "POST",
         body: JSON.stringify({ sourceEngineId, name, targetEngineIds }),
       });
-      setUnifiedMcpSnapshot(next);
-      const targetLabels = targetEngineIds
-        .map((id) => engineLabelById.get(id) ?? id)
-        .join("、");
-      toastManager.add({
-        type: "success",
-        title: `已同步 ${name}`,
-        description: `已写入：${targetLabels}`,
-      });
+      setUnifiedMcpSnapshot(res.snapshot);
+      const succeeded = res.results
+        .filter((r) => r.ok)
+        .map((r) => engineLabelById.get(r.engineId) ?? r.engineId);
+      const failed = res.results.filter((r) => !r.ok);
+
+      if (failed.length === 0) {
+        setSyncReport((prev) =>
+          prev && prev.name === name && prev.sourceEngineId === sourceEngineId ? null : prev,
+        );
+        toastManager.add({
+          type: "success",
+          title: `已同步 ${name}`,
+          description: `已写入：${succeeded.join("、")}`,
+        });
+      } else {
+        setSyncReport({ sourceEngineId, name, results: res.results });
+        const failedLabels = failed
+          .map((r) => `${engineLabelById.get(r.engineId) ?? r.engineId}（${r.error ?? "写入失败"}）`)
+          .join("；");
+        toastManager.add({
+          type: succeeded.length > 0 ? "warning" : "error",
+          title:
+            succeeded.length > 0
+              ? `部分同步失败：${succeeded.length} 成功，${failed.length} 失败`
+              : "同步失败",
+          description:
+            succeeded.length > 0
+              ? `已写入：${succeeded.join("、")}。失败：${failedLabels}`
+              : failedLabels,
+        });
+      }
     } catch (err) {
       toastManager.add({
         type: "error",
@@ -484,13 +659,15 @@ export function UnifiedMcpSettingsPanel() {
       const env = pairsToRecord(editor.envPairs);
       const headers = pairsToRecord(editor.headerPairs);
 
+      const shouldSendEnabled = editor.mode === "create" || editor.enabledTouched;
+
       const next = await fetchMcpApi<UnifiedMcpSnapshot>("/api/vela/mcp/upsert", {
         method: "POST",
         body: JSON.stringify({
           name: trimmedName,
           ...(editor.originalName ? { originalName: editor.originalName } : {}),
           transport: editor.transport,
-          enabled: editor.enabled,
+          ...(shouldSendEnabled ? { enabled: editor.enabled } : {}),
           ...(editor.transport === "stdio"
             ? {
                 command: editor.command.trim(),
@@ -566,7 +743,9 @@ export function UnifiedMcpSettingsPanel() {
     const targets: Array<{ engineId: McpEngineId; name: string }> =
       viewMode === "engine" && activeEngine
         ? activeEngine.servers.map((server) => ({ engineId: activeEngine.id, name: server.name }))
-        : matrixRows.map((row) => ({ engineId: row.primaryEngineId, name: row.name }));
+        : matrixRows.flatMap((row) =>
+            [...row.byEngine.keys()].map((engineId) => ({ engineId, name: row.name })),
+          );
 
     if (targets.length === 0) return;
     setTestingAll(true);
@@ -861,6 +1040,73 @@ export function UnifiedMcpSettingsPanel() {
         </div>
       </div>
 
+      {/* Per-engine partial sync report */}
+      {syncReport && (
+        <div className="space-y-2 rounded-xl border border-warning/35 bg-warning-surface/40 px-4 py-3 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 font-medium text-foreground">
+              <AlertCircleIcon className="size-4 shrink-0 text-warning" />
+              <span>
+                「{syncReport.name}」同步结果（来自{" "}
+                {engineLabelById.get(syncReport.sourceEngineId) ?? syncReport.sourceEngineId}）
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {syncReport.results.some((r) => !r.ok) && (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={busyKey !== null}
+                  onClick={() =>
+                    void handleSync(
+                      syncReport.sourceEngineId,
+                      syncReport.name,
+                      syncReport.results.filter((r) => !r.ok).map((r) => r.engineId),
+                    )
+                  }
+                >
+                  重试失败项
+                </Button>
+              )}
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                aria-label="关闭同步结果提示"
+                onClick={() => setSyncReport(null)}
+              >
+                <XIcon className="size-3.5" />
+              </Button>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {syncReport.results.map((item) => {
+              const label = engineLabelById.get(item.engineId) ?? item.engineId;
+              return (
+                <div
+                  key={item.engineId}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-md border px-2 py-1",
+                    item.ok
+                      ? "border-border/60 bg-background/70 text-foreground"
+                      : "border-destructive/35 bg-destructive/8 text-destructive",
+                  )}
+                >
+                  {item.ok ? (
+                    <CheckIcon className="size-3.5 shrink-0" />
+                  ) : (
+                    <AlertCircleIcon className="size-3.5 shrink-0" />
+                  )}
+                  <span className="font-medium">{label}</span>
+                  <span className="text-muted-foreground">
+                    {item.ok ? "已写入" : item.error || "写入失败"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Error banner */}
       {error && (
         <div className="flex items-center justify-between gap-3 rounded-xl border border-destructive/30 bg-destructive/6 px-4 py-3 text-xs text-destructive">
@@ -884,327 +1130,375 @@ export function UnifiedMcpSettingsPanel() {
         ) : null
       ) : viewMode === "matrix" ? (
         <>
-          {/* Pixel-aligned Matrix Table */}
+          {/* Pixel-aligned Matrix Table with container-aware responsive layout */}
           <SettingsSection
             id="unified-mcp-matrix"
             title="MCP 服务"
             headerAction={
               <span className="text-xs text-muted-foreground">
-                点击勾选切换启停 · 点击圆点一键同步
+                点击勾选切换启停 · 窄屏支持单键同步
               </span>
             }
           >
-            {/* Header row using exact same grid columns */}
-            <div
-              className={cn(
-                MATRIX_GRID_CLASS,
-                "hidden bg-muted/25 px-4 py-2 text-[11px] font-medium text-muted-foreground sm:grid",
-              )}
-            >
-              <div className="min-w-0 pr-3">服务</div>
-              {engines.map((engine) => (
-                <div key={engine.id} className="flex justify-center">
-                  <Tooltip>
-                    <TooltipTrigger
-                      render={
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setActiveEngineTab(engine.id);
-                            setViewMode("engine");
-                          }}
-                          className="cursor-pointer truncate rounded px-1 py-0.5 text-center transition-colors hover:bg-accent/60 hover:text-foreground"
-                        >
-                          {ENGINE_SHORT_LABEL[engine.id]}
-                        </button>
-                      }
-                    />
-                    <TooltipPopup side="top">
-                      {engine.label} · {engine.displayPath}
-                    </TooltipPopup>
-                  </Tooltip>
-                </div>
-              ))}
-              <div className="text-right">操作</div>
-            </div>
-
-            {matrixRows.length === 0 ? (
-              <div className="px-4 py-10 text-center text-xs text-muted-foreground">
-                {searchQuery ? "没有匹配的 MCP 服务" : "暂未发现 MCP 服务，点击右上角「添加 MCP」新建。"}
-              </div>
-            ) : (
-              matrixRows.map((row) => {
-                const missingEngines = ALL_ENGINE_IDS.filter((id) => !row.byEngine.has(id));
-                const configuredEngines = ALL_ENGINE_IDS.filter((id) => row.byEngine.has(id));
-                const isRowBusy = busyKey !== null && busyKey.includes(`:${row.name}`);
-                const hasMaskedSecrets =
-                  row.primaryEntry.maskedEnvKeys.length > 0 ||
-                  row.primaryEntry.maskedHeaderKeys.length > 0;
-
-                return (
-                  <div
-                    key={row.name}
-                    className={cn(
-                      MATRIX_GRID_CLASS,
-                      "group px-4 py-3 transition-colors hover:bg-muted/20",
-                    )}
-                  >
-                    {/* Column 1: Service name + summary */}
-                    <div className="min-w-0 pr-3">
-                      <div className="flex items-center gap-2">
-                        {row.primaryEntry.transport === "http" ? (
-                          <GlobeIcon className="size-3.5 shrink-0 text-muted-foreground/75" />
-                        ) : (
-                          <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground/75" />
-                        )}
-                        <span className="truncate text-sm font-medium text-foreground">
-                          {row.name}
-                        </span>
-                        <span className="shrink-0 font-mono text-[10px] uppercase tracking-wide text-muted-foreground/70">
-                          {row.primaryEntry.transport === "http" ? "http" : "stdio"}
-                        </span>
-                        {row.primaryEntry.bearerTokenEnvVar && (
-                          <Tooltip>
-                            <TooltipTrigger
-                              render={
-                                <span className="inline-flex shrink-0 items-center gap-0.5 text-[10px] text-muted-foreground/75">
-                                  <LockIcon className="size-2.5" />
-                                </span>
-                              }
-                            />
-                            <TooltipPopup side="top">
-                              Bearer Token 环境变量：{row.primaryEntry.bearerTokenEnvVar}
-                            </TooltipPopup>
-                          </Tooltip>
-                        )}
-                        {!row.primaryEntry.bearerTokenEnvVar && hasMaskedSecrets && (
-                          <Tooltip>
-                            <TooltipTrigger
-                              render={
-                                <span className="inline-flex shrink-0 items-center text-muted-foreground/75">
-                                  <LockIcon className="size-2.5" />
-                                </span>
-                              }
-                            />
-                            <TooltipPopup side="top">含已脱敏凭据，编辑与同步时自动保留</TooltipPopup>
-                          </Tooltip>
-                        )}
-                        <McpHealthBadge
-                          testing={testingKeys.has(row.name)}
-                          result={testResults[`${row.primaryEngineId}:${row.name}`] ?? testResults[row.name]}
-                          onQuickAuth={
-                            row.primaryEntry.transport === "http"
-                              ? () =>
-                                  openAuthDialog(
-                                    row.primaryEntry,
-                                    row.primaryEngineId,
-                                    configuredEngines,
-                                    testResults[`${row.primaryEngineId}:${row.name}`] ??
-                                      testResults[row.name],
-                                  )
-                              : undefined
-                          }
-                        />
-                      </div>
-                      <p className="mt-0.5 truncate pl-[22px] font-mono text-[11px] text-muted-foreground/75">
-                        {serverSummary(row.primaryEntry)}
-                      </p>
-                    </div>
-
-                    {/* Columns 2-7: 6 Engine status cells (desktop direct grid children) */}
-                    {engines.map((engine) => {
-                      const entry = row.byEngine.get(engine.id);
-                      const cellBusy =
-                        busyKey === `toggle:${engine.id}:${row.name}` ||
-                        busyKey === `sync:${row.name}:${engine.id}`;
-
-                      return (
-                        <div
-                          key={engine.id}
-                          className="hidden items-center justify-center sm:flex"
-                        >
-                          <Tooltip>
-                            <TooltipTrigger
-                              render={
-                                <button
-                                  type="button"
-                                  disabled={busyKey !== null}
-                                  onClick={() => {
-                                    if (entry) {
-                                      void handleToggle(engine.id, row.name, !entry.enabled);
-                                    } else {
-                                      void handleSync(row.primaryEngineId, row.name, [engine.id]);
-                                    }
-                                  }}
-                                  aria-label={
-                                    entry
-                                      ? `${engine.label} ${entry.enabled ? "已启用" : "已禁用"}`
-                                      : `同步到 ${engine.label}`
-                                  }
-                                  className={cn(
-                                    "group/cell flex size-5 cursor-pointer items-center justify-center rounded-full transition-all disabled:pointer-events-none disabled:opacity-50",
-                                    entry?.enabled
-                                      ? "bg-foreground/88 text-background hover:bg-foreground"
-                                      : entry
-                                        ? "border border-border bg-muted/60 text-muted-foreground hover:border-foreground/35 hover:text-foreground"
-                                        : "text-muted-foreground/30 hover:border hover:border-border hover:bg-background hover:text-foreground",
-                                  )}
-                                >
-                                  {cellBusy ? (
-                                    <RefreshCwIcon className="size-2.5 animate-spin" />
-                                  ) : entry?.enabled ? (
-                                    <CheckIcon className="size-3 stroke-[2.5]" />
-                                  ) : entry ? (
-                                    <MinusIcon className="size-2.5" />
-                                  ) : (
-                                    <>
-                                      <span className="size-1.5 rounded-full bg-current group-hover/cell:hidden" />
-                                      <PlusIcon className="hidden size-3 group-hover/cell:block" />
-                                    </>
-                                  )}
-                                </button>
-                              }
-                            />
-                            <TooltipPopup side="top">
-                              {entry?.enabled
-                                ? `${engine.label}：已启用（点击禁用）`
-                                : entry
-                                  ? `${engine.label}：已禁用（点击启用）`
-                                  : `未配置 · 点击同步到 ${engine.label}`}
-                            </TooltipPopup>
-                          </Tooltip>
-                        </div>
-                      );
-                    })}
-
-                    {/* Mobile fallback strip (< sm) */}
-                    <div className="flex flex-wrap items-center gap-1.5 pl-[22px] sm:hidden">
-                      {engines.map((engine) => {
-                        const entry = row.byEngine.get(engine.id);
-                        return (
+            <div className="@container">
+              {/* Header row using exact same grid columns */}
+              <div
+                className={cn(
+                  MATRIX_GRID_CLASS,
+                  "hidden bg-muted/25 px-4 py-2 text-[11px] font-medium text-muted-foreground @[680px]:grid",
+                )}
+              >
+                <div className="min-w-0 pr-3">服务</div>
+                {engines.map((engine) => (
+                  <div key={engine.id} className="flex justify-center">
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
                           <button
-                            key={engine.id}
                             type="button"
-                            disabled={busyKey !== null}
                             onClick={() => {
-                              if (entry) {
-                                void handleToggle(engine.id, row.name, !entry.enabled);
-                              } else {
-                                void handleSync(row.primaryEngineId, row.name, [engine.id]);
-                              }
+                              setActiveEngineTab(engine.id);
+                              setViewMode("engine");
                             }}
-                            className={cn(
-                              "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px]",
-                              entry?.enabled
-                                ? "border-foreground/25 bg-foreground/[0.06] text-foreground"
-                                : entry
-                                  ? "border-border text-muted-foreground line-through"
-                                  : "border-dashed border-border/70 text-muted-foreground/70",
-                            )}
+                            className="cursor-pointer truncate rounded px-1 py-0.5 text-center transition-colors hover:bg-accent/60 hover:text-foreground"
                           >
                             {ENGINE_SHORT_LABEL[engine.id]}
                           </button>
+                        }
+                      />
+                      <TooltipPopup side="top">
+                        {engine.label} · {engine.displayPath}
+                      </TooltipPopup>
+                    </Tooltip>
+                  </div>
+                ))}
+                <div className="text-right">操作</div>
+              </div>
+
+              {matrixRows.length === 0 ? (
+                <div className="px-4 py-10 text-center text-xs text-muted-foreground">
+                  {searchQuery ? "没有匹配的 MCP 服务" : "暂未发现 MCP 服务，点击右上角「添加 MCP」新建。"}
+                </div>
+              ) : (
+                matrixRows.map((row) => {
+                  const missingEngines = ALL_ENGINE_IDS.filter((id) => !row.byEngine.has(id));
+                  const configuredEngines = ALL_ENGINE_IDS.filter((id) => row.byEngine.has(id));
+                  const isRowBusy = busyKey !== null && busyKey.includes(`:${row.name}`);
+                  const isRowTesting = configuredEngines.some((id) =>
+                    testingKeys.has(`${id}:${row.name}`),
+                  );
+                  const rowHealth = resolveMatrixRowHealthBadge(
+                    row.name,
+                    row.primaryEngineId,
+                    configuredEngines,
+                    testResults,
+                  );
+                  const rowHealthEntry = row.byEngine.get(rowHealth.engineId) ?? row.primaryEntry;
+                  const crossEngine = describeCrossEngineParity(
+                    row.primaryEntry,
+                    row.primaryEngineId,
+                    configuredEngines,
+                    row.byEngine,
+                  );
+                  const hasMaskedSecrets =
+                    row.primaryEntry.maskedEnvKeys.length > 0 ||
+                    row.primaryEntry.maskedHeaderKeys.length > 0;
+
+                  return (
+                    <div
+                      key={row.name}
+                      className={cn(
+                        MATRIX_GRID_CLASS,
+                        "group px-4 py-3 transition-colors hover:bg-muted/20",
+                      )}
+                    >
+                      {/* Column 1: Service name + summary */}
+                      <div className="min-w-0 @[680px]:pr-3">
+                        <div className="flex items-center gap-2">
+                          {row.primaryEntry.transport === "http" ? (
+                            <GlobeIcon className="size-3.5 shrink-0 text-muted-foreground/75" />
+                          ) : (
+                            <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground/75" />
+                          )}
+                          <span className="truncate text-sm font-medium text-foreground">
+                            {row.name}
+                          </span>
+                          <span className="shrink-0 font-mono text-[10px] uppercase tracking-wide text-muted-foreground/70">
+                            {row.primaryEntry.transport === "http" ? "http" : "stdio"}
+                          </span>
+                          {row.primaryEntry.bearerTokenEnvVar && (
+                            <Tooltip>
+                              <TooltipTrigger
+                                render={
+                                  <span className="inline-flex shrink-0 items-center gap-0.5 text-[10px] text-muted-foreground/75">
+                                    <LockIcon className="size-2.5" />
+                                  </span>
+                                }
+                              />
+                              <TooltipPopup side="top">
+                                Bearer Token 环境变量：{row.primaryEntry.bearerTokenEnvVar}
+                              </TooltipPopup>
+                            </Tooltip>
+                          )}
+                          {!row.primaryEntry.bearerTokenEnvVar && hasMaskedSecrets && (
+                            <Tooltip>
+                              <TooltipTrigger
+                                render={
+                                  <span className="inline-flex shrink-0 items-center text-muted-foreground/75">
+                                    <LockIcon className="size-2.5" />
+                                  </span>
+                                }
+                              />
+                              <TooltipPopup side="top">含已脱敏凭据，编辑与同步时自动保留</TooltipPopup>
+                            </Tooltip>
+                          )}
+                          <McpHealthBadge
+                            testing={isRowTesting}
+                            result={rowHealth.result}
+                            prefixLabel={rowHealth.badgeNote}
+                            onQuickAuth={
+                              rowHealthEntry.transport === "http"
+                                ? () =>
+                                    openAuthDialog(
+                                      rowHealthEntry,
+                                      rowHealth.engineId,
+                                      [rowHealth.engineId],
+                                      rowHealth.result,
+                                    )
+                                : undefined
+                            }
+                          />
+                        </div>
+                        <p className="mt-0.5 truncate pl-[22px] font-mono text-[11px] text-muted-foreground">
+                          {serverSummary(row.primaryEntry)}
+                        </p>
+                      </div>
+
+                      {/* Columns 2-7: 6 Engine status cells (wide container direct grid children) */}
+                      {engines.map((engine) => {
+                        const entry = row.byEngine.get(engine.id);
+                        const cellBusy =
+                          busyKey === `toggle:${engine.id}:${row.name}` ||
+                          busyKey === `sync:${row.name}:${engine.id}`;
+
+                        return (
+                          <div
+                            key={engine.id}
+                            className="hidden items-center justify-center @[680px]:flex"
+                          >
+                            <Tooltip>
+                              <TooltipTrigger
+                                render={
+                                  <button
+                                    type="button"
+                                    disabled={busyKey !== null}
+                                    onClick={() => {
+                                      if (entry) {
+                                        void handleToggle(engine.id, row.name, !entry.enabled);
+                                      } else {
+                                        void handleSync(row.primaryEngineId, row.name, [engine.id]);
+                                      }
+                                    }}
+                                    aria-label={
+                                      entry
+                                        ? `${engine.label} ${entry.enabled ? "已启用" : "已禁用"}`
+                                        : `同步到 ${engine.label}`
+                                    }
+                                    className={cn(
+                                      "group/cell flex size-5 cursor-pointer items-center justify-center rounded-full transition-all disabled:pointer-events-none disabled:opacity-50",
+                                      entry?.enabled
+                                        ? "bg-foreground/88 text-background hover:bg-foreground"
+                                        : entry
+                                          ? "border border-border bg-muted/60 text-muted-foreground hover:border-foreground/35 hover:text-foreground"
+                                          : "text-muted-foreground/30 hover:border hover:border-border hover:bg-background hover:text-foreground",
+                                    )}
+                                  >
+                                    {cellBusy ? (
+                                      <RefreshCwIcon className="size-2.5 animate-spin" />
+                                    ) : entry?.enabled ? (
+                                      <CheckIcon className="size-3 stroke-[2.5]" />
+                                    ) : entry ? (
+                                      <MinusIcon className="size-2.5" />
+                                    ) : (
+                                      <>
+                                        <span className="size-1.5 rounded-full bg-current group-hover/cell:hidden" />
+                                        <PlusIcon className="hidden size-3 group-hover/cell:block" />
+                                      </>
+                                    )}
+                                  </button>
+                                }
+                              />
+                              <TooltipPopup side="top">
+                                {entry?.enabled
+                                  ? `${engine.label}：已启用（点击禁用）`
+                                  : entry
+                                    ? `${engine.label}：已禁用（点击启用）`
+                                    : `未配置 · 点击同步到 ${engine.label}`}
+                              </TooltipPopup>
+                            </Tooltip>
+                          </div>
                         );
                       })}
-                    </div>
 
-                    {/* Column 8: Subtle row actions */}
-                    <div className="flex items-center justify-end gap-0.5 opacity-40 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                      <Tooltip>
-                        <TooltipTrigger
-                          render={
-                            <Button
-                              size="icon-xs"
-                              variant="ghost"
-                              aria-label={`检测 ${row.name} 连接`}
-                              disabled={testingKeys.has(row.name) || isRowBusy}
-                              onClick={() => void runTestServer(row.primaryEngineId, row.name)}
+                      {/* Compact engine pills + explicit sync action for narrow containers */}
+                      <div className="flex flex-wrap items-center gap-1.5 pl-[22px] @[680px]:hidden">
+                        {engines.map((engine) => {
+                          const entry = row.byEngine.get(engine.id);
+                          return (
+                            <button
+                              key={engine.id}
+                              type="button"
+                              disabled={busyKey !== null}
+                              onClick={() => {
+                                if (entry) {
+                                  void handleToggle(engine.id, row.name, !entry.enabled);
+                                } else {
+                                  void handleSync(row.primaryEngineId, row.name, [engine.id]);
+                                }
+                              }}
+                              className={cn(
+                                "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] transition-colors",
+                                entry?.enabled
+                                  ? "border-foreground/25 bg-foreground/[0.06] text-foreground"
+                                  : entry
+                                    ? "border-border text-muted-foreground line-through"
+                                    : "border-dashed border-border/70 text-muted-foreground/75 hover:border-border hover:text-foreground",
+                              )}
                             >
-                              <ActivityIcon
-                                className={cn("size-3.5", testingKeys.has(row.name) && "animate-pulse")}
-                              />
-                            </Button>
-                          }
-                        />
-                        <TooltipPopup side="top">测试连接与工具列表</TooltipPopup>
-                      </Tooltip>
+                              {entry?.enabled ? (
+                                <CheckIcon className="size-2.5" />
+                              ) : !entry ? (
+                                <PlusIcon className="size-2.5 opacity-70" />
+                              ) : null}
+                              {ENGINE_SHORT_LABEL[engine.id]}
+                            </button>
+                          );
+                        })}
+                        {missingEngines.length > 0 && (
+                          <button
+                            type="button"
+                            disabled={isRowBusy}
+                            onClick={() =>
+                              void handleSync(row.primaryEngineId, row.name, missingEngines)
+                            }
+                            className="inline-flex items-center gap-1 rounded-md border border-border/70 bg-muted/40 px-1.5 py-0.5 text-[11px] font-medium text-foreground/85 hover:bg-accent disabled:opacity-50"
+                          >
+                            <ArrowLeftRightIcon className="size-2.5" />
+                            同步其余 {missingEngines.length} 个
+                          </button>
+                        )}
+                      </div>
 
-                      {missingEngines.length > 0 && (
+                      {/* Column 8: Row actions */}
+                      <div className="flex items-center justify-end gap-0.5 opacity-85 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
                         <Tooltip>
                           <TooltipTrigger
                             render={
                               <Button
                                 size="icon-xs"
                                 variant="ghost"
-                                aria-label={`同步 ${row.name} 到全部引擎`}
-                                disabled={isRowBusy}
+                                aria-label={`检测 ${row.name} 连接`}
+                                disabled={isRowTesting || isRowBusy}
                                 onClick={() =>
-                                  void handleSync(row.primaryEngineId, row.name, missingEngines)
+                                  void Promise.all(
+                                    configuredEngines.map((engineId) =>
+                                      runTestServer(engineId, row.name),
+                                    ),
+                                  )
                                 }
                               >
-                                <ArrowLeftRightIcon className="size-3.5" />
+                                <ActivityIcon
+                                  className={cn("size-3.5", isRowTesting && "animate-pulse")}
+                                />
                               </Button>
                             }
                           />
                           <TooltipPopup side="top">
-                            同步到剩余 {missingEngines.length} 个引擎
+                            {configuredEngines.length > 1
+                              ? `检测全部 ${configuredEngines.length} 个已配引擎的连接`
+                              : "测试连接与工具列表"}
                           </TooltipPopup>
                         </Tooltip>
-                      )}
 
-                      <Tooltip>
-                        <TooltipTrigger
-                          render={
-                            <Button
-                              size="icon-xs"
-                              variant="ghost"
-                              aria-label={`编辑 ${row.name}`}
-                              disabled={isRowBusy}
-                              onClick={() => {
-                                setEditorError(null);
-                                setEditor(
-                                  createEditEditor(
-                                    row.primaryEntry,
-                                    row.primaryEngineId,
-                                    configuredEngines,
-                                  ),
-                                );
-                              }}
-                            >
-                              <PencilIcon className="size-3.5" />
-                            </Button>
-                          }
-                        />
-                        <TooltipPopup side="top">编辑配置</TooltipPopup>
-                      </Tooltip>
-
-                      <Tooltip>
-                        <TooltipTrigger
-                          render={
-                            <Button
-                              size="icon-xs"
-                              variant="ghost-destructive"
-                              aria-label={`删除 ${row.name}`}
-                              disabled={isRowBusy}
-                              onClick={() =>
-                                setDeleteDialog({
-                                  name: row.name,
-                                  availableEngines: configuredEngines,
-                                  selectedEngines: configuredEngines,
-                                })
+                        {missingEngines.length > 0 && (
+                          <Tooltip>
+                            <TooltipTrigger
+                              render={
+                                <Button
+                                  size="icon-xs"
+                                  variant="ghost"
+                                  aria-label={`同步 ${row.name} 到全部引擎`}
+                                  disabled={isRowBusy}
+                                  onClick={() =>
+                                    void handleSync(row.primaryEngineId, row.name, missingEngines)
+                                  }
+                                >
+                                  <ArrowLeftRightIcon className="size-3.5" />
+                                </Button>
                               }
-                            >
-                              <Trash2Icon className="size-3.5" />
-                            </Button>
-                          }
-                        />
-                        <TooltipPopup side="top">删除</TooltipPopup>
-                      </Tooltip>
+                            />
+                            <TooltipPopup side="top">
+                              同步到剩余 {missingEngines.length} 个引擎
+                            </TooltipPopup>
+                          </Tooltip>
+                        )}
+
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <Button
+                                size="icon-xs"
+                                variant="ghost"
+                                aria-label={`编辑 ${row.name}`}
+                                disabled={isRowBusy}
+                                onClick={() => {
+                                  setEditorError(null);
+                                  setEditor(
+                                    createEditEditor(
+                                      row.primaryEntry,
+                                      row.primaryEngineId,
+                                      configuredEngines,
+                                      crossEngine.engines,
+                                      crossEngine.parity,
+                                    ),
+                                  );
+                                }}
+                              >
+                                <PencilIcon className="size-3.5" />
+                              </Button>
+                            }
+                          />
+                          <TooltipPopup side="top">编辑配置</TooltipPopup>
+                        </Tooltip>
+
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <Button
+                                size="icon-xs"
+                                variant="ghost-destructive"
+                                aria-label={`删除 ${row.name}`}
+                                disabled={isRowBusy}
+                                onClick={() =>
+                                  setDeleteDialog({
+                                    name: row.name,
+                                    availableEngines: configuredEngines,
+                                    selectedEngines: configuredEngines,
+                                  })
+                                }
+                              >
+                                <Trash2Icon className="size-3.5" />
+                              </Button>
+                            }
+                          />
+                          <TooltipPopup side="top">删除</TooltipPopup>
+                        </Tooltip>
+                      </div>
                     </div>
-                  </div>
-                );
-              })
-            )}
+                  );
+                })
+              )}
+            </div>
           </SettingsSection>
 
           {/* Compact Collapsible Plugin-managed MCPs */}
@@ -1304,24 +1598,37 @@ export function UnifiedMcpSettingsPanel() {
               )}
 
               {activeEngine.servers.length === 0 ? (
-                <div className="flex items-center justify-between gap-3 px-4 py-8">
-                  <span className="text-xs text-muted-foreground">
-                    {activeEngine.exists
-                      ? "当前引擎暂未配置自定义 MCP 服务。"
-                      : "尚未创建该引擎的配置文件，添加或同步时将自动创建。"}
-                  </span>
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    onClick={() => {
-                      setEditorError(null);
-                      setEditor(createEmptyEditor([activeEngine.id]));
-                    }}
-                  >
-                    <PlusIcon className="size-3" />
-                    添加
-                  </Button>
-                </div>
+                searchQuery.trim().length > 0 ? (
+                  <div className="flex items-center justify-between gap-3 px-4 py-8">
+                    <span className="text-xs text-muted-foreground">
+                      {activeEngine.unfilteredServerCount > 0
+                        ? `${activeEngine.label} 中没有匹配「${searchQuery.trim()}」的 MCP 服务。`
+                        : `${activeEngine.label} 暂未配置自定义 MCP 服务（当前有筛选条件）。`}
+                    </span>
+                    <Button size="xs" variant="outline" onClick={() => setSearchQuery("")}>
+                      清除筛选
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between gap-3 px-4 py-8">
+                    <span className="text-xs text-muted-foreground">
+                      {activeEngine.exists
+                        ? "当前引擎暂未配置自定义 MCP 服务。"
+                        : "尚未创建该引擎的配置文件，添加或同步时将自动创建。"}
+                    </span>
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      onClick={() => {
+                        setEditorError(null);
+                        setEditor(createEmptyEditor([activeEngine.id]));
+                      }}
+                    >
+                      <PlusIcon className="size-3" />
+                      添加
+                    </Button>
+                  </div>
+                )
               ) : (
                 activeEngine.servers.map((server) => {
                   const otherEngines = ALL_ENGINE_IDS.filter((id) => id !== activeEngine.id);
@@ -1368,13 +1675,13 @@ export function UnifiedMcpSettingsPanel() {
                             }
                           />
                         </div>
-                        <p className="mt-0.5 truncate pl-[22px] font-mono text-[11px] text-muted-foreground/75">
+                        <p className="mt-0.5 truncate pl-[22px] font-mono text-[11px] text-muted-foreground">
                           {serverSummary(server)}
                         </p>
                       </div>
 
                       <div className="flex shrink-0 items-center gap-1">
-                        <div className="flex items-center gap-0.5 opacity-40 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                        <div className="flex items-center gap-0.5 opacity-85 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
                           <Tooltip>
                             <TooltipTrigger
                               render={
@@ -1496,6 +1803,20 @@ export function UnifiedMcpSettingsPanel() {
                   <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/6 px-3 py-2 text-xs text-destructive">
                     <AlertCircleIcon className="size-3.5 shrink-0" />
                     <span>{editorError}</span>
+                  </div>
+                )}
+
+                {editor.divergentEngines.length > 0 && (
+                  <div className="flex items-start gap-2 rounded-lg border border-warning/35 bg-warning-surface/50 px-3 py-2 text-xs text-foreground">
+                    <AlertCircleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
+                    <span>
+                      {formatCrossEngineWarning(
+                        editor.crossEngineParity === "equivalent" ? "different" : editor.crossEngineParity,
+                        editor.divergentEngines.map((id) => engineLabelById.get(id) ?? id).join("、"),
+                        engineLabelById.get(editor.primaryEngineId ?? "codex") ?? "当前载入引擎",
+                        engineLabelById.get(editor.primaryEngineId ?? "codex") ?? "主引擎",
+                      )}
+                    </span>
                   </div>
                 )}
 
@@ -2071,10 +2392,12 @@ export function UnifiedMcpSettingsPanel() {
 function McpHealthBadge({
   testing,
   result,
+  prefixLabel,
   onQuickAuth,
 }: {
   testing: boolean;
   result?: McpTestResult | undefined;
+  prefixLabel?: string | undefined;
   onQuickAuth?: (() => void) | undefined;
 }) {
   if (testing) {
@@ -2089,7 +2412,7 @@ function McpHealthBadge({
 
   const isAuthActionable = result.status === "auth_required" && onQuickAuth !== undefined;
 
-  const label =
+  const rawLabel =
     result.status === "connected"
       ? result.toolCount !== undefined
         ? `${result.toolCount} 工具 · ${result.latencyMs}ms`
@@ -2099,19 +2422,20 @@ function McpHealthBadge({
         : result.status === "auth_required"
           ? "需认证"
           : "连接失败";
+  const label = prefixLabel ? `${prefixLabel} · ${rawLabel}` : rawLabel;
 
   const dotClass =
     result.status === "connected"
-      ? "bg-emerald-500"
+      ? "bg-success"
       : result.status === "auth_required"
-        ? "bg-amber-500"
+        ? "bg-warning"
         : "bg-destructive";
 
   const textClass =
     result.status === "connected"
       ? "text-muted-foreground"
       : result.status === "auth_required"
-        ? "text-amber-600 dark:text-amber-400"
+        ? "text-warning"
         : "text-destructive";
 
   const detailLines: string[] = [];
@@ -2140,7 +2464,7 @@ function McpHealthBadge({
             <button
               type="button"
               onClick={onQuickAuth}
-              className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-700 transition-colors hover:border-amber-500/55 hover:bg-amber-500/18 dark:text-amber-400"
+              className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-full border border-warning/35 bg-warning-surface/60 px-2 py-0.5 text-[11px] font-medium text-warning transition-colors hover:border-warning/60 hover:bg-warning-surface"
             >
               <span className={cn("size-1.5 rounded-full", dotClass)} />
               {label}

@@ -201,6 +201,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
      by the composer, its context strip and attached banners. */
   --shadow-composer: 0 1px 2px rgb(0 0 0 / 5%);
   --shadow-composer-dark: 0 14px 32px -18px rgb(0 0 0 / 75%);
+  --shadow-collab-card-dark: inset 0 1px 0 rgb(255 255 255 / 0.05);
   /* Overlap the lower toolbar backdrop by one pixel to cover the composer seam. */
   --spacing-composer-seam: calc(var(--spacing) * 4 - 1px);
   /* Dark-mode shade where an attached surface meets the composer: 10px of
@@ -652,51 +653,23 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
 }
 
 @utility visible-animate-dispatch-ping {
-  @media (prefers-reduced-motion: no-preference) {
-    animation: var(--animate-dispatch-ping);
-    animation-play-state: var(--visible-animation-state, paused);
-    will-change: var(--visible-animation-will-change, auto);
-  }
+  animation: none;
 }
 
 @utility visible-animate-dispatch-sweep {
-  @media (prefers-reduced-motion: no-preference) {
-    animation: var(--animate-dispatch-sweep);
-    animation-play-state: var(--visible-animation-state, paused);
-    will-change: var(--visible-animation-will-change, auto);
-  }
+  animation: none;
 }
 
 @utility visible-animate-dispatch-flow-v {
-  @media (prefers-reduced-motion: no-preference) {
-    animation: var(--animate-dispatch-flow-v);
-    animation-play-state: var(--visible-animation-state, paused);
-    will-change: var(--visible-animation-will-change, auto);
-  }
+  animation: none;
 }
 
 @utility visible-animate-dispatch-orbit {
-  @media (prefers-reduced-motion: no-preference) {
-    animation: var(--animate-dispatch-orbit);
-    animation-play-state: var(--visible-animation-state, paused);
-    will-change: var(--visible-animation-will-change, auto);
-  }
+  animation: none;
 }
 
 @utility visible-animate-dispatch-shine {
-  @media (prefers-reduced-motion: no-preference) and (forced-colors: none) {
-    color: transparent;
-    background-image:
-      linear-gradient(to right, transparent, var(--contrast-foreground), transparent),
-      linear-gradient(var(--contrast-secondary-label), var(--contrast-secondary-label));
-    background-size:
-      4.5rem 100%,
-      100% 100%;
-    background-repeat: no-repeat;
-    background-clip: text;
-    animation: live-tool-shine 2.2s linear infinite;
-    animation-play-state: var(--visible-animation-state, paused);
-  }
+  animation: none;
 }
 
 @keyframes live-activity-focus {

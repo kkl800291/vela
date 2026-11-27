@@ -327,6 +327,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   const currentEntry = yield* Ref.make(entry);
   const currentRoutes = Ref.get(currentEntry).pipe(Effect.map(connectionRoutes));
   const preferredRouteId = yield* Ref.make(Option.none<string>());
+  const lastConnectedRouteId = yield* Ref.make(Option.none<string>());
   const routeCooldowns = yield* Ref.make<ReadonlyMap<string, bigint>>(new Map());
   // Outlives sessions so a reconnect shows a refusal seen earlier; a route leaves once it connects.
   const refusedRoutes = yield* Ref.make(NO_REFUSED_ROUTES);
@@ -345,9 +346,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     const latest = yield* Ref.get(currentEntry);
     const routes = connectionRoutes(latest);
     const preferred = yield* Ref.getAndSet(preferredRouteId, Option.none());
-    if (Option.isNone(preferred)) return latest;
+    const prioritized = Option.isSome(preferred)
+      ? preferred
+      : routes.length > 1
+        ? yield* Ref.get(lastConnectedRouteId)
+        : Option.none();
+    if (Option.isNone(prioritized)) return latest;
     const route = routes.find(
-      (candidate) => connectionRouteId(candidate.target) === preferred.value,
+      (candidate) => connectionRouteId(candidate.target) === prioritized.value,
     );
     return route === undefined
       ? latest
@@ -1078,6 +1084,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     );
     const connectedAt = yield* Clock.currentTimeMillis;
     generation = nextGeneration;
+    yield* Ref.set(lastConnectedRouteId, Option.some(activeRouteId));
     yield* SubscriptionRef.set(prepared, Option.some(connectedLease.prepared));
     yield* SubscriptionRef.set(session, Option.some(connectedLease.session));
     if (options?.learnRoutes !== undefined) {
@@ -1166,9 +1173,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
   const waitForSignal = Queue.take(signals).pipe(
     Effect.repeat({ while: (next) => next._tag === "BetterRouteAvailable" }),
-    Effect.map(
-      (next) => next._tag === "Wakeup" && ConnectionWakeups.resetsRetryBackoff(next.reason),
-    ),
+    Effect.map((next) => ({
+      resetsBackoff: next._tag === "Wakeup" && ConnectionWakeups.resetsRetryBackoff(next.reason),
+      tryOffline: next._tag === "Wakeup" && next.reason === "application-active-long",
+    })),
   );
 
   const run = Effect.fnUntraced(function* () {
@@ -1210,9 +1218,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       if (currentIntent.network === "offline" && !ignoreOffline) {
         yield* clearLease;
         yield* setState(offlineState(currentIntent, generation, failureCount + 1, latestFailure));
-        const applicationActivated = yield* waitForSignal;
-        if (applicationActivated) {
+        const wakeup = yield* waitForSignal;
+        if (wakeup.resetsBackoff) {
           resetRetryLadder();
+        }
+        if (wakeup.tryOffline) {
+          replacing = true;
         }
         continue;
       }
@@ -1259,6 +1270,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       const error: ConnectionAttemptError = outcome.failure.error;
       if (!outcome.established) {
         latestFailure = error;
+        yield* Ref.set(lastConnectedRouteId, Option.none());
       }
       if (error._tag === "ConnectionBlockedError") {
         const blockedIntent = yield* Ref.get(intent);
@@ -1273,8 +1285,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           retryAt: null,
           refusedRouteIds: NO_REFUSED_ROUTES,
         });
-        const applicationActivated = yield* waitForSignal;
-        if (applicationActivated) {
+        const wakeup = yield* waitForSignal;
+        if (wakeup.resetsBackoff) {
           resetRetryLadder();
         }
         continue;
@@ -1364,9 +1376,12 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     }).pipe(
       Effect.flatMap((changed) =>
         changed
-          ? (network === "offline" ? Effect.void : forgetSilentRoutes).pipe(
-              Effect.andThen(signal({ _tag: "NetworkChanged", network })),
-            )
+          ? (network === "offline"
+              ? Effect.void
+              : forgetSilentRoutes.pipe(
+                  Effect.andThen(Ref.set(lastConnectedRouteId, Option.none())),
+                )
+            ).pipe(Effect.andThen(signal({ _tag: "NetworkChanged", network })))
           : Effect.void,
       ),
     );
@@ -1385,7 +1400,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         (reason === "network-changed" || reason === "application-active-long"
           ? forgetSilentRoutes
           : Effect.void
-        ).pipe(Effect.andThen(signal({ _tag: "Wakeup", reason }))),
+        ).pipe(
+          Effect.andThen(
+            reason === "network-changed"
+              ? Ref.set(lastConnectedRouteId, Option.none())
+              : Effect.void,
+          ),
+          Effect.andThen(signal({ _tag: "Wakeup", reason })),
+        ),
       ),
     ),
   );

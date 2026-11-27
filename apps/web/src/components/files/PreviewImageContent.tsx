@@ -1,10 +1,36 @@
 import { useGT } from "gt-react";
-import { useLayoutEffect, useRef, useState } from "react";
-import { MaximizeIcon, MinusIcon, PlusIcon, ScanIcon } from "lucide-react";
+import { type CSSProperties, useLayoutEffect, useRef, useState } from "react";
+import {
+  Grid2x2Icon,
+  MaximizeIcon,
+  MinusIcon,
+  MoonIcon,
+  PlusIcon,
+  ScanIcon,
+  SunIcon,
+} from "lucide-react";
 import { ExpandedImageDialog } from "~/components/chat/ExpandedImageDialog";
 import { observeResize } from "~/lib/observeResize";
 import { AttachmentImage } from "../media/AttachmentImage";
 import { FileSurfaceAction, FileSurfaceFailure } from "./fileSurfaceChrome";
+
+type ImageBackdrop = "checker" | "light" | "dark";
+
+const IMAGE_BACKDROP_STYLES: Record<ImageBackdrop, CSSProperties> = {
+  checker: {
+    backgroundColor: "#e5e7eb",
+    backgroundImage:
+      "linear-gradient(45deg, #cbd5e1 25%, transparent 25%), linear-gradient(-45deg, #cbd5e1 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #cbd5e1 75%), linear-gradient(-45deg, transparent 75%, #cbd5e1 75%)",
+    backgroundSize: "16px 16px",
+    backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0px",
+  },
+  light: {
+    backgroundColor: "#ffffff",
+  },
+  dark: {
+    backgroundColor: "#18181b",
+  },
+};
 
 export default function PreviewImageContent(props: {
   readonly src: string;
@@ -18,6 +44,7 @@ export default function PreviewImageContent(props: {
   const [natural, setNatural] = useState({ width: 0, height: 0 });
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [zoom, setZoom] = useState<number | null>(null);
+  const [backdrop, setBackdrop] = useState<ImageBackdrop>("checker");
   const ref = useRef<HTMLDivElement>(null);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Measure the image viewport before paint and observe resizes to keep fit-to-view scaling accurate.
   useLayoutEffect(() => {
@@ -83,6 +110,28 @@ export default function PreviewImageContent(props: {
           >
             <MaximizeIcon className="size-3.5" />
           </FileSurfaceAction>
+          <span aria-hidden className="mx-1 h-3.5 w-px bg-border/60" />
+          <FileSurfaceAction
+            label={gt("Checkerboard background")}
+            pressed={backdrop === "checker"}
+            onPress={() => setBackdrop("checker")}
+          >
+            <Grid2x2Icon className="size-3.5" />
+          </FileSurfaceAction>
+          <FileSurfaceAction
+            label={gt("Light background")}
+            pressed={backdrop === "light"}
+            onPress={() => setBackdrop("light")}
+          >
+            <SunIcon className="size-3.5" />
+          </FileSurfaceAction>
+          <FileSurfaceAction
+            label={gt("Dark background")}
+            pressed={backdrop === "dark"}
+            onPress={() => setBackdrop("dark")}
+          >
+            <MoonIcon className="size-3.5" />
+          </FileSurfaceAction>
         </div>
       </div>
       <div ref={ref} className="min-h-0 flex-1 overflow-auto">
@@ -95,8 +144,17 @@ export default function PreviewImageContent(props: {
         >
           <button
             type="button"
+            data-backdrop={backdrop}
             aria-label={gt("Zoom {name}", { name: props.name })}
             className="shrink-0 cursor-zoom-in"
+            style={
+              natural.width
+                ? {
+                    ...IMAGE_BACKDROP_STYLES[backdrop],
+                    boxShadow: "0 0 0 1px rgb(128 128 128 / 0.25)",
+                  }
+                : undefined
+            }
             onClick={() => setExpanded(true)}
           >
             <AttachmentImage

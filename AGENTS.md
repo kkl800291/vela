@@ -10,10 +10,22 @@ Vela is a customized, standalone product forked from MIT-licensed open-source fo
 2. **Performance without compromise**: Keep WebSocket payloads bounded, avoid GPU-pegging CSS animations, and keep large lists responsive.
 3. **Multi-provider parity**: When adding capabilities, keep provider adapters cleanly separated at the adapter boundary.
 4. **Config safety**: Never clobber unrelated user settings or comments when editing external CLI configs (`~/.codex/config.toml`, `~/.claude.json`, etc.). Always mask secrets in API responses and preserve `.vela.bak` backups.
+5. **Single-orchestrator multi-agent collaboration**: Keep one main thread as orchestrator and reviewer while parallel dev workers run in isolated worktrees. Never flood the user with ephemeral review threads.
+
+## Multi-agent collaboration
+
+Authoritative architecture and invariants live in [docs/internals/18_multi-agent-collaboration.md](./docs/internals/18_multi-agent-collaboration.md). Any work touching dispatch, multi-agent delegation, review queues, or worktree delivery must uphold these rules:
+
+1. **Orchestrator owns verdicts; separate context hygiene from thread noise**: One main thread plans, reviews, and delivers; parallel dev workers execute in isolated managed worktrees. Reuse existing threads for continuous multi-turn discussions and dev repairs; perform routine step-by-step review sequentially in the main thread (author ≠ reviewer). Reserve fresh-context read-only audits for an optional single pre-delivery batch cold audit (`base..delivery`) or an explicitly requested high-risk second opinion—folded into the collaboration card with findings returned to the orchestrator for final verdict.
+2. **Bind review and delivery to immutable snapshots**: Automated gates, orchestrator verdicts, serial integration, and final delivery must bind to frozen Git workspace snapshots (`refs/vela/collab/*` synthetic commits that never touch user branches or the real Git index). If integration alters the effective changes, re-run gates and re-review; never read live worktrees or live `HEAD` as the delivery source.
+3. **Queue collaboration wakes with durable recovery**: Deliver orchestrator inbox items strictly in persisted FIFO order (`mode: "queue"`, never `auto` or promoted to `steer`), with at most one active collaboration item per parent thread and verified dedicated `runId` binding. Commit state transitions, receipts, and outbox intents in SQLite before running external Git, thread, or filesystem side effects, and reconcile on startup.
+4. **Integrate in isolation; apply once on user confirmation**: Only approved immutable snapshots enter the hidden integration workspace, unlocking dependent DAG steps only after integration reconciles. Run batch cross-step verification before exposing one unified delivery diff for explicit user application (preserving the target workspace's real index and manual edits; never auto-commit or push).
+5. **Isolate failures along dependencies**: Conflicts, human decisions, repair limits, and incomplete review turns pause only the affected step and its downstream dependents while independent work and the review queue continue. Recovery and revert paths must reject stale evidence and preserve user edits.
+6. **Server owns collaboration state**: Chat-initiated and panel-initiated collaborations share one server-owned durable engine and one live collaboration card. Clients render bounded projections, evidence is read on demand by snapshot ID, and provider quirks stay at the adapter boundary.
 
 ## Architecture & where code lives
 
-- `apps/server` — Effect/Node WebSocket & HTTP server, event-sourced orchestration (`Orchestrator` → `EventSink` → `EffectWorker`), providers, checkpointing, and Unified MCP manager (`apps/server/src/mcp/UnifiedMcpManager.ts` & `unifiedMcpRoutes.ts`).
+- `apps/server` — Effect/Node WebSocket & HTTP server, event-sourced orchestration (`Orchestrator` → `EventSink` → `EffectWorker`), multi-agent collaboration & dispatch (`apps/server/src/dispatch`), providers, checkpointing, and Unified MCP manager (`apps/server/src/mcp/UnifiedMcpManager.ts` & `unifiedMcpRoutes.ts`).
 - `apps/web` — React + Vite UI, including `/settings/mcp` (`UnifiedMcpSettingsPanel.tsx`) and TanStack Router routes.
 - `apps/desktop` — Electron desktop wrapper (`Vela` / `Vela (Dev).app`) bundling the local server runner and native menus.
 - `packages/contracts` — Effect/Schema wire contracts shared across server, web, and desktop (note: workspace packages retain internal `@t3tools/*` / `t3` package identifiers to avoid unnecessary import churn).

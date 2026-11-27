@@ -1,4 +1,5 @@
 import { ChildThreadApprovals } from "./ChildThreadApprovals";
+import { MobileCollabCard } from "../collab/MobileCollabCard";
 import { errorDisplayMessage } from "@t3tools/client-runtime/errors";
 import { useOpenThreadInspector } from "./thread-inspector-navigation";
 import { useSidebarWorkspaceTabs } from "../layout/workspace/useSystemWorkspaceTabBar";
@@ -1745,6 +1746,15 @@ function ThreadDetailBody(
                       threadRef={props.selectedThreadDetailRef}
                       maxHeight={pendingUserInputMaxHeight}
                     />
+                    {props.draftMode ? null : (
+                      <MobileCollabCard
+                        environmentId={props.environmentId}
+                        threadId={props.selectedThread.id}
+                        projectRoot={props.threadCwd}
+                        threadWorking={Boolean(props.activeWorkStartedAt)}
+                        canOperate={props.canOperateThread}
+                      />
+                    )}
                     <ThreadGuestShareBar
                       threadRef={props.selectedThreadDetailRef}
                       canOperateThread={props.canOperateThread}

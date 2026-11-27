@@ -47,12 +47,36 @@ export function buildPairingUrl(host: string, code: string): string {
   }
 }
 
+function unwrapDeepLinkPairingUrl(raw: string): string | null {
+  try {
+    const url = new URL(raw);
+    if (url.protocol === "t3code:" || url.protocol === "vela:") {
+      const pairingUrl = url.searchParams.get(MOBILE_PAIRING_URL_PARAM)?.trim() ?? "";
+      if (pairingUrl.length > 0) {
+        return pairingUrl;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function isHttpPairingUrl(candidate: string): boolean {
+  try {
+    const url = new URL(candidate);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.host.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export function parsePairingUrl(url: string): { host: string; code: string } {
   const trimmed = url.trim();
   if (!trimmed) return { host: "", code: "" };
 
+  const target = unwrapDeepLinkPairingUrl(trimmed) ?? trimmed;
+
   try {
-    const parsed = new URL(trimmed);
+    const parsed = new URL(target);
     const hostedPairingRequest = readHostedPairingRequest(parsed);
     if (hostedPairingRequest) {
       return {
@@ -71,7 +95,7 @@ export function parsePairingUrl(url: string): { host: string; code: string } {
     parsed.pathname = "/";
     return { host: parsed.toString().replace(/\/$/, ""), code };
   } catch {
-    return { host: trimmed, code: "" };
+    return { host: target, code: "" };
   }
 }
 
@@ -81,15 +105,10 @@ export function extractPairingUrlFromQrPayload(payload: string): string {
     throw new PairingQrPayloadEmptyError({});
   }
 
-  try {
-    const url = new URL(trimmed);
-    if (url.protocol === "t3code:") {
-      const pairingUrl = url.searchParams.get(MOBILE_PAIRING_URL_PARAM)?.trim() ?? "";
-      if (pairingUrl.length > 0) {
-        return pairingUrl;
-      }
-    }
-  } catch {}
+  const candidate = unwrapDeepLinkPairingUrl(trimmed) ?? trimmed;
+  if (!isHttpPairingUrl(candidate)) {
+    throw new PairingQrPayloadEmptyError({});
+  }
 
-  return trimmed;
+  return candidate;
 }

@@ -1,5 +1,6 @@
 import { msg } from "gt-i18n";
 import { translatableDetail } from "../errors/translatable.ts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -63,6 +64,7 @@ const ROUTE_CHECK_TIMEOUT_MS = 2_500;
 // wait the full probe timeout for a LAN the device has already left. A route
 // that misses it connects over relay, then upgrades with a second reconnect.
 const ROUTE_CHECK_HEAD_START_MS = 500;
+const RECENT_HOST_CHECK_TTL_NANOS = 2_000_000_000n;
 
 export class ConnectionDriver extends Context.Service<
   ConnectionDriver,
@@ -92,68 +94,91 @@ export const connectOverRoutes = Effect.fn("ConnectionDriver.connectOverRoutes")
     routes.length === 1
       ? []
       : yield* Effect.forEach(routes, (route) => Effect.forkChild(checkRoute(route)));
-  const headStart = yield* Effect.forkChild(Effect.sleep(ROUTE_CHECK_HEAD_START_MS));
-  const attemptScope = yield* Scope.Scope;
-  let transient: ConnectionAttemptError | undefined;
-  let blocked: ConnectionAttemptError | undefined;
-  const refusedRouteIds: Array<string> = [];
-  // Each route gets its own scope so a half-open session closes before the next try.
-  const attempt = Effect.fnUntraced(function* (route: ConnectionRoute) {
-    const routeScope = yield* Scope.fork(attemptScope);
-    const result = yield* connectRoute(route).pipe(
-      Scope.provide(routeScope),
-      Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Scope.close(routeScope, exit))),
-      Effect.result,
+  return yield* Effect.gen(function* () {
+    const headStart = yield* Effect.forkChild(Effect.sleep(ROUTE_CHECK_HEAD_START_MS));
+    const attemptScope = yield* Scope.Scope;
+    let transient: ConnectionAttemptError | undefined;
+    let blocked: ConnectionAttemptError | undefined;
+    const refusedRouteIds: Array<string> = [];
+    // Each route gets its own scope so a half-open session closes before the next try.
+    const attempt = Effect.fnUntraced(function* (route: ConnectionRoute) {
+      const routeScope = yield* Scope.fork(attemptScope);
+      const result = yield* connectRoute(route).pipe(
+        Scope.provide(routeScope),
+        Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : Scope.close(routeScope, exit))),
+        Effect.result,
+      );
+      if (result._tag === "Failure") {
+        if (result.failure._tag === "ConnectionTransientError") transient ??= result.failure;
+        else blocked ??= result.failure;
+        if (isHostCredentialRefusal(result.failure))
+          refusedRouteIds.push(connectionRouteId(route.target));
+      }
+      return result;
+    });
+    const silent: Array<{ readonly route: ConnectionRoute; readonly index: number }> = [];
+    for (const [index, route] of routes.entries()) {
+      const check =
+        checks.length === 0
+          ? "unchecked"
+          : yield* Effect.raceFirst(
+              Fiber.join(checks[index]!),
+              Fiber.join(headStart).pipe(Effect.as<RouteCheck>("silent")),
+            );
+      if (check === "silent") {
+        silent.push({ route, index });
+        continue;
+      }
+      const result = yield* attempt(route);
+      if (result._tag === "Success") return { ...result.success, refusedRouteIds };
+      // An incompatible server is the same server on every route.
+      if (result.failure.reason === "unsupported") return yield* result.failure;
+    }
+    const pending = [...silent];
+    const stillSilent: Array<{ readonly route: ConnectionRoute; readonly index: number }> = [];
+    while (pending.length > 0) {
+      const settled = yield* Effect.raceAllFirst(
+        pending.map((item, position) =>
+          Fiber.join(checks[item.index]!).pipe(
+            Effect.map((check) => ({ position, item, check })),
+          ),
+        ),
+      );
+      pending.splice(settled.position, 1);
+      if (settled.check === "silent") {
+        stillSilent.push(settled.item);
+        continue;
+      }
+      const result = yield* attempt(settled.item.route);
+      if (result._tag === "Success") return { ...result.success, refusedRouteIds };
+      if (result.failure.reason === "unsupported") return yield* result.failure;
+    }
+    stillSilent.sort((a, b) => a.index - b.index);
+    for (const { route } of stillSilent) {
+      // A route still silent after its whole check can hold the attempt open far
+      // longer than the check did. Once another route failed in a way that
+      // retries, the retry reaches it sooner than waiting here would.
+      if (transient !== undefined) break;
+      const result = yield* attempt(route);
+      if (result._tag === "Success") return { ...result.success, refusedRouteIds };
+      if (result.failure.reason === "unsupported") return yield* result.failure;
+    }
+    return yield* (
+      transient ??
+      blocked ??
+      new ConnectionTransientError({
+        reason: "endpoint-unavailable",
+        ...translatableDetail(
+          msg("{host} did not answer on any saved route.", { host: entry.target.label }),
+        ),
+      })
     );
-    if (result._tag === "Failure") {
-      if (result.failure._tag === "ConnectionTransientError") transient ??= result.failure;
-      else blocked ??= result.failure;
-      if (isHostCredentialRefusal(result.failure))
-        refusedRouteIds.push(connectionRouteId(route.target));
-    }
-    return result;
-  });
-  const silent: Array<{ readonly route: ConnectionRoute; readonly index: number }> = [];
-  for (const [index, route] of routes.entries()) {
-    const check =
+  }).pipe(
+    Effect.ensuring(
       checks.length === 0
-        ? "unchecked"
-        : yield* Effect.raceFirst(
-            Fiber.join(checks[index]!),
-            Fiber.join(headStart).pipe(Effect.as<RouteCheck>("silent")),
-          );
-    if (check === "silent") {
-      silent.push({ route, index });
-      continue;
-    }
-    const result = yield* attempt(route);
-    if (result._tag === "Success") return { ...result.success, refusedRouteIds };
-    // An incompatible server is the same server on every route.
-    if (result.failure.reason === "unsupported") return yield* result.failure;
-  }
-  const late = yield* Effect.forEach(silent, ({ index }) => Fiber.join(checks[index]!), {
-    concurrency: "unbounded",
-  });
-  const answeredLate = silent.filter((_, position) => late[position] !== "silent");
-  const stillSilent = silent.filter((_, position) => late[position] === "silent");
-  for (const { route } of [...answeredLate, ...stillSilent]) {
-    // A route still silent after its whole check can hold the attempt open far
-    // longer than the check did. Once another route failed in a way that
-    // retries, the retry reaches it sooner than waiting here would.
-    if (transient !== undefined && stillSilent.some((entry) => entry.route === route)) break;
-    const result = yield* attempt(route);
-    if (result._tag === "Success") return { ...result.success, refusedRouteIds };
-    if (result.failure.reason === "unsupported") return yield* result.failure;
-  }
-  return yield* (
-    transient ??
-    blocked ??
-    new ConnectionTransientError({
-      reason: "endpoint-unavailable",
-      ...translatableDetail(
-        msg("{host} did not answer on any saved route.", { host: entry.target.label }),
-      ),
-    })
+        ? Effect.void
+        : Effect.forEach(checks, Fiber.interrupt, { concurrency: "unbounded", discard: true }),
+    ),
   );
 });
 
@@ -183,6 +208,11 @@ export const make = Effect.gen(function* () {
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
   const httpClient = yield* HttpClient.HttpClient;
 
+  const recentHostChecks = new Map<
+    string,
+    { readonly environmentId: string; readonly at: bigint }
+  >();
+
   // The descriptor is public, so this sends no credential to whatever
   // answers at a saved LAN address on a different network.
   const checkDescriptor = (httpBaseUrl: string, environmentId: string, keepsItsHost: boolean) =>
@@ -206,26 +236,64 @@ export const make = Effect.gen(function* () {
       Effect.provideService(HttpClient.HttpClient, httpClient),
     );
 
-  const checkRoute = (entry: ConnectionCatalogEntry, route: ConnectionRoute) => {
+  const checkRoute = (
+    entry: ConnectionCatalogEntry,
+    route: ConnectionRoute,
+    allowRecentHostCheck = true,
+  ) => {
     const httpBaseUrl = routeHttpBaseUrl(route);
     if (httpBaseUrl === null) return Effect.succeed<RouteCheck>("unchecked");
-    return checkDescriptor(httpBaseUrl, entry.target.environmentId, routeKeepsItsHost(route)).pipe(
+    const keepsItsHost = routeKeepsItsHost(route);
+    if (allowRecentHostCheck && keepsItsHost) {
+      const recent = recentHostChecks.get(httpBaseUrl);
+      if (recent !== undefined) {
+        recentHostChecks.delete(httpBaseUrl);
+        return Effect.gen(function* () {
+          if (
+            recent.environmentId === entry.target.environmentId &&
+            (yield* Clock.monotonicTimeNanos) - recent.at <= RECENT_HOST_CHECK_TTL_NANOS
+          ) {
+            return "answered" as const;
+          }
+          return yield* checkDescriptor(httpBaseUrl, entry.target.environmentId, keepsItsHost);
+        }).pipe(
+          Effect.withSpan("ConnectionDriver.checkRoute", {
+            attributes: { "connection.target.kind": route.target._tag },
+          }),
+        );
+      }
+    }
+    return checkDescriptor(httpBaseUrl, entry.target.environmentId, keepsItsHost).pipe(
       Effect.withSpan("ConnectionDriver.checkRoute", {
         attributes: { "connection.target.kind": route.target._tag },
       }),
     );
   };
 
-  const checkHost = (prepared: PreparedConnection) =>
-    checkDescriptor(
+  const checkHost = (prepared: PreparedConnection) => {
+    const keepsItsHost = prepared.httpBaseUrl.startsWith("https:");
+    return checkDescriptor(
       prepared.httpBaseUrl,
       prepared.environmentId,
-      prepared.httpBaseUrl.startsWith("https:"),
+      keepsItsHost,
     ).pipe(
+      Effect.tap((result) =>
+        Effect.gen(function* () {
+          if (result === "answered" && keepsItsHost) {
+            recentHostChecks.set(prepared.httpBaseUrl, {
+              environmentId: prepared.environmentId,
+              at: yield* Clock.monotonicTimeNanos,
+            });
+          } else {
+            recentHostChecks.delete(prepared.httpBaseUrl);
+          }
+        }),
+      ),
       Effect.withSpan("ConnectionDriver.checkHost", {
         attributes: { "connection.target.kind": prepared.target._tag },
       }),
     );
+  };
 
   const connect = Effect.fn("ConnectionDriver.connect")(function* (
     entry: ConnectionCatalogEntry,
@@ -274,7 +342,7 @@ export const make = Effect.gen(function* () {
     preflightRoute(
       sendsTokenInClear(connectionRoutes(entry), route)
         ? Effect.succeed("silent" as const)
-        : checkRoute(entry, route),
+        : checkRoute(entry, route, false),
       resolver.prepare(routeEntry(entry, route)),
     ).pipe(Effect.withSpan("ConnectionDriver.preflight"));
 

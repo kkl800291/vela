@@ -44,6 +44,7 @@ import {
   decodeProviderReplayNdjson,
   materializeReplayTranscriptWorkspace,
 } from "@t3tools/provider-testing/replayTranscript";
+import { buildCodexInitializeParams } from "../provider/CodexProvider.ts";
 import * as ProviderRegistryMock from "../provider/testUtils/providerRegistryMock.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -108,6 +109,12 @@ const readDelegatedTaskStatusTranscript = Effect.fn("readDelegatedTaskStatusTran
     const transcript = yield* decodeProviderReplayNdjson(
       text
         .replaceAll(queuedFollowupResult, followupResult)
+        // The captured session predates the Vela branding.
+        .replace(
+          /"clientInfo":\{"name":"T3 Code","title":"T3 Code","version":"[^"]+"\}/,
+          `"clientInfo":${JSON.stringify(buildCodexInitializeParams().clientInfo)}`,
+        )
+        .replaceAll("[T3 Code: the agent in T3 thread", "[Vela: the agent in T3 thread")
         .replace(
           /"name":"Replay fixture: delegated_task_status"/g,
           () => `"name":${JSON.stringify(threadNames.shift())}`,

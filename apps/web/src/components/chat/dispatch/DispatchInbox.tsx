@@ -17,6 +17,7 @@ import {
   KIND_META,
   resolveStepKind,
   stripMarkdownPreview,
+  summarizeStepVerification,
 } from "./dispatchModel";
 
 export function DispatchInbox({
@@ -24,16 +25,20 @@ export function DispatchInbox({
   runs,
   escalations,
   busyKey,
+  currentBranch,
   onFocusStep,
   onOpenDiff,
+  onOpenStepDiff,
   onRunAction,
 }: {
   readonly steps: ReadonlyArray<DispatchTaskCard>;
   readonly runs: Readonly<Record<string, DispatchStepRun>>;
   readonly escalations: ReadonlyArray<DispatchEscalationRecord>;
   readonly busyKey: string | null;
+  readonly currentBranch?: string | null | undefined;
   readonly onFocusStep: (stepId: string) => void;
   readonly onOpenDiff: () => void;
+  readonly onOpenStepDiff?: ((stepId: string) => void) | undefined;
   readonly onRunAction: (
     key: string,
     pathname: string,
@@ -168,7 +173,6 @@ export function DispatchInbox({
               disabled={busyKey !== null || !(customDecisions[esc.id] ?? "").trim()}
               onClick={() => {
                 const text = (customDecisions[esc.id] ?? "").trim();
-                setCustomDecisions((prev) => ({ ...prev, [esc.id]: "" }));
                 void onRunAction(
                   `esc:${esc.id}:custom`,
                   "/api/vela/dispatch/escalation/reply",
@@ -178,7 +182,11 @@ export function DispatchInbox({
                     resolvedBy: "human",
                   },
                   "已发送决定并恢复执行",
-                );
+                ).then((ok) => {
+                  if (ok) {
+                    setCustomDecisions((prev) => ({ ...prev, [esc.id]: "" }));
+                  }
+                });
               }}
             >
               发送
@@ -191,7 +199,6 @@ export function DispatchInbox({
         const run = runs[step.id];
         const kind = resolveStepKind(step);
         const isWorktree = run?.isolation === "worktree";
-        const changedCount = run?.diffSummary?.changedFiles.length ?? 0;
 
         if (kind === "research") {
           const reportSummary = run?.deliverable?.text
@@ -243,13 +250,11 @@ export function DispatchInbox({
           );
         }
 
-        const gateText = run?.hardGate
-          ? run.hardGate.results.length > 0
-            ? run.hardGate.ok
-              ? `检查命令全部通过（${run.hardGate.results.length} 项）`
-              : "部分检查未通过"
-            : "门禁校验已通过"
-          : null;
+        const verification = summarizeStepVerification(step, run, currentBranch);
+        const stepHeaderLabel =
+          verification.checksRunCount > 0 && run?.hardGate?.ok
+            ? `${step.id}「${step.title}」已通过检查与复查`
+            : `${step.id}「${step.title}」已完成执行，待确认验收`;
 
         return (
           <div
@@ -260,15 +265,24 @@ export function DispatchInbox({
               <span>等待确认验收</span>
               {isWorktree && <span className="font-mono">Worktree</span>}
             </div>
-            <div className="text-sm font-semibold text-foreground">
-              {step.id}「{step.title}」已通过检查与复查
+            <div className="text-sm font-semibold text-foreground">{stepHeaderLabel}</div>
+            {verification.summaryText && (
+              <p className="line-clamp-2 text-xs leading-relaxed text-foreground/85">
+                {verification.summaryText}
+              </p>
+            )}
+            <div className="space-y-1 text-xs leading-relaxed text-muted-foreground">
+              <div>
+                改动文件：
+                {verification.changedFiles.length > 0
+                  ? `${verification.changedFiles.length} 个（${verification.changedFiles.slice(0, 3).join(", ")}${verification.changedFiles.length > 3 ? " 等" : ""}）`
+                  : "0 个"}
+              </div>
+              <div>
+                实际检查：{verification.checkLabel} · {verification.reviewLabel}
+              </div>
+              <div>确认后：{verification.targetBranchLabel}</div>
             </div>
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              共改动 {changedCount} 个文件{gateText ? `，${gateText}` : ""}。
-              {isWorktree
-                ? "确认后将把 Worktree 改动合并回当前分支未提交列表并解锁依赖步骤。"
-                : "确认无误后将解锁下一步；如不满意可撤回本步改动。"}
-            </p>
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 size="sm"
@@ -286,9 +300,13 @@ export function DispatchInbox({
                 <CheckIcon className="size-3.5" />
                 {isWorktree ? "合并到当前分支并验收" : "确认验收"}
               </Button>
-              <Button size="sm" variant="outline" onClick={onOpenDiff}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => (onOpenStepDiff ? onOpenStepDiff(step.id) : onOpenDiff())}
+              >
                 <FileDiffIcon className="size-3.5" />
-                查看 Diff
+                查看本步改动
               </Button>
               <Button
                 size="sm"

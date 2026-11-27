@@ -59,6 +59,7 @@ const STANDARD_THEME_PREVIEW_COLORS: Record<
 export const STANDARD_THEME_CARDS: ReadonlyArray<ThemeCardDefinition> = [
   {
     id: "default",
+    // oxlint-disable-next-line t3code/no-untranslated-copy -- Brand name
     label: "Vela",
     previews: (["light", "dark"] as const).map((mode) => ({
       mode,
@@ -96,7 +97,7 @@ export function getThemeCardDefinition(theme: ThemeDefinition): ThemeCardDefinit
   };
 }
 
-function getThemePreviewStyle(
+export function getThemePreviewStyle(
   colors: ThemeCardPreviewColors,
   mode: ThemeAppearance,
 ): CSSProperties {
@@ -109,6 +110,8 @@ function getThemePreviewStyle(
     backgroundImage: [
       `radial-gradient(circle at ${accentPosition} in oklab, ${colors.accent} 0%, color-mix(in oklab, ${colors.accent} ${spec.accent.middleOpacity * 100}%, transparent) ${spec.accent.middleOffset * 100}%, transparent ${spec.accent.endOffset * 100}%)`,
       `radial-gradient(circle at ${actionPosition} in oklab, color-mix(in oklab, ${colors.messageAction} ${spec.action.startOpacity * 100}%, transparent) 0%, transparent ${spec.action.endOffset * 100}%)`,
+      `radial-gradient(circle at 74% 78% in oklab, color-mix(in oklab, ${colors.messageSurface} 88%, transparent) 0%, transparent 56%)`,
+      `linear-gradient(108deg, ${colors.sidebar} 0%, color-mix(in oklab, ${colors.sidebar} 82%, transparent) 36%, transparent 56%)`,
     ].join(", "),
   };
 }
@@ -189,24 +192,27 @@ export function ThemePreviewCircles({
                 >
                   <ThemePreviewCircle colors={preview.colors} mode={mode} />
                   {isPicked ? (
-                    <>
-                      <span
-                        aria-hidden
-                        className="pointer-events-none absolute inset-0 rounded-full"
-                        style={{ boxShadow: "inset 0 0 0 2px var(--ring)" }}
-                      />
-                      <span
-                        aria-hidden
-                        className="pointer-events-none absolute bottom-0.5 right-0.5 flex size-5 items-center justify-center rounded-full border border-border/70 bg-background text-foreground shadow-sm"
-                      >
-                        {mode === "light" ? (
-                          <SunIcon className="size-3" />
-                        ) : (
-                          <MoonIcon className="size-3" />
-                        )}
-                      </span>
-                    </>
+                    <span
+                      aria-hidden
+                      className="pointer-events-none absolute inset-0 rounded-full"
+                      style={{ boxShadow: "inset 0 0 0 2px var(--ring)" }}
+                    />
                   ) : null}
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "pointer-events-none absolute bottom-0.5 right-0.5 flex size-5 items-center justify-center rounded-full border shadow-sm",
+                      isPicked
+                        ? "border-foreground/25 bg-background text-foreground"
+                        : "border-border/60 bg-background/90 text-muted-foreground",
+                    )}
+                  >
+                    {mode === "light" ? (
+                      <SunIcon className="size-3" />
+                    ) : (
+                      <MoonIcon className="size-3" />
+                    )}
+                  </span>
                 </button>
               }
             />

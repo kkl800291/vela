@@ -208,6 +208,49 @@ it.layer(NodeServices.layer)("WorkspaceFolders", (it) => {
     }),
   );
 
+  it.effect(
+    "reads ignoreRepositories from vela.json and falls back to t3.json only when it is absent",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspaceRoot = yield* makeTempDir;
+        for (const folder of ["api/.git", "vendor/big/.git", "legacy/.git"]) {
+          yield* fileSystem.makeDirectory(path.join(workspaceRoot, folder), { recursive: true });
+        }
+        const names = () =>
+          WorkspaceFolders.discoverFolders(workspaceRoot).pipe(
+            Effect.map((folders) => folders.map((folder) => folder.name).toSorted()),
+          );
+
+        yield* fileSystem.writeFileString(
+          path.join(workspaceRoot, "t3.json"),
+          JSON.stringify({ ignoreRepositories: ["legacy"] }),
+        );
+        assert.deepEqual(yield* names(), ["api", "big"]);
+
+        yield* fileSystem.writeFileString(
+          path.join(workspaceRoot, "vela.json"),
+          JSON.stringify({ ignoreRepositories: ["vendor/big"] }),
+        );
+        assert.deepEqual(yield* names(), ["api", "legacy"]);
+
+        yield* fileSystem.writeFileString(path.join(workspaceRoot, "vela.json"), "{}");
+        assert.deepEqual(yield* names(), ["api", "big", "legacy"]);
+
+        yield* fileSystem.writeFileString(path.join(workspaceRoot, "vela.json"), "{ not json");
+        assert.deepEqual(yield* names(), ["api", "big", "legacy"]);
+
+        yield* fileSystem.remove(path.join(workspaceRoot, "vela.json"));
+        yield* fileSystem.remove(path.join(workspaceRoot, "t3.json"));
+        yield* fileSystem.writeFileString(
+          path.join(workspaceRoot, "vela.json"),
+          JSON.stringify({ ignoreRepositories: ["api"] }),
+        );
+        assert.deepEqual(yield* names(), ["big", "legacy"]);
+      }),
+  );
+
   it.effect("does not walk a project's folders when t3.json ignores the whole project", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

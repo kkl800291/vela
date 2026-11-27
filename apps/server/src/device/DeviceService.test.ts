@@ -179,6 +179,10 @@ const fixture = Effect.fn("fixture")(function* (
   } = {},
 ) {
   const settings = yield* Ref.make(DEFAULT_SERVER_SETTINGS);
+  const platformsAvailable = yield* Ref.make(true);
+  const holdNextSettingsUpdate = yield* Ref.make(false);
+  const settingsUpdateEntered = yield* Deferred.make<void>();
+  const releaseSettingsUpdate = yield* Deferred.make<void>();
   const starts: string[] = [];
   const agentStarts: string[] = [];
   const agentStops: string[] = [];
@@ -338,17 +342,19 @@ const fixture = Effect.fn("fixture")(function* (
       : {}),
     id: LOCAL_DEVICE_HOST_ID,
     label: "This machine",
-    summary: Effect.sync(() => ({
-      id: LOCAL_DEVICE_HOST_ID,
-      kind: connection.kind,
-      label: "Test server",
-      platforms: [
-        { platform: "android", available: true },
-        { platform: "ios", available: true },
-      ],
-      hubInstalled: true,
-      agentDeviceInstalled: false,
-    })),
+    summary: Ref.get(platformsAvailable).pipe(
+      Effect.map((available) => ({
+        id: LOCAL_DEVICE_HOST_ID,
+        kind: connection.kind,
+        label: "Test server",
+        platforms: [
+          { platform: "android" as const, available },
+          { platform: "ios" as const, available },
+        ],
+        hubInstalled: true,
+        agentDeviceInstalled: false,
+      })),
+    ),
     platformAvailability: (platform) =>
       (options.onPlatformAvailability ?? Effect.void).pipe(
         Effect.as({ platform, available: true }),
@@ -410,14 +416,20 @@ const fixture = Effect.fn("fixture")(function* (
         ready: Effect.void,
         getSettings: Ref.get(settings),
         updateSettings: (patch) =>
-          Ref.updateAndGet(settings, (current) => ({
-            ...current,
-            enableDeviceSupport: patch.enableDeviceSupport ?? current.enableDeviceSupport,
-            enableAgentDeviceAccess:
-              patch.enableAgentDeviceAccess ?? current.enableAgentDeviceAccess,
-            deviceOnboardingCompleted:
-              patch.deviceOnboardingCompleted ?? current.deviceOnboardingCompleted,
-          })),
+          Effect.gen(function* () {
+            if (yield* Ref.getAndSet(holdNextSettingsUpdate, false)) {
+              yield* Deferred.succeed(settingsUpdateEntered, undefined);
+              yield* Deferred.await(releaseSettingsUpdate);
+            }
+            return yield* Ref.updateAndGet(settings, (current) => ({
+              ...current,
+              enableDeviceSupport: patch.enableDeviceSupport ?? current.enableDeviceSupport,
+              enableAgentDeviceAccess:
+                patch.enableAgentDeviceAccess ?? current.enableAgentDeviceAccess,
+              deviceOnboardingCompleted:
+                patch.deviceOnboardingCompleted ?? current.deviceOnboardingCompleted,
+            }));
+          }),
         streamChanges: Stream.empty,
         subscribeChanges: Effect.succeed(Stream.empty),
       }),
@@ -435,6 +447,10 @@ const fixture = Effect.fn("fixture")(function* (
     agentStops,
     requests,
     settings,
+    platformsAvailable,
+    holdNextSettingsUpdate,
+    settingsUpdateEntered,
+    releaseSettingsUpdate,
     closedSessions,
     connection,
     devices,
@@ -525,14 +541,14 @@ describe("device setup consent", () => {
       exitCode: 1,
       stderr: "private diagnostics",
       expected:
-        "Connected over SSH, but this host runs Windows, and SSH device hosts currently need macOS or Linux. To use this machine's devices, run T3 Code on it and connect to that environment.",
+        "Connected over SSH, but this host runs Windows, and SSH device hosts currently need macOS or Linux. To use this machine's devices, run Vela on it and connect to that environment.",
     },
     {
       name: "a Windows host returning 9009",
       exitCode: 9009,
       stderr: "private diagnostics",
       expected:
-        "Connected over SSH, but this host runs Windows, and SSH device hosts currently need macOS or Linux. To use this machine's devices, run T3 Code on it and connect to that environment.",
+        "Connected over SSH, but this host runs Windows, and SSH device hosts currently need macOS or Linux. To use this machine's devices, run Vela on it and connect to that environment.",
     },
     {
       name: "missing Node on a Windows host with a POSIX shell",
@@ -746,6 +762,259 @@ describe("device setup consent", () => {
       expect((yield* Ref.get(settings)).deviceOnboardingCompleted).toBe(true);
     }),
   );
+
+  it.effect.each([
+    {
+      name: "a disable request holds the lifecycle lock",
+      first: { enabled: false },
+      second: { onboardingCompleted: true },
+      // The onboarding update observes the persisted disable and stops again.
+      stops: 2,
+    },
+    {
+      name: "an onboarding update holds the lifecycle lock",
+      first: { onboardingCompleted: true },
+      second: { enabled: false },
+      // Onboarding leaves device support enabled, so only the later disable stops hosts.
+      stops: 1,
+    },
+  ])(
+    "overlapping configure agrees when $name",
+    ({ first, second, stops }) =>
+      Effect.gen(function* () {
+        const {
+          service,
+          settings,
+          starts,
+          platformsAvailable,
+          holdNextSettingsUpdate,
+          settingsUpdateEntered,
+          releaseSettingsUpdate,
+        } = yield* fixture();
+        yield* service.configure({ enabled: true });
+        yield* service.open({
+          threadId: ThreadId.make("thread-stale-configure"),
+          deviceId: "Pixel_API_35",
+          platform: "android",
+        });
+        expect((yield* service.state).devices.length).toBeGreaterThan(0);
+        expect((yield* service.state).sessions).toHaveLength(1);
+        // Keep the trailing list() from rediscovering devices over the publish under test.
+        yield* Ref.set(platformsAvailable, false);
+        const stopsBefore = starts.filter((entry) => entry === "stop").length;
+
+        yield* Ref.set(holdNextSettingsUpdate, true);
+        const firstFiber = yield* service.configure(first).pipe(Effect.forkChild);
+        yield* Deferred.await(settingsUpdateEntered);
+        const secondReachedLock = yield* Deferred.make<void>();
+        const secondFiber = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(secondReachedLock, undefined);
+          yield* Effect.yieldNow;
+          return yield* service.configure(second);
+        }).pipe(Effect.forkChild);
+        yield* Deferred.await(secondReachedLock);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseSettingsUpdate, undefined);
+
+        yield* Fiber.join(firstFiber);
+        const secondResult = yield* Fiber.join(secondFiber);
+        const persisted = yield* Ref.get(settings);
+        const listed = yield* service.list;
+        const state = yield* service.state;
+
+        expect(persisted.enableDeviceSupport).toBe(false);
+        expect(persisted.deviceOnboardingCompleted).toBe(true);
+        expect(persisted.enableAgentDeviceAccess).toBe(false);
+        expect(listed).toMatchObject({
+          hostStatus: "disabled",
+          devices: [],
+          sessions: [],
+          bootingDevices: [],
+          onboardingCompleted: true,
+          agentAccessEnabled: false,
+        });
+        expect(state).toMatchObject({
+          hostStatus: "disabled",
+          devices: [],
+          sessions: [],
+          bootingDevices: [],
+          onboardingCompleted: true,
+          agentAccessEnabled: false,
+        });
+        expect(secondResult).toMatchObject({
+          hostStatus: "disabled",
+          devices: [],
+          sessions: [],
+          bootingDevices: [],
+          onboardingCompleted: true,
+          agentAccessEnabled: false,
+        });
+        expect(starts.filter((entry) => entry === "stop").length - stopsBefore).toBe(stops);
+      }),
+  );
+
+  it.effect(
+    "stale enable list failure does not overwrite disabled state and interrupted stop still publishes disabled",
+    () =>
+      Effect.gen(function* () {
+        const summaryEntered = yield* Deferred.make<void>();
+        const releaseSummary = yield* Deferred.make<void>();
+        const stopEntered = yield* Deferred.make<void>();
+        const releaseStop = yield* Deferred.make<void>();
+        const pauseSummary = yield* Ref.make(false);
+        const pauseStop = yield* Ref.make(false);
+        const host: DeviceHost.DeviceHost["Service"] = {
+          id: LOCAL_DEVICE_HOST_ID,
+          label: "Local",
+          summary: Effect.gen(function* () {
+            if (yield* Ref.get(pauseSummary)) {
+              yield* Deferred.succeed(summaryEntered, undefined);
+              yield* Deferred.await(releaseSummary);
+            }
+            return {
+              id: LOCAL_DEVICE_HOST_ID,
+              kind: "local" as const,
+              label: "Local",
+              platforms: [{ platform: "ios" as const, available: true }],
+              hubInstalled: true,
+              agentDeviceInstalled: false,
+            };
+          }),
+          platformAvailability: (platform) => Effect.succeed({ platform, available: true }),
+          ensureReady: () =>
+            Effect.fail(
+              new DeviceHost.DeviceHostError({
+                hostId: LOCAL_DEVICE_HOST_ID,
+                step: "probe",
+                cause: new Error("transient host failure"),
+              }),
+            ),
+          ensureAgentReady: () =>
+            Effect.fail(
+              new DeviceHost.DeviceHostError({
+                hostId: LOCAL_DEVICE_HOST_ID,
+                step: "probe",
+                cause: new Error("transient host failure"),
+              }),
+            ),
+          current: Effect.succeed(null),
+          stopAgent: Effect.void,
+          stop: Effect.gen(function* () {
+            if (yield* Ref.get(pauseStop)) {
+              yield* Deferred.succeed(stopEntered, undefined);
+              yield* Deferred.await(releaseStop);
+            }
+          }),
+        };
+        const service = yield* DeviceService.makeWithHosts(new Map([[host.id, host]])).pipe(
+          Effect.provide(NodeCrypto.layer),
+        );
+
+        // Case 1: An older enable's trailing list() pauses at host.summary while disable completes,
+        // then resumes and fails during ensureReady. It must not overwrite "disabled" with "failed".
+        yield* Ref.set(pauseSummary, true);
+        const enableFiber = yield* service.configure({ enabled: true }).pipe(Effect.forkChild);
+        yield* Deferred.await(summaryEntered);
+        const disabledState = yield* service.configure({ enabled: false });
+        expect(disabledState.hostStatus).toBe("disabled");
+        yield* Deferred.succeed(releaseSummary, undefined);
+        yield* Fiber.join(enableFiber);
+        expect((yield* service.state).hostStatus).toBe("disabled");
+        expect((yield* service.list).hostStatus).toBe("disabled");
+
+        // Case 2: Interrupting configure({ enabled: false }) while host.stop is running must still
+        // publish "disabled" so persisted settings and stateRef agree.
+        yield* Ref.set(pauseSummary, false);
+        yield* service.configure({ enabled: true });
+        yield* Ref.set(pauseStop, true);
+        const disableFiber = yield* service.configure({ enabled: false }).pipe(Effect.forkChild);
+        yield* Deferred.await(stopEntered);
+        yield* Fiber.interrupt(disableFiber);
+        expect((yield* service.state).hostStatus).toBe("disabled");
+        expect((yield* service.list).hostStatus).toBe("disabled");
+
+        // Case 3: A pending retryHost() on a host that gets replaced while listing must not mark
+        // the replacement host as "failed".
+        yield* Ref.set(pauseStop, false);
+        yield* service.configure({ enabled: true });
+        const retryEntered = yield* Deferred.make<void>();
+        const releaseRetry = yield* Deferred.make<void>();
+        const pauseRetry = yield* Ref.make(false);
+        const noopRun = () => Effect.succeed({ code: 0, stdout: "", stderr: "" });
+        const noopHttp = HttpClient.make((request) =>
+          Effect.sync(() =>
+            HttpClientResponse.fromWeb(request, Response.json({ emulators: [], simulators: [] })),
+          ),
+        );
+        const oldReady: DeviceHost.DeviceHostReady = {
+          nodePath: process.execPath,
+          hub: { origin: "http://old-remote.test" },
+          devices: {
+            ...makeDeviceHubOperations({
+              hostId: "remote-a",
+              origin: "http://old-remote.test",
+              http: noopHttp,
+              run: noopRun,
+              platformAvailable: () => Effect.succeed(true),
+            }),
+            list: Effect.gen(function* () {
+              if (yield* Ref.get(pauseRetry)) {
+                yield* Deferred.succeed(retryEntered, undefined);
+                yield* Deferred.await(releaseRetry);
+                return yield* new DeviceOperationError({
+                  operation: "list",
+                  reason: "request_failed",
+                  cause: new Error("old host failed"),
+                });
+              }
+              return { devices: [], detail: undefined };
+            }),
+          },
+          helpers: { serveSimAxSettings: null, serveSimCli: null },
+          run: noopRun,
+        };
+        const oldHost: DeviceHost.DeviceHost["Service"] = {
+          ...host,
+          id: "remote-a",
+          label: "Remote A (old)",
+          summary: Effect.succeed({
+            id: "remote-a",
+            kind: "ssh" as const,
+            label: "Remote A (old)",
+            platforms: [{ platform: "ios" as const, available: true }],
+            hubInstalled: true,
+            agentDeviceInstalled: false,
+          }),
+          ensureReady: () => Effect.succeed(oldReady),
+        };
+        const newHost: DeviceHost.DeviceHost["Service"] = {
+          ...oldHost,
+          label: "Remote A (new)",
+          summary: Effect.succeed({
+            id: "remote-a",
+            kind: "ssh" as const,
+            label: "Remote A (new)",
+            platforms: [{ platform: "ios" as const, available: true }],
+            hubInstalled: true,
+            agentDeviceInstalled: false,
+          }),
+        };
+        const hostMap = new Map<string, DeviceHost.DeviceHost["Service"]>([
+          [oldHost.id, oldHost],
+        ]);
+        const replaceService = yield* DeviceService.makeWithHosts(hostMap).pipe(
+          Effect.provide(NodeCrypto.layer),
+        );
+        yield* replaceService.configure({ enabled: true });
+        yield* Ref.set(pauseRetry, true);
+        const retryFiber = yield* replaceService.retryHost("remote-a").pipe(Effect.forkChild);
+        yield* Deferred.await(retryEntered);
+        hostMap.set("remote-a", newHost);
+        yield* Deferred.succeed(releaseRetry, undefined);
+        yield* Fiber.join(retryFiber);
+        expect((yield* replaceService.state).hostStatuses["remote-a"]?.status).not.toBe("failed");
+      }).pipe(Effect.provide(ServerSettings.layerTest({ enableDeviceSupport: false }))),
+  );
 });
 
 const layerSecretResolver = Layer.succeed(SecretResolver.SecretResolver, {
@@ -774,7 +1043,7 @@ it.effect.each([
     exitCode: 255,
     stderr: "Host key verification failed.\r\n",
     reason:
-      "SSH encountered an untrusted host key while connecting to probe.test from the machine running this T3 Code server. Connect once with ssh from there to identify the host and verify its key before accepting it.",
+      "SSH encountered an untrusted host key while connecting to probe.test from the machine running this Vela server. Connect once with ssh from there to identify the host and verify its key before accepting it.",
   },
   {
     name: "unrecognized SSH failure",
@@ -2024,7 +2293,7 @@ it.effect.each(["exit", "missing"] as const)(
       expect(error.message).toBe(
         failure === "exit"
           ? "Device update device tool failed: The device command failed (exit code 243)."
-          : "Device update device tool failed: Device support needs npm, which is not on the T3 server's PATH. Install npm (it comes with Node.js from nodejs.org), restart T3 Code, then retry.",
+          : "Device update device tool failed: Device support needs npm, which is not on the T3 server's PATH. Install npm (it comes with Node.js from nodejs.org), restart Vela, then retry.",
       );
     }).pipe(
       Effect.provide(

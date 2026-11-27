@@ -633,12 +633,17 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
           const ready = yield* readinessIfSupported(host.id);
           if (ready) yield* refresh(ready);
         }).pipe(
-          Effect.catch((error) =>
-            setHostStatus(host.id, {
-              status: "failed",
-              detail: error._tag === "DeviceHostUnavailableError" ? error.reason : error.message,
+        Effect.catch((error) =>
+          lifecycleLock.withPermit(
+            Effect.gen(function* () {
+              if (!(yield* readDeviceSettings).enabled || hosts.get(host.id) !== host) return;
+              yield* setHostStatus(host.id, {
+                status: "failed",
+                detail: error._tag === "DeviceHostUnavailableError" ? error.reason : error.message,
+              });
             }),
           ),
+        ),
         ),
       { concurrency: 4 },
     );
@@ -679,7 +684,7 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
 
   const retryHost: DeviceService["Service"]["retryHost"] = Effect.fn("DeviceService.retryHost")(
     function* (hostId) {
-      yield* resolveHost(hostId);
+      const host = yield* resolveHost(hostId);
       if (!(yield* readDeviceSettings).enabled) return (yield* SynchronizedRef.get(stateRef)).state;
       yield* Effect.gen(function* () {
         const ready =
@@ -687,10 +692,15 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
         if (ready) yield* refresh(ready);
       }).pipe(
         Effect.catch((error) =>
-          setHostStatus(hostId, {
-            status: "failed",
-            detail: error._tag === "DeviceHostUnavailableError" ? error.reason : error.message,
-          }),
+          lifecycleLock.withPermit(
+            Effect.gen(function* () {
+              if (!(yield* readDeviceSettings).enabled || hosts.get(hostId) !== host) return;
+              yield* setHostStatus(hostId, {
+                status: "failed",
+                detail: error._tag === "DeviceHostUnavailableError" ? error.reason : error.message,
+              });
+            }),
+          ),
         ),
       );
       return (yield* SynchronizedRef.get(stateRef)).state;
@@ -699,50 +709,60 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
 
   const configure: DeviceService["Service"]["configure"] = Effect.fn("DeviceService.configure")(
     function* (input) {
-      const currentSettings = yield* readDeviceSettings;
-      const nextEnabled = input.enabled ?? currentSettings.enabled;
-      const nextAgentAccess = input.agentAccessEnabled ?? currentSettings.agentAccessEnabled;
-      yield* lifecycleLock.withPermit(
-        Effect.gen(function* () {
-          yield* settings
-            .updateSettings({
-              ...(input.enabled === undefined ? {} : { enableDeviceSupport: input.enabled }),
-              ...(input.agentAccessEnabled === undefined
-                ? {}
-                : { enableAgentDeviceAccess: input.agentAccessEnabled }),
-              ...(input.onboardingCompleted === undefined
-                ? {}
-                : { deviceOnboardingCompleted: input.onboardingCompleted }),
-            })
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new DeviceOperationError({
-                    operation: "configure",
-                    reason: "settings_failed",
-                    cause,
-                  }),
-              ),
-            );
-          if (!nextEnabled) {
-            yield* Effect.forEach(hosts.values(), (host) => host.stop, { discard: true });
-          } else if (input.agentAccessEnabled === false) {
-            yield* Effect.forEach(hosts.values(), (host) => host.stopAgent, { discard: true });
-          }
-          yield* publish((state) => ({
-            ...state,
-            hostStatus: nextEnabled ? "idle" : "disabled",
-            hostStatusDetail: undefined,
-            hostStatuses: {},
-            devices: nextEnabled ? state.devices : [],
-            sessions: nextEnabled ? state.sessions : [],
-            bootingDevices: nextEnabled ? state.bootingDevices : [],
-            agentAccessEnabled: nextAgentAccess,
-            onboardingCompleted: input.onboardingCompleted ?? state.onboardingCompleted,
-          }));
-        }),
+      // Read the flags from the settings this call just persisted. A partial
+      // update waiting on the lock must not reuse values read before it.
+      // Keep updateSettings uninterruptible so a cancellation cannot split persisted
+      // settings from the published state.
+      const next = yield* lifecycleLock.withPermit(
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const updated = yield* settings
+              .updateSettings({
+                ...(input.enabled === undefined ? {} : { enableDeviceSupport: input.enabled }),
+                ...(input.agentAccessEnabled === undefined
+                  ? {}
+                  : { enableAgentDeviceAccess: input.agentAccessEnabled }),
+                ...(input.onboardingCompleted === undefined
+                  ? {}
+                  : { deviceOnboardingCompleted: input.onboardingCompleted }),
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new DeviceOperationError({
+                      operation: "configure",
+                      reason: "settings_failed",
+                      cause,
+                    }),
+                ),
+              );
+            const nextEnabled = updated.enableDeviceSupport;
+            const nextAgentAccess = updated.enableAgentDeviceAccess;
+            const nextOnboardingCompleted = updated.deviceOnboardingCompleted;
+            const publishUpdatedState = publish((state) => ({
+              ...state,
+              hostStatus: nextEnabled ? "idle" : "disabled",
+              hostStatusDetail: undefined,
+              hostStatuses: {},
+              devices: nextEnabled ? state.devices : [],
+              sessions: nextEnabled ? state.sessions : [],
+              bootingDevices: nextEnabled ? state.bootingDevices : [],
+              agentAccessEnabled: nextAgentAccess,
+              onboardingCompleted: nextOnboardingCompleted,
+            }));
+            // Once settings are persisted, always publish matching state even if host.stop is interrupted.
+            yield* restore(
+              !nextEnabled
+                ? Effect.forEach(hosts.values(), (host) => host.stop, { discard: true })
+                : input.agentAccessEnabled === false && !nextAgentAccess
+                  ? Effect.forEach(hosts.values(), (host) => host.stopAgent, { discard: true })
+                  : Effect.void,
+            ).pipe(Effect.ensuring(publishUpdatedState));
+            return { nextEnabled, nextAgentAccess };
+          }),
+        ),
       );
-      if (nextEnabled && nextAgentAccess && input.agentAccessEnabled === true) {
+      if (next.nextEnabled && next.nextAgentAccess && input.agentAccessEnabled === true) {
         yield* agentReadinessIfSupported();
       }
       return yield* list;

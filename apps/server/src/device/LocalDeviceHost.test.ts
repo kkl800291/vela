@@ -983,3 +983,58 @@ it.effect(
       expect(yield* fs.exists(`${baseDir}/tools`)).toBe(false);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+it.effect(
+  "prefers a complete Android SDK over an earlier adb-only SDK directory",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-device-sdk-order-" });
+      const adbOnlySdk = `${baseDir}/sdk-adb-only`;
+      const completeSdk = `${baseDir}/sdk-complete`;
+
+      yield* fs.makeDirectory(`${adbOnlySdk}/platform-tools`, { recursive: true });
+      yield* fs.writeFileString(`${adbOnlySdk}/platform-tools/adb`, "#!/bin/sh\n");
+
+      yield* fs.makeDirectory(`${completeSdk}/platform-tools`, { recursive: true });
+      yield* fs.makeDirectory(`${completeSdk}/emulator`, { recursive: true });
+      yield* fs.makeDirectory(`${completeSdk}/cmdline-tools/latest/bin`, { recursive: true });
+      yield* fs.writeFileString(`${completeSdk}/platform-tools/adb`, "#!/bin/sh\n");
+      yield* fs.writeFileString(`${completeSdk}/emulator/emulator`, "#!/bin/sh\n");
+      yield* fs.writeFileString(`${completeSdk}/cmdline-tools/latest/bin/avdmanager`, "#!/bin/sh\n");
+
+      const host = yield* LocalDeviceHost.make().pipe(
+        Effect.provide(Layer.mergeAll(ServerConfig.layerTest(baseDir, baseDir), NetService.layer)),
+        Effect.provideService(HostProcess.Environment, {
+          HOME: baseDir,
+          ANDROID_HOME: adbOnlySdk,
+          ANDROID_SDK_ROOT: completeSdk,
+          PATH: "",
+        }),
+        Effect.provideService(HostProcess.Platform, "darwin"),
+        Effect.provideService(HostProcess.IsExecutable, false),
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die(new Error("Should not spawn"))),
+        ),
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: () => Effect.succeed(processOutput(0)),
+        }),
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make(() => Effect.die(new Error("Should not call network"))),
+        ),
+      );
+
+      const availability = yield* host.platformAvailability("android").pipe(
+        Effect.provideService(HostProcess.Environment, {
+          HOME: baseDir,
+          ANDROID_HOME: adbOnlySdk,
+          ANDROID_SDK_ROOT: completeSdk,
+          PATH: "",
+        }),
+        Effect.provideService(HostProcess.Platform, "darwin"),
+      );
+      expect(availability).toEqual({ platform: "android", available: true });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

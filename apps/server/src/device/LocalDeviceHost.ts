@@ -181,10 +181,41 @@ const androidSdk = Effect.gen(function* () {
     path.join(home, "Android", "Sdk"),
     path.join(environment.LOCALAPPDATA ?? path.join(home, "AppData", "Local"), "Android", "Sdk"),
   ];
+  type InspectedSdk = {
+    readonly root: string;
+    readonly adb: boolean;
+    readonly emulator: boolean;
+    readonly avdmanager: boolean;
+    readonly legacyAvdmanager: boolean;
+  };
+  const scoreSdk = (sdk: InspectedSdk): number =>
+    (sdk.adb ? 1 : 0) +
+    (sdk.emulator ? 2 : 0) +
+    (sdk.avdmanager ? 2 : 0) +
+    (sdk.legacyAvdmanager ? 1 : 0);
+
+  const inspectedRoots = new Set<string>();
+  let bestSdk: InspectedSdk | null = null;
+  let bestScore = 0;
+
+  const considerRoot = Effect.fnUntraced(function* (root: string) {
+    const trimmed = root.trim();
+    if (!trimmed || inspectedRoots.has(trimmed)) return false;
+    inspectedRoots.add(trimmed);
+    const sdk = yield* inspect(trimmed);
+    if (!sdk.adb && !sdk.emulator) return false;
+    const score = scoreSdk(sdk);
+    if (bestSdk === null || score > bestScore) {
+      bestSdk = sdk;
+      bestScore = score;
+    }
+    return sdk.adb && sdk.emulator && sdk.avdmanager;
+  });
+
   for (const root of candidates) {
-    const sdk = yield* inspect(root);
-    if (sdk.adb || sdk.emulator) return sdk;
+    if (yield* considerRoot(root)) return bestSdk!;
   }
+  if (bestSdk !== null) return bestSdk;
   // PATH entries can be slow to stat (network shares), so only consult them after the standard locations miss.
   const searchPath = environment.PATH ?? environment.Path ?? "";
   for (const directory of searchPath.split(windows ? ";" : ":")) {
@@ -192,9 +223,9 @@ const androidSdk = Effect.gen(function* () {
     const adb = path.join(directory, adbBinary);
     if (!(yield* exists(adb))) continue;
     const resolved = yield* fs.realPath(adb).pipe(Effect.orElseSucceed(() => adb));
-    const sdk = yield* inspect(path.dirname(path.dirname(resolved)));
-    if (sdk.adb || sdk.emulator) return sdk;
+    if (yield* considerRoot(path.dirname(path.dirname(resolved)))) return bestSdk!;
   }
+  if (bestSdk !== null) return bestSdk;
   // No real SDK anywhere: report what the configured root is missing.
   if (explicit[0]) return yield* inspect(explicit[0]);
   return { root: null, adb: false, emulator: false, avdmanager: false, legacyAvdmanager: false };

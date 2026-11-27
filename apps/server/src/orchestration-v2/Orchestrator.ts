@@ -12165,6 +12165,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
 
+    if (queuedMessage.createdBy === "system" && queuedMessage.creationSource === "server") {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "System collaboration messages cannot be promoted to Steer.",
+      });
+    }
+
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
     // A scheduled delivery steers on the thread's current pick, so /goal must suit that provider.

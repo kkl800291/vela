@@ -4,10 +4,35 @@ import {
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
   T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
   T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+  T3_CODE_ORCHESTRATION_SECTIONS,
   t3AcpPromptWithInstructions,
   t3OrchestrationPrompt,
   t3OrchestrationSystemPrompt,
 } from "./orchestrationInstructions.ts";
+
+describe("Vela collaboration instructions", () => {
+  it("binds FIFO reviews to frozen evidence and reserves delivery for user confirmation", () => {
+    for (const text of [
+      "independent external review",
+      "Reuse the existing thread",
+      "managed worktrees",
+      "frozen snapshots in FIFO order",
+      "`vela_dispatch_status` using `planId`, `reviewId` and `view`",
+      "dedicated review run",
+      "`findings` and `criteriaResults`",
+      "confirm applying the single delivery",
+      "never apply, revert, commit or push",
+    ]) {
+      assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, text);
+    }
+  });
+
+  it("keeps all orchestration sections within the Codex UTF-8 byte limit", () => {
+    for (const section of T3_CODE_ORCHESTRATION_SECTIONS) {
+      assert.isAtMost(new TextEncoder().encode(section).byteLength, 4_000);
+    }
+  });
+});
 
 describe("T3 device instructions", () => {
   it("route device work through device_open and give Claude the line that loads the tools", () => {

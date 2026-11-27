@@ -26,20 +26,22 @@ it.each(["prod", ""])("rejects APP_VARIANT=%j before selecting production IDs", 
 });
 
 it.each([
-  [undefined, "com.t3tools.t3code"],
-  ["development", "com.t3tools.t3code.dev"],
-  ["preview", "com.t3tools.t3code.preview"],
-  ["production", "com.t3tools.t3code"],
-])("keeps the iOS and Android identifiers for APP_VARIANT=%j", async (value, identifier) => {
+  [undefined, "com.vela.mobile"],
+  ["development", "com.vela.mobile.dev"],
+  ["preview", "com.vela.mobile.preview"],
+  ["production", "com.vela.mobile"],
+])("uses Vela iOS and Android identifiers and avoids upstream Expo targets for APP_VARIANT=%j", async (value, identifier) => {
   const config = await loadConfig(value);
   expect(config.ios?.bundleIdentifier).toBe(identifier);
   expect(config.android?.package).toBe(identifier);
+  expect(config.owner).toBeUndefined();
+  expect(config.updates?.enabled).toBe(false);
+  expect(config.updates?.url).toBeUndefined();
+  expect((config.extra as { eas?: { projectId?: string } } | undefined)?.eas?.projectId).toBeUndefined();
   // Copied thread links open this app only while app.t3.codes lists it.
   const host = new URL(DEFAULT_HOSTED_APP_URL).host;
   expect(config.ios?.associatedDomains).toContain(`applinks:${host}`);
-  expect(appleAppSiteAssociation.applinks.details[0]?.appIDs).toContain(
-    `${config.ios?.appleTeamId}.${identifier}`,
-  );
+  expect(appleAppSiteAssociation.applinks.details[0]?.appIDs.some((id) => id.endsWith(`.${identifier}`))).toBe(true);
   expect(config.android?.intentFilters?.[0]?.data).toEqual([
     { scheme: "https", host, pathPrefix: "/threads/" },
   ]);

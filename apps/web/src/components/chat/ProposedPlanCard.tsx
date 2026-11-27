@@ -18,7 +18,7 @@ import {
   normalizePlanMarkdownForExport,
 } from "../../proposedPlan";
 import ChatMarkdown from "../ChatMarkdown";
-import { EllipsisIcon } from "lucide-react";
+import { EllipsisIcon, LayersIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
@@ -35,6 +35,12 @@ import {
 } from "../ui/dialog";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { projectEnvironment } from "~/state/projects";
+import {
+  fetchDispatchApi,
+  refreshDispatchState,
+  requestFocusDispatchStep,
+  useVelaDispatchState,
+} from "~/state/velaDispatch";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { readEnvironmentScope, useEnvironmentScope } from "~/state/session";
@@ -61,6 +67,14 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
   const [lastSavePath, setLastSavePath] = useState("");
   const [isSavingToWorkspace, setIsSavingToWorkspace] = useState(false);
+  const [isTurningIntoDispatch, setIsTurningIntoDispatch] = useState(false);
+  const [sourceExpanded, setSourceExpanded] = useState(false);
+  const { state: dispatchState } = useVelaDispatchState(
+    workspaceRoot,
+    threadRef?.threadId,
+    environmentId,
+  );
+  const linkedCollab = dispatchState?.collab ?? null;
   const writeProjectFile = useAtomCommand(projectEnvironment.writeFile, {
     reportFailure: false,
   });
@@ -101,6 +115,44 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
 
   const handleCopyPlan = () => {
     copyToClipboard(saveContents);
+  };
+
+  const handleTurnIntoDispatchPlan = async () => {
+    if (!workspaceRoot || !threadRef || isTurningIntoDispatch) return;
+    setIsTurningIntoDispatch(true);
+    try {
+      await fetchDispatchApi<{ ok: true }>(
+        "/api/vela/dispatch/kickoff",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            projectRoot: workspaceRoot,
+            threadId: threadRef.threadId,
+            requirement: planMarkdown,
+            mode: "fast",
+          }),
+        },
+        undefined,
+        environmentId,
+      );
+      void refreshDispatchState(workspaceRoot, threadRef.threadId, environmentId);
+      toastManager.add({
+        type: "success",
+        // oxlint-disable-next-line t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy
+        title: "已开始拆分并行任务",
+      });
+    } catch (err) {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          // oxlint-disable-next-line t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy
+          title: "拆分并行任务失败",
+          description: err instanceof Error ? err.message : gt("An error occurred while dispatching."),
+        }),
+      );
+    } finally {
+      setIsTurningIntoDispatch(false);
+    }
   };
 
   const openSaveDialog = () => {
@@ -166,6 +218,25 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
     })();
   };
 
+  if (linkedCollab && !sourceExpanded && !findActive) {
+    /* oxlint-disable t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-2xl border border-border/45 bg-card/35 px-4 py-2.5">
+        <div className="flex min-w-0 items-center gap-2">
+          <Badge variant="secondary">计划</Badge>
+          <span className="truncate text-sm font-medium text-foreground/80">{title}</span>
+          <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+            · 已拆分为 {linkedCollab.stepCount} 步
+          </span>
+        </div>
+        <Button size="xs" variant="ghost" onClick={() => setSourceExpanded(true)}>
+          展开
+        </Button>
+      </div>
+    );
+    /* oxlint-enable t3code/no-untranslated-copy */
+  }
+
   return (
     <div className="rounded-2xl border border-border/80 bg-card/70 p-4 sm:p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -176,27 +247,56 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
             {title}
           </h3>
         </div>
-        <Menu>
-          <MenuTrigger
-            render={<Button aria-label={gt("Plan actions")} size="icon-xs" variant="outline" />}
-          >
-            <EllipsisIcon aria-hidden="true" className="size-4" />
-          </MenuTrigger>
-          <MenuPopup align="end">
-            <MenuItem onClick={handleCopyPlan}>
-              {isCopied ? gt("Copied!") : gt("Copy to clipboard")}
-            </MenuItem>
-            <MenuItem onClick={handleDownload}>
-              <T>Download as markdown</T>
-            </MenuItem>
-            <MenuItem
-              onClick={openSaveDialog}
-              disabled={!canWriteFiles || !workspaceRoot || isSavingToWorkspace}
+        <div className="flex shrink-0 items-center gap-1.5">
+          {linkedCollab && threadRef ? (
+            /* oxlint-disable t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */
+            <>
+              <button
+                type="button"
+                onClick={() => requestFocusDispatchStep(threadRef.threadId, "__plan__")}
+                className="text-xs text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline"
+              >
+                已生成并行任务
+              </button>
+              <Button size="xs" variant="ghost" onClick={() => setSourceExpanded(false)}>
+                收起
+              </Button>
+            </>
+            /* oxlint-enable t3code/no-untranslated-copy */
+          ) : workspaceRoot && threadRef ? (
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={isTurningIntoDispatch}
+              onClick={() => void handleTurnIntoDispatchPlan()}
             >
-              <T>Save to workspace</T>
-            </MenuItem>
-          </MenuPopup>
-        </Menu>
+              <LayersIcon aria-hidden="true" className="size-3.5" />
+              {/* oxlint-disable-next-line t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */}
+              {isTurningIntoDispatch ? "正在拆分…" : "并行执行"}
+            </Button>
+          ) : null}
+          <Menu>
+            <MenuTrigger
+              render={<Button aria-label={gt("Plan actions")} size="icon-xs" variant="outline" />}
+            >
+              <EllipsisIcon aria-hidden="true" className="size-4" />
+            </MenuTrigger>
+            <MenuPopup align="end">
+              <MenuItem onClick={handleCopyPlan}>
+                {isCopied ? gt("Copied!") : gt("Copy to clipboard")}
+              </MenuItem>
+              <MenuItem onClick={handleDownload}>
+                <T>Download as markdown</T>
+              </MenuItem>
+              <MenuItem
+                onClick={openSaveDialog}
+                disabled={!canWriteFiles || !workspaceRoot || isSavingToWorkspace}
+              >
+                <T>Save to workspace</T>
+              </MenuItem>
+            </MenuPopup>
+          </Menu>
+        </div>
       </div>
       <div className="mt-4">
         <div

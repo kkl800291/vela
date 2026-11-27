@@ -101,6 +101,7 @@ const PI_UNSOLICITED_ACTIVITY_ERROR =
   "Pi started agent work outside an active T3 turn. The session was stopped to prevent invisible tool execution.";
 const SETTLE_PROBE_MAX_ATTEMPTS = 3;
 const SETTLE_PROBE_RETRY_DELAY = Duration.millis(100);
+const AUTO_RETRY_END_SETTLE_GRACE = Duration.millis(250);
 
 const PiProviderCapabilitiesV2 = {
   runtimePolicy: { enforcement: "client-boundary" },
@@ -384,6 +385,11 @@ interface ActivePiTurn {
   lastLiveUsedTokens: number | null;
   lastMessageUsage: PiMessageTokenUsage | undefined;
   settleProbeGeneration: number;
+  /**
+   * The generation of an armed grace timer, or a deferred timer if compaction
+   * was already running. Compaction also invalidates timers from older generations.
+   */
+  exhaustedRetrySettle: number | "afterCompaction" | null;
   /** An extension may start compaction immediately after Pi emits agent_settled. */
   settleWhenIdle: boolean;
   /** Pi fails a cancelled compact's response too; that is a stop, not a turn failure. */
@@ -2186,6 +2192,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             failureItemOrdinal: itemOrdinal(turn, failureItemId),
             status: "failed",
             failure,
+            ...(!closed && [...piAsyncRuns.values()].some((run) => run.turn === turn)
+              ? { childTurnsContinue: true }
+              : {}),
             ...(turn.activeProviderRetry === null
               ? {}
               : {
@@ -2254,6 +2263,52 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           Effect.ignore,
           Effect.forkIn(scope),
         );
+      };
+
+      // auto_retry_end(success: false) may never be followed by agent_settled. The grace
+      // window lets compaction or a normal settle win; compaction_start expires it.
+      const armExhaustedRetrySettle = (turn: ActivePiTurn) => {
+        if (turn.activeCompaction !== null) {
+          turn.exhaustedRetrySettle = "afterCompaction";
+          return Effect.void;
+        }
+        const generation = turn.settleProbeGeneration;
+        turn.exhaustedRetrySettle = generation;
+        return Effect.sleep(AUTO_RETRY_END_SETTLE_GRACE).pipe(
+          Effect.andThen(
+            Effect.suspend(() => {
+              if (
+                threadState?.activeTurn !== turn ||
+                turn.settleProbeGeneration !== generation ||
+                turn.activeCompaction !== null ||
+                turn.exhaustedRetrySettle !== generation
+              ) {
+                return Effect.void;
+              }
+              turn.exhaustedRetrySettle = null;
+              turn.settleWhenIdle = true;
+              return scheduleSettleProbe(turn, true);
+            }),
+          ),
+          Effect.forkIn(scope),
+          Effect.asVoid,
+        );
+      };
+
+      const rearmExhaustedRetrySettleAfterCompaction = (turn: ActivePiTurn, willRetry: boolean) => {
+        // A recovery retry, or a prompt just released into this turn, owns what happens next.
+        if (willRetry || releasedPromptTurnId === turn.providerTurn.id) {
+          turn.exhaustedRetrySettle = null;
+          return Effect.void;
+        }
+        if (
+          turn.settleWhenIdle ||
+          turn.exhaustedRetrySettle === null ||
+          turn.exhaustedRetrySettle === turn.settleProbeGeneration
+        ) {
+          return Effect.void;
+        }
+        return armExhaustedRetrySettle(turn);
       };
 
       const stopPendingWake = Effect.fnUntraced(function* (wake: PiWake) {
@@ -2346,6 +2401,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             turn.sawAgentActivity = true;
             turn.nativeAborted = false;
             turn.settleProbeGeneration += 1;
+            turn.exhaustedRetrySettle = null;
             return;
           }
           case "message_start": {
@@ -2368,6 +2424,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               const recoveredAt = yield* DateTime.now;
               yield* emitProviderRetry(turn, turn.activeProviderRetry, "completed", recoveredAt);
               turn.activeProviderRetry = null;
+              turn.exhaustedRetrySettle = null;
             }
             yield* reportLiveUsage(turn, event["usage"]);
             const delta = event["assistantMessageEvent"];
@@ -2458,6 +2515,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             };
             turn.activeCompaction = null;
             turn.compactionCancelled = event["aborted"] === true;
+            const willRetry = event["willRetry"] === true;
             const result = event["result"];
             if (result === null || result === undefined) {
               if (event["aborted"] === true) {
@@ -2468,6 +2526,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 ) {
                   yield* scheduleSettleProbe(turn, turn.settleWhenIdle);
                 }
+                yield* rearmExhaustedRetrySettleAfterCompaction(turn, willRetry);
                 return;
               }
               const errorMessage =
@@ -2481,10 +2540,11 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               ) {
                 yield* scheduleSettleProbe(turn, turn.settleWhenIdle);
               }
+              yield* rearmExhaustedRetrySettleAfterCompaction(turn, willRetry);
               return;
             }
             // Clear overflow failures only when compaction will retry; ordinary compaction must retain exhausted retries.
-            if (event["willRetry"] === true) turn.failure = null;
+            if (willRetry) turn.failure = null;
             turn.latestCompactionAfterTokens =
               nonNegativeInteger(result, "estimatedTokensAfter") ?? null;
             const summary = recordString(result, "summary");
@@ -2501,10 +2561,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ) {
               yield* scheduleSettleProbe(turn, turn.settleWhenIdle);
             }
+            yield* rearmExhaustedRetrySettleAfterCompaction(turn, willRetry);
             return;
           }
           case "auto_retry_start": {
             if (turn === null) return;
+            turn.exhaustedRetrySettle = null;
             const emittedAt = yield* DateTime.now;
             const attempt = Math.max(1, Math.trunc(recordNumber(event, "attempt") ?? 1));
             const maxAttempts = Math.max(
@@ -2550,6 +2612,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                 turn.activeProviderRetry = null;
               }
               turn.failure = null;
+              turn.exhaustedRetrySettle = null;
               return;
             }
             const failure = makeProviderFailure({
@@ -2574,6 +2637,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             turn.activeProviderRetry = providerRetry;
             turn.failure = failure;
             yield* emitProviderRetry(turn, providerRetry, "failed", emittedAt);
+            if (turn.settleWhenIdle) {
+              turn.exhaustedRetrySettle = null;
+              yield* scheduleSettleProbe(turn, true);
+            } else {
+              yield* armExhaustedRetrySettle(turn);
+            }
             return;
           }
           case "extension_ui_request":
@@ -2597,6 +2666,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               turn.nativeAborted = event["aborted"] === true;
               turn.settleWhenIdle = true;
               turn.settleProbeGeneration += 1;
+              turn.exhaustedRetrySettle = null;
               if (
                 turn.adoptedWake &&
                 pendingPromptResponses.some(
@@ -2826,6 +2896,19 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               if (state === null) return;
               adoptLiveSessionFile(state, data);
               yield* finalizeTurn(state);
+              return;
+            }
+            if (
+              turn.activeProviderRetry !== null &&
+              !turn.activeProviderRetry.failure.retryable &&
+              recordField(data, "isCompacting") !== true &&
+              (recordNumber(data, "pendingMessageCount") ?? 0) === 0 &&
+              attempt < SETTLE_PROBE_MAX_ATTEMPTS
+            ) {
+              yield* Effect.sleep(SETTLE_PROBE_RETRY_DELAY).pipe(
+                Effect.andThen(scheduleSettleProbe(turn, true, attempt + 1)),
+                Effect.forkIn(scope),
+              );
             }
             return;
           }
@@ -3535,6 +3618,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               lastLiveUsedTokens: null,
               lastMessageUsage: undefined,
               settleProbeGeneration: 0,
+              exhaustedRetrySettle: null,
               settleWhenIdle: false,
               compactionCancelled: false,
               manualCompactInFlight: compactCommand !== null,
@@ -3688,6 +3772,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                   });
                 }
                 turn.settleProbeGeneration += 1;
+                turn.exhaustedRetrySettle = null;
               }),
             );
           },
@@ -3736,6 +3821,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                   if (state?.activeTurn === turn) {
                     // Probes answered before Stop may carry a session file the extension already left.
                     turn.settleProbeGeneration += 1;
+                    turn.exhaustedRetrySettle = null;
                     const liveState = yield* request({ type: "get_state" }, 2_000).pipe(
                       Effect.orElseSucceed(() => undefined),
                     );

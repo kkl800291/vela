@@ -2040,7 +2040,145 @@ export function deriveThreadFeedPresentation(
       firstEntryByRun,
     };
   }
-  return result;
+  return foldMobileCollabReviewRows(
+    result,
+    feed,
+    expandedRunIds,
+    activeRunId,
+    display.revealedMessageId,
+  );
+}
+
+function isCollabReviewWakeMessage(message: ThreadFeedMessage): boolean {
+  return (
+    message.role === "user" &&
+    message.id.startsWith("vela-collab:") &&
+    message.createdBy === "system" &&
+    message.creationSource === "server" &&
+    /^\[Vela collaboration review\](?:\r?\n|$)/.test(message.text)
+  );
+}
+
+interface MobileCollabReviewGroup {
+  readonly runId: RunId;
+  readonly id: string;
+  readonly createdAt: string;
+  count: number;
+  hasActiveRun: boolean;
+  hasRevealedMessage: boolean;
+}
+
+function foldMobileCollabReviewRows(
+  rows: ReadonlyArray<ThreadFeedEntry>,
+  feed: ReadonlyArray<ThreadFeedEntry>,
+  expandedRunIds: ReadonlySet<RunId>,
+  activeRunId: RunId | null,
+  revealedMessageId: MessageId | null,
+): ThreadFeedEntry[] {
+  if (!feed.some((entry) => entry.type === "message" && isCollabReviewWakeMessage(entry.message))) {
+    return rows as ThreadFeedEntry[];
+  }
+
+  const userActionRuns = new Set<RunId>();
+  for (const entry of feed) {
+    if (entry.type !== "activity-group" || entry.runId === null) continue;
+    for (const activity of entry.activities) {
+      const itemType = activity.workEntry.itemType;
+      const item = activity.projectedItem.item;
+      if (
+        itemType === "user_input_request" ||
+        (item.type === "approval_request" && item.status === "pending")
+      ) {
+        userActionRuns.add(entry.runId);
+      }
+    }
+  }
+
+  const wakeGroups = new Map<MessageId, MobileCollabReviewGroup>();
+  const runGroups = new Map<RunId, MobileCollabReviewGroup>();
+  let currentGroup: MobileCollabReviewGroup | undefined;
+
+  for (const entry of feed) {
+    if (entry.type !== "message") continue;
+    const { message } = entry;
+    if (message.role === "assistant") {
+      if (message.runId !== null && runGroups.get(message.runId) !== currentGroup) {
+        currentGroup = undefined;
+      }
+      if (currentGroup && message.id === revealedMessageId) {
+        currentGroup.hasRevealedMessage = true;
+      }
+      continue;
+    }
+    if (
+      !isCollabReviewWakeMessage(message) ||
+      (message.runId !== null && userActionRuns.has(message.runId))
+    ) {
+      currentGroup = undefined;
+      continue;
+    }
+    if (!currentGroup) {
+      const syntheticRunId = RunId.make(`collab-review:${message.id}`);
+      currentGroup = {
+        runId: syntheticRunId,
+        id: `run-fold:${syntheticRunId}`,
+        createdAt: entry.createdAt,
+        count: 0,
+        hasActiveRun: false,
+        hasRevealedMessage: false,
+      };
+    }
+    currentGroup.count += 1;
+    if (message.id === revealedMessageId) currentGroup.hasRevealedMessage = true;
+    if (message.runId !== null && message.runId === activeRunId) currentGroup.hasActiveRun = true;
+    wakeGroups.set(message.id, currentGroup);
+    if (message.runId !== null) {
+      runGroups.set(message.runId, currentGroup);
+    }
+  }
+
+  if (wakeGroups.size === 0) return rows as ThreadFeedEntry[];
+
+  const emitted = new Set<MobileCollabReviewGroup>();
+  const output: ThreadFeedEntry[] = [];
+
+  for (const row of rows) {
+    let group: MobileCollabReviewGroup | undefined;
+    if (row.type === "message" && row.message.role === "user") {
+      group = wakeGroups.get(row.message.id);
+    } else if (row.type === "message" && row.message.role === "assistant") {
+      group = row.message.runId !== null ? runGroups.get(row.message.runId) : undefined;
+    } else if (row.type === "run-fold") {
+      group = runGroups.get(row.runId);
+    } else if (row.type === "activity-group" || row.type === "work-toggle" || row.type === "viewed-images") {
+      group = row.runId !== null ? runGroups.get(row.runId) : undefined;
+    } else if (row.type === "thinking") {
+      group = row.runId !== null ? runGroups.get(row.runId) : undefined;
+    }
+
+    if (!group || group.hasActiveRun || group.hasRevealedMessage) {
+      output.push(row);
+      continue;
+    }
+
+    const expanded = expandedRunIds.has(group.runId);
+    if (!emitted.has(group)) {
+      emitted.add(group);
+      output.push({
+        type: "run-fold",
+        id: group.id,
+        createdAt: group.createdAt,
+        runId: group.runId,
+        label: `已折叠 ${group.count} 轮常规审查`,
+        expanded,
+      });
+    }
+    if (expanded) {
+      output.push(row);
+    }
+  }
+
+  return output;
 }
 
 const continuedWorkLogRows = new WeakMap<ThreadFeedEntry, ThreadFeedEntry>();

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { VelaCollabProjection } from "@t3tools/contracts";
 
 import type {
   DispatchProviderSummary,
@@ -10,12 +11,22 @@ import {
   applyTargetOptionChange,
   buildTargetForModelSelection,
   computeBatches,
+  computeBlockedDownstreamSteps,
+  computeTopCompletedRunCount,
+  COLLAB_ATTENTION_LABEL,
+  COLLAB_STEP_LABEL,
+  collabAttentionLabel,
+  collabPlanLabel,
+  findCollabStepDependents,
   formatAgentTarget,
+  formatCollabDependsOn,
   formatDecisionOptionsText,
   formatElapsedDuration,
   isStepAwaitingDecision,
   normalizeDispatchTargetOptions,
   parseDecisionOptionsText,
+  parseUnifiedDiffLines,
+  partitionCollabSteps,
   progressSegmentTone,
   resolveAgentEffortLabel,
   resolveAgentTargetDisplay,
@@ -23,7 +34,130 @@ import {
   resolveGateStages,
   resolveStepKind,
   stripMarkdownPreview,
+  summarizeStepVerification,
 } from "./dispatchModel";
+
+describe("collaboration projection", () => {
+  it("keeps attention separate and sorts reviews by the active inbox and FIFO position", () => {
+    const plan = {
+      engineVersion: 2,
+      planId: "plan",
+      planVersion: 1,
+      revision: 1,
+      title: "Collaboration",
+      status: "running",
+      stepCount: 11,
+      blocked: false,
+      config: { enableBatchAudit: false },
+      steps: (
+        [
+          { stepId: "third", status: "queued_for_review", queuePosition: 3 },
+          { stepId: "develop", status: "developing" },
+          { stepId: "second", status: "queued_for_review", queuePosition: 2 },
+          { stepId: "gate", status: "verifying_gates" },
+          { stepId: "active", status: "queued_for_review", queuePosition: 4 },
+          { stepId: "first", status: "queued_for_review", queuePosition: 1 },
+          { stepId: "decide", status: "needs_attention" },
+          { stepId: "integrate", status: "integrating" },
+          { stepId: "integrated", status: "integrated" },
+          { stepId: "done", status: "done" },
+          { stepId: "locked", status: "locked" },
+        ] as const
+      ).map((step): VelaCollabProjection["steps"][number] => ({
+        ...step,
+        title: step.stepId,
+        kind: "change",
+        phase: "initial",
+        attempt: 1,
+      })),
+      activeInbox: { inboxItemId: "inbox", kind: "review", stepId: "active", status: "dispatched" },
+    } satisfies VelaCollabProjection;
+    const sections = partitionCollabSteps(plan);
+    expect(sections.developing.map(({ stepId }) => stepId)).toEqual(["develop", "gate", "locked"]);
+    expect(sections.reviewQueue.map(({ stepId }) => stepId)).toEqual([
+      "active",
+      "first",
+      "second",
+      "third",
+    ]);
+    expect(sections.attention.map(({ stepId }) => stepId)).toEqual(["decide"]);
+    expect(sections.integrationAndDelivery.map(({ stepId }) => stepId)).toEqual([
+      "integrate",
+      "integrated",
+      "done",
+    ]);
+    expect(collabPlanLabel(plan)).toBe("执行中");
+    expect(collabPlanLabel({ ...plan, status: "ready_to_deliver" })).toBe("待应用");
+    expect(collabPlanLabel({ ...plan, blocked: true })).toBe("有待处理项");
+    expect(collabPlanLabel({ ...plan, canRetryBatch: true })).toBe("有待处理项");
+    expect(Object.values(COLLAB_STEP_LABEL)).toHaveLength(11);
+    expect(COLLAB_STEP_LABEL.reviewing).toBe("审查中");
+  });
+
+  it("labels delivery and step attention while keeping legacy entries on the legacy path", () => {
+    expect(collabAttentionLabel({ engineVersion: 2, attentionReason: "ready_to_deliver" })).toBe(
+      "已完成，待应用",
+    );
+    expect(collabAttentionLabel({ engineVersion: 2, attentionReason: "review_incomplete" })).toBe(
+      "审查未完成",
+    );
+    expect(
+      collabAttentionLabel({ engineVersion: 2, attentionReason: "manual_check_required" }),
+    ).toBe("待人工确认");
+    expect(Object.values(COLLAB_ATTENTION_LABEL)).toHaveLength(9);
+    expect(collabAttentionLabel({})).toBeUndefined();
+  });
+
+  it("folds only top contiguous completed steps when total > 6 and formats dependencies", () => {
+    const mk = (id: string, status: VelaCollabProjection["steps"][number]["status"], dependsOn?: string[]) => ({
+      stepId: id,
+      title: `Step ${id}`,
+      kind: "change" as const,
+      status,
+      phase: "initial" as const,
+      attempt: 1,
+      ...(dependsOn ? { dependsOn } : {}),
+    });
+    const sixSteps = [
+      mk("s1", "integrated"),
+      mk("s2", "done"),
+      mk("s3", "developing"),
+      mk("s4", "locked"),
+      mk("s5", "locked"),
+      mk("s6", "locked"),
+    ];
+    expect(computeTopCompletedRunCount(sixSteps)).toBe(0);
+
+    const sevenSteps = [
+      mk("s1", "integrated"),
+      mk("s2", "done"),
+      mk("s3", "developing", ["s1"]),
+      mk("s4", "integrated"),
+      mk("s5", "locked", ["s1", "s3"]),
+      mk("s6", "locked", ["s1", "s2", "s3"]),
+      mk("s7", "locked"),
+    ];
+    expect(computeTopCompletedRunCount(sevenSteps)).toBe(2);
+
+    const plan: VelaCollabProjection = {
+      engineVersion: 2,
+      planId: "p1",
+      planVersion: 1,
+      revision: 1,
+      title: "Test",
+      status: "draft",
+      stepCount: sevenSteps.length,
+      blocked: false,
+      config: { enableBatchAudit: false },
+      steps: sevenSteps,
+    };
+    expect(formatCollabDependsOn(plan, ["s1"], "draft")).toBe("依赖第 1 步");
+    expect(formatCollabDependsOn(plan, ["s1", "s3"], "locked")).toBe("等待第 1、3 步");
+    expect(formatCollabDependsOn(plan, ["s1", "s2", "s3"], "draft")).toBe("依赖第 1 步等 3 项");
+    expect(findCollabStepDependents(plan, "s1").map((d) => d.number)).toEqual([3, 5, 6]);
+    expect(findCollabStepDependents(plan, "s7")).toEqual([]);
+  });
+});
 
 function makeCard(
   id: string,
@@ -256,22 +390,22 @@ describe("resolveGateStages", () => {
 describe("progressSegmentTone", () => {
   it("assigns expected tones and sweep flags for all dispatch statuses", () => {
     const expectations: Array<[DispatchStepStatus, string, boolean]> = [
-      ["done", "bg-foreground/80", false],
+      ["done", "bg-foreground/85", false],
       ["needs_human_decision", "bg-warning", false],
       ["awaiting_decision", "bg-warning", false],
-      ["ready_to_accept", "bg-foreground/50", false],
-      ["running", "bg-foreground/30", true],
-      ["reviewing", "bg-foreground/30", true],
-      ["fixing_review", "bg-foreground/30", true],
-      ["fixing_acceptance", "bg-foreground/30", true],
-      ["awaiting_product_acceptance", "bg-foreground/30", true],
-      ["waiting_orchestrator", "bg-foreground/30", true],
-      ["premise_failed", "bg-destructive/70", false],
-      ["boundary_violation", "bg-destructive/70", false],
-      ["hard_gate_failed", "bg-destructive/70", false],
+      ["ready_to_accept", "bg-success", false],
+      ["running", "bg-foreground/35", true],
+      ["reviewing", "bg-foreground/35", true],
+      ["fixing_review", "bg-foreground/35", true],
+      ["fixing_acceptance", "bg-foreground/35", true],
+      ["awaiting_product_acceptance", "bg-foreground/35", true],
+      ["waiting_orchestrator", "bg-foreground/35", true],
+      ["premise_failed", "bg-destructive/80", false],
+      ["boundary_violation", "bg-destructive/80", false],
+      ["hard_gate_failed", "bg-destructive/80", false],
+      ["ready", "bg-info/60", false],
       ["locked", "bg-muted", false],
-      ["ready", "bg-muted", false],
-      ["cancelled", "bg-muted", false],
+      ["cancelled", "bg-muted-foreground/30", false],
     ];
 
     for (const [status, expectedClass, expectedSweep] of expectations) {
@@ -519,5 +653,142 @@ describe("formatAgentTarget & effort formatting", () => {
       effort: "xhigh",
       options: [{ id: "fastMode", value: true }],
     });
+  });
+});
+
+describe("summarizeStepVerification", () => {
+  it("reports 未运行检查命令 when hardGate results are empty", () => {
+    const card = makeCard("S1", 1, {
+      goal: "Fix export encoding",
+      reviewer: null,
+      isolation: "direct",
+    });
+    const summary = summarizeStepVerification(
+      card,
+      {
+        isolation: "direct",
+        diffSummary: { changedFiles: ["src/export.ts"], patch: "+utf8", truncated: false },
+        hardGate: { ok: true, results: [], logText: "" },
+        reviews: [],
+        acceptanceReports: [],
+      },
+      "main",
+    );
+
+    expect(summary.checkLabel).toBe("未运行检查命令");
+    expect(summary.reviewLabel).toBe("未启用独立复查");
+    expect(summary.targetBranchLabel).toContain("当前分支（main）未提交列表");
+    expect(summary.hasPatch).toBe(true);
+    expect(summary.changedFiles).toEqual(["src/export.ts"]);
+    expect(summary.summaryText).toBe("Fix export encoding");
+  });
+
+  it("summarizes passed/failed checks, review status, and worktree merge target", () => {
+    const card = makeCard("S2", 2, {
+      isolation: "worktree",
+      reviewer: { providerInstanceId: "codex" },
+    });
+    const summary = summarizeStepVerification(
+      card,
+      {
+        isolation: "worktree",
+        diffSummary: { changedFiles: ["a.ts", "b.ts"], patch: "", truncated: false },
+        hardGate: {
+          ok: true,
+          results: [
+            { command: "vp test run", ok: true, exitCode: 0, durationMs: 120, output: "" },
+            { command: "vp check", ok: true, exitCode: 0, durationMs: 80, output: "" },
+          ],
+          logText: "",
+        },
+        reviews: [
+          {
+            round: 1,
+            verdict: "pass",
+            summary: "Code looks clean",
+            issues: [],
+            reviewedAt: "2026-11-25T00:00:00Z",
+          },
+        ],
+        acceptanceReports: [],
+        deliverable: {
+          kind: "change_summary",
+          text: "## 完成导出\n支持 **BOM** UTF-8 导出。",
+          producedAt: "2026-11-25T00:00:00Z",
+        },
+      },
+      "feat/export",
+    );
+
+    expect(summary.checkLabel).toBe("已运行 2 项检查，全部通过");
+    expect(summary.reviewLabel).toBe("独立复查通过");
+    expect(summary.targetBranchLabel).toContain("合并 Worktree 改动到当前分支（feat/export）未提交列表");
+    expect(summary.summaryText).toBe("完成导出 支持 BOM UTF-8 导出。");
+    expect(summary.hasPatch).toBe(false);
+  });
+});
+
+describe("computeBlockedDownstreamSteps", () => {
+  it("finds blocked locked steps in DAG mode and linear mode", () => {
+    const dag = [
+      makeCard("S1", 1, { status: "ready_to_accept", dependsOn: [] }),
+      makeCard("S2", 2, { status: "locked", dependsOn: ["S1"] }),
+      makeCard("S3", 3, { status: "ready", dependsOn: [] }),
+      makeCard("S4", 4, { status: "locked", dependsOn: ["S1", "S2"] }),
+    ];
+    expect(computeBlockedDownstreamSteps(dag, "S1").map((s) => s.id)).toEqual(["S2", "S4"]);
+
+    const linear = [
+      makeCard("S1", 1, { status: "done" }),
+      makeCard("S2", 2, { status: "ready_to_accept" }),
+      makeCard("S3", 3, { status: "locked" }),
+      makeCard("S4", 4, { status: "locked" }),
+    ];
+    expect(computeBlockedDownstreamSteps(linear, "S2").map((s) => s.id)).toEqual(["S3", "S4"]);
+  });
+});
+
+describe("parseUnifiedDiffLines", () => {
+  it("classifies deleted SQL comments (--- ) and added +++ lines inside hunks as del/add, not meta", () => {
+    const patch = [
+      "diff --git a/migrations/001.sql b/migrations/001.sql",
+      "index 1111111..2222222 100644",
+      "--- a/migrations/001.sql",
+      "+++ b/migrations/001.sql",
+      "@@ -1,3 +1,3 @@",
+      " SELECT 1;",
+      "--- old comment",
+      "+++ new note",
+      "\\ No newline at end of file",
+      'diff --git "a/docs/my notes.md" "b/docs/my notes.md"',
+      "--- a/docs/my notes.md",
+      "+++ b/docs/my notes.md",
+      "@@ -1 +1 @@",
+      "-before",
+      "+after",
+    ].join("\n");
+
+    const lines = parseUnifiedDiffLines(patch);
+    expect(lines.map((l) => [l.kind, l.text, l.filePath])).toEqual([
+      ["meta", "diff --git a/migrations/001.sql b/migrations/001.sql", "migrations/001.sql"],
+      ["meta", "index 1111111..2222222 100644", undefined],
+      ["meta", "--- a/migrations/001.sql", undefined],
+      ["meta", "+++ b/migrations/001.sql", undefined],
+      ["hunk", "@@ -1,3 +1,3 @@", undefined],
+      ["context", " SELECT 1;", undefined],
+      ["del", "--- old comment", undefined],
+      ["add", "+++ new note", undefined],
+      ["meta", "\\ No newline at end of file", undefined],
+      ["meta", 'diff --git "a/docs/my notes.md" "b/docs/my notes.md"', "docs/my notes.md"],
+      ["meta", "--- a/docs/my notes.md", undefined],
+      ["meta", "+++ b/docs/my notes.md", undefined],
+      ["hunk", "@@ -1 +1 @@", undefined],
+      ["del", "-before", undefined],
+      ["add", "+after", undefined],
+    ]);
+  });
+
+  it("handles empty patch strings", () => {
+    expect(parseUnifiedDiffLines("")).toEqual([]);
   });
 });

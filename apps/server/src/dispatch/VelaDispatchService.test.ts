@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off globalTimers:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -22,9 +22,10 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -38,6 +39,8 @@ import {
   auditPathBoundaries,
   captureWorkspaceSnapshot,
   inspectWorkspaceDelta,
+  inspectWorkspaceDeltaWithTree,
+  revertStepSnapshotSafely,
   revertWorkspaceToSnapshot,
   runHardGates,
 } from "./VelaDispatchGit.ts";
@@ -54,8 +57,56 @@ import {
   toModelSelection,
   layer as velaDispatchServiceLayer,
 } from "./VelaDispatchService.ts";
-import { VelaDispatchStore, unlockReadySteps } from "./VelaDispatchStore.ts";
+import { VelaDispatchStore, dispatchStateFileOf, unlockReadySteps } from "./VelaDispatchStore.ts";
 import type { DispatchStepRun, DispatchTaskCard } from "./VelaDispatchTypes.ts";
+import type { DispatchEscalationRecord } from "./VelaDispatchTypes.ts";
+
+const fsReadGate = vi.hoisted(() => ({
+  armed: false,
+  wait: Promise.resolve() as Promise<void>,
+  notifyPaused: () => {},
+}));
+
+const fsWriteGate = vi.hoisted(() => ({
+  armed: false,
+  pathIncludes: "",
+  wait: Promise.resolve() as Promise<void>,
+  notifyPaused: () => {},
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readFile: (async (path: Parameters<typeof actual.readFile>[0], options?: unknown) => {
+      if (fsReadGate.armed && String(path).endsWith("state.json")) {
+        fsReadGate.armed = false;
+        const stale = await actual.readFile(path, options as never);
+        fsReadGate.notifyPaused();
+        await fsReadGate.wait;
+        return stale;
+      }
+      return actual.readFile(path, options as never);
+    }) as typeof actual.readFile,
+    writeFile: (async (
+      path: Parameters<typeof actual.writeFile>[0],
+      data: Parameters<typeof actual.writeFile>[1],
+      options?: Parameters<typeof actual.writeFile>[2],
+    ) => {
+      if (
+        fsWriteGate.armed &&
+        fsWriteGate.pathIncludes.length > 0 &&
+        String(path).includes("state.json") &&
+        String(path).includes(fsWriteGate.pathIncludes)
+      ) {
+        fsWriteGate.armed = false;
+        fsWriteGate.notifyPaused();
+        await fsWriteGate.wait;
+      }
+      return actual.writeFile(path, data, options);
+    }) as typeof actual.writeFile,
+  };
+});
 
 const tempDirs: string[] = [];
 
@@ -82,6 +133,152 @@ function createTempStateDir(): string {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "vela-dispatch-state-"));
   tempDirs.push(dir);
   return dir;
+}
+
+function deferFirstStateJsonRead(): {
+  readonly paused: Promise<void>;
+  readonly release: () => void;
+  readonly restore: () => void;
+} {
+  let releaseGate!: () => void;
+  let markPaused!: () => void;
+  fsReadGate.wait = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const paused = new Promise<void>((resolve) => {
+    markPaused = resolve;
+  });
+  fsReadGate.notifyPaused = () => markPaused();
+  fsReadGate.armed = true;
+  return {
+    paused,
+    release: () => releaseGate(),
+    restore: () => {
+      fsReadGate.armed = false;
+      releaseGate();
+    },
+  };
+}
+
+function deferFirstStateJsonWrite(pathIncludes: string): {
+  readonly paused: Promise<void>;
+  readonly release: () => void;
+  readonly restore: () => void;
+} {
+  let releaseGate!: () => void;
+  let markPaused!: () => void;
+  fsWriteGate.wait = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const paused = new Promise<void>((resolve) => {
+    markPaused = resolve;
+  });
+  fsWriteGate.notifyPaused = () => markPaused();
+  fsWriteGate.pathIncludes = pathIncludes;
+  fsWriteGate.armed = true;
+  return {
+    paused,
+    release: () => releaseGate(),
+    restore: () => {
+      fsWriteGate.armed = false;
+      fsWriteGate.pathIncludes = "";
+      releaseGate();
+    },
+  };
+}
+
+function makeDispatchStep(
+  id: string,
+  status: DispatchTaskCard["status"],
+  patch: Partial<DispatchTaskCard> = {},
+): DispatchTaskCard {
+  return {
+    id,
+    order: 1,
+    title: id,
+    goal: id,
+    kind: "change",
+    isolation: "direct",
+    dependsOn: [],
+    premisesToVerify: [],
+    contextFiles: [],
+    acceptanceCriteria: ["done"],
+    allowedGlobs: [],
+    forbiddenGlobs: [],
+    sensitiveGlobs: [],
+    hardGates: [],
+    executor: { providerInstanceId: "codex" },
+    reviewer: null,
+    status,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...patch,
+  };
+}
+
+function makeDispatchRun(stepId: string, patch: Partial<DispatchStepRun> = {}): DispatchStepRun {
+  return {
+    stepId,
+    isolation: "direct",
+    branchName: "main",
+    baseCommit: "HEAD",
+    baselineTree: null,
+    workspacePath: "",
+    childThreadId: "thr-child",
+    childRunId: null,
+    reviewerThreadIds: [],
+    status: "needs_human_decision",
+    headline: "waiting",
+    lastError: null,
+    premiseFailures: [],
+    diffSummary: null,
+    boundaryAudit: null,
+    hardGate: null,
+    reviews: [],
+    acceptanceReports: [],
+    escalationRounds: 0,
+    reviewRound: 0,
+    acceptanceRound: 0,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...patch,
+  };
+}
+
+function throwingDispatchSubscriber(counter: { count: number }): () => void {
+  return () => {
+    counter.count += 1;
+    throw new Error("subscriber failed");
+  };
+}
+
+function makeEscalation(
+  id: string,
+  stepId: string,
+  patch: Partial<DispatchEscalationRecord> = {},
+): DispatchEscalationRecord {
+  return {
+    id,
+    stepId,
+    kind: "executor_question",
+    status: "open_human",
+    title: "Need a decision",
+    question: "Which approach?",
+    options: [{ id: "A", label: "Continue" }],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...patch,
+  };
+}
+
+async function waitUntil(predicate: () => boolean, label: string): Promise<void> {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > 5000) {
+      throw new Error(`timed out waiting for ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 afterEach(() => {
@@ -124,6 +321,81 @@ describe("VelaDispatchGit", () => {
     expect(NodeFS.existsSync(NodePath.join(repo, "src", "added.ts"))).toBe(false);
     expect(NodeFS.existsSync(NodePath.join(repo, "src", "existing.ts"))).toBe(true);
     expect(NodeFS.existsSync(NodePath.join(repo, ".vela", "dispatch", "state.json"))).toBe(true);
+  });
+
+  it("revertStepSnapshotSafely preserves manual edits & new user notes, 3-way merges non-overlapping edits, and flags conflicts", async () => {
+    const repo = createTempGitRepo();
+    NodeFS.writeFileSync(
+      NodePath.join(repo, "src", "shared.ts"),
+      ["line 1", "line 2", "line 3", "line 4", "line 5", "line 6"].join("\n") + "\n",
+    );
+    NodeFS.writeFileSync(NodePath.join(repo, "src", "other.ts"), "export const other = 1;\n");
+
+    const snap = await captureWorkspaceSnapshot(repo);
+    expect(snap.baselineTree).toBeTruthy();
+
+    // Step modifies shared.ts (line 2) and creates step-added.ts.
+    NodeFS.writeFileSync(
+      NodePath.join(repo, "src", "shared.ts"),
+      ["line 1", "line 2-by-step", "line 3", "line 4", "line 5", "line 6"].join("\n") + "\n",
+    );
+    NodeFS.writeFileSync(NodePath.join(repo, "src", "step-added.ts"), "export const s = 1;\n");
+
+    const deltaWithTree = await inspectWorkspaceDeltaWithTree(repo, snap.baselineTree);
+    expect(deltaWithTree.currentTree).toBeTruthy();
+
+    // User manually edits unrelated other.ts, creates user-note.md, and makes a non-overlapping edit to shared.ts (line 6).
+    NodeFS.writeFileSync(NodePath.join(repo, "src", "other.ts"), "export const other = 999;\n");
+    NodeFS.writeFileSync(NodePath.join(repo, "user-note.md"), "# My Note\n");
+    NodeFS.writeFileSync(
+      NodePath.join(repo, "src", "shared.ts"),
+      ["line 1", "line 2-by-step", "line 3", "line 4", "line 5", "line 6-by-user"].join("\n") +
+        "\n",
+    );
+
+    const safeResult = await revertStepSnapshotSafely(repo, {
+      baselineTree: snap.baselineTree!,
+      completedTree: deltaWithTree.currentTree,
+    });
+    expect(safeResult.conflicts).toEqual([]);
+    expect(safeResult.removedFiles).toEqual(["src/step-added.ts"]);
+    expect(safeResult.mergedFiles).toEqual(["src/shared.ts"]);
+    expect(NodeFS.existsSync(NodePath.join(repo, "src", "step-added.ts"))).toBe(false);
+    // User's unrelated file & new note are completely untouched!
+    expect(NodeFS.readFileSync(NodePath.join(repo, "src", "other.ts"), "utf8")).toBe(
+      "export const other = 999;\n",
+    );
+    expect(NodeFS.readFileSync(NodePath.join(repo, "user-note.md"), "utf8")).toBe("# My Note\n");
+    // Step's line 2 edit was reverted while user's line 6 edit survived via 3-way merge!
+    expect(NodeFS.readFileSync(NodePath.join(repo, "src", "shared.ts"), "utf8")).toBe(
+      ["line 1", "line 2", "line 3", "line 4", "line 5", "line 6-by-user"].join("\n") + "\n",
+    );
+
+    // Now test overlapping conflict: step modifies line 2, then user also modifies line 2 differently.
+    const snap2 = await captureWorkspaceSnapshot(repo);
+    NodeFS.writeFileSync(
+      NodePath.join(repo, "src", "shared.ts"),
+      ["line 1", "line 2-by-step-v2", "line 3", "line 4", "line 5", "line 6-by-user"].join("\n") +
+        "\n",
+    );
+    const delta2 = await inspectWorkspaceDeltaWithTree(repo, snap2.baselineTree);
+    NodeFS.writeFileSync(
+      NodePath.join(repo, "src", "shared.ts"),
+      ["line 1", "line 2-by-user-conflict", "line 3", "line 4", "line 5", "line 6-by-user"].join(
+        "\n",
+      ) + "\n",
+    );
+
+    const conflictResult = await revertStepSnapshotSafely(repo, {
+      baselineTree: snap2.baselineTree!,
+      completedTree: delta2.currentTree,
+    });
+    expect(conflictResult.conflicts).toHaveLength(1);
+    expect(conflictResult.conflicts[0]?.file).toBe("src/shared.ts");
+    // Conflict aborted without clobbering disk!
+    expect(NodeFS.readFileSync(NodePath.join(repo, "src", "shared.ts"), "utf8")).toContain(
+      "line 2-by-user-conflict",
+    );
   });
 
   it("audits allowedGlobs, forbiddenGlobs, and sensitiveGlobs accurately", () => {
@@ -335,6 +607,124 @@ describe("VelaDispatchStore unlockReadySteps & persistence", () => {
     expect(
       JSON.parse(NodeFS.readFileSync(NodePath.join(legacyDir, "state.json"), "utf8")).planTitle,
     ).toBe("Legacy Plan");
+  });
+
+  it("does not let a cold listAllStates scan roll back a newer update", async () => {
+    const repo = createTempGitRepo();
+    const stateDir = createTempStateDir();
+    const seeded = new VelaDispatchStore(stateDir);
+    const step = makeCard("S1", 1, "ready");
+    await seeded.update(repo, (curr) => ({
+      ...curr,
+      planTitle: "stale-title",
+      steps: [step],
+    }));
+
+    const store = new VelaDispatchStore(stateDir);
+    const disk = deferFirstStateJsonRead();
+    try {
+      const listed = store.listAllStates();
+      await Promise.race([
+        disk.paused,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("listAllStates disk read was not deferred")), 2000),
+        ),
+      ]);
+      await store.update(repo, (curr) => ({
+        ...curr,
+        planTitle: "fresh-title",
+        steps: curr.steps.length > 0 ? curr.steps : [step],
+      }));
+      disk.release();
+      const states = await listed;
+      expect(states.find((state) => state.projectRoot === repo)?.planTitle).toBe("fresh-title");
+
+      const next = await store.update(repo, (curr) => ({
+        ...curr,
+        planTitle: curr.planTitle === "fresh-title" ? "fresher-title" : "rolled-back",
+      }));
+      expect(next.planTitle).toBe("fresher-title");
+      const persisted = JSON.parse(
+        NodeFS.readFileSync(dispatchStateFileOf(repo, stateDir), "utf8"),
+      ) as { planTitle?: string };
+      expect(persisted.planTitle).toBe("fresher-title");
+    } finally {
+      disk.release();
+      disk.restore();
+    }
+  });
+
+  it("does not let a cold read roll back a newer update into the cache", async () => {
+    const repo = createTempGitRepo();
+    const stateDir = createTempStateDir();
+    const seeded = new VelaDispatchStore(stateDir);
+    await seeded.update(repo, (curr) => ({ ...curr, planTitle: "stale-title" }));
+
+    const store = new VelaDispatchStore(stateDir);
+    const disk = deferFirstStateJsonRead();
+    try {
+      const reading = store.read(repo);
+      await Promise.race([
+        disk.paused,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("read disk read was not deferred")), 2000),
+        ),
+      ]);
+      await store.update(repo, (curr) => ({ ...curr, planTitle: "fresh-title" }));
+      disk.release();
+      expect((await reading).planTitle).toBe("fresh-title");
+
+      const next = await store.update(repo, (curr) => ({
+        ...curr,
+        planTitle: curr.planTitle === "fresh-title" ? "fresher-title" : "rolled-back",
+      }));
+      expect(next.planTitle).toBe("fresher-title");
+      const persisted = JSON.parse(
+        NodeFS.readFileSync(dispatchStateFileOf(repo, stateDir), "utf8"),
+      ) as { planTitle?: string };
+      expect(persisted.planTitle).toBe("fresher-title");
+    } finally {
+      disk.release();
+      disk.restore();
+    }
+  });
+
+  it("keys a project-level state file without its legacy parentThreadId so a clear wins the scan", async () => {
+    const repo = createTempGitRepo();
+    const stateDir = createTempStateDir();
+    const seeded = new VelaDispatchStore(stateDir);
+    await seeded.update(repo, (curr) => ({
+      ...curr,
+      parentThreadId: "legacy-thread",
+      planTitle: "legacy-project-plan",
+      steps: [makeCard("S1", 1, "ready")],
+    }));
+
+    const store = new VelaDispatchStore(stateDir);
+    const disk = deferFirstStateJsonRead();
+    try {
+      const listed = store.listAllStates();
+      await Promise.race([
+        disk.paused,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("project scan was not deferred")), 2000),
+        ),
+      ]);
+      await store.update(repo, (curr) => ({
+        ...curr,
+        steps: [],
+        escalations: [],
+        runs: {},
+        planTitle: null,
+      }));
+      disk.release();
+      const states = await listed;
+      expect(states.filter((state) => state.projectRoot === repo)).toEqual([]);
+      expect(states.some((state) => state.steps.some((step) => step.id === "S1"))).toBe(false);
+    } finally {
+      disk.release();
+      disk.restore();
+    }
   });
 });
 
@@ -555,6 +945,11 @@ function makeDispatchTestLayer(
     readonly providers?: ReadonlyArray<ServerProvider> | undefined;
     readonly onSendToThread?: ((text: string) => void) | undefined;
     readonly onLaunch?: ((input: ThreadLaunchService.ThreadLaunchInput) => void) | undefined;
+    readonly onProjectLookup?: (() => void) | undefined;
+    readonly onDeferredProvider?: (() => void) | undefined;
+    readonly providerGate?: Promise<void> | undefined;
+    readonly launchGate?: Promise<void> | undefined;
+    readonly holdBackground?: Promise<void> | undefined;
     readonly getThreadProjection?:
       | ((threadId: ThreadId) => OrchestrationV2ThreadProjection | null)
       | undefined;
@@ -562,6 +957,8 @@ function makeDispatchTestLayer(
 ) {
   const stateDir = options?.stateDir ?? createTempStateDir();
   let childSeq = 0;
+  let providerReads = 0;
+  const providerGate = options?.providerGate;
   const mockProject: Project = {
     id: ProjectId.make("proj-dispatch-test"),
     title: "Dispatch Test",
@@ -619,10 +1016,23 @@ function makeDispatchTestLayer(
             } as unknown as Effect.Success<
               ReturnType<ThreadManagementService.ThreadManagementService["Service"]["waitForThread"]>
             >),
-          ...(options?.onSendToThread
+          ...(options?.onSendToThread || options?.holdBackground
             ? {
                 sendToThread: (input) => {
-                  options.onSendToThread?.(input.text);
+                  options?.onSendToThread?.(input.text);
+                  if (options?.holdBackground) {
+                    const held = options.holdBackground;
+                    return Effect.promise(async () => {
+                      await held;
+                      return {
+                        run: { id: RunId.make("run-held") },
+                      } as unknown as Effect.Success<
+                        ReturnType<
+                          ThreadManagementService.ThreadManagementService["Service"]["sendToThread"]
+                        >
+                      >;
+                    });
+                  }
                   return Effect.fail(
                     new ThreadManagementService.ThreadManagementThreadNotFoundError({
                       projectId: input.projectId,
@@ -636,30 +1046,44 @@ function makeDispatchTestLayer(
         Layer.mock(ThreadLaunchService.ThreadLaunchService)(
           options?.onLaunch
             ? {
-                launch: (launchInput) => {
-                  options.onLaunch?.(launchInput);
-                  childSeq += 1;
-                  const childThreadId = ThreadId.make(`thr-child-${childSeq}`);
-                  const childRunId = RunId.make(`run-child-${childSeq}`);
-                  return Effect.succeed({
-                    threadId: childThreadId,
-                    resumed: false,
-                    projection: {
-                      thread: { id: childThreadId, worktreePath: null },
-                      runs: [{ id: childRunId, status: "completed" }],
-                      messages: [],
-                      turnItems: [],
-                    },
-                  } as unknown as ThreadLaunchService.ThreadLaunchResult);
-                },
+                launch: (launchInput) =>
+                  Effect.promise(async () => {
+                    options.onLaunch?.(launchInput);
+                    if (options.launchGate) await options.launchGate;
+                    childSeq += 1;
+                    const childThreadId = ThreadId.make(`thr-child-${childSeq}`);
+                    const childRunId = RunId.make(`run-child-${childSeq}`);
+                    return {
+                      threadId: childThreadId,
+                      resumed: false,
+                      projection: {
+                        thread: { id: childThreadId, worktreePath: null },
+                        runs: [{ id: childRunId, status: "completed" }],
+                        messages: [],
+                        turnItems: [],
+                      },
+                    } as unknown as ThreadLaunchService.ThreadLaunchResult;
+                  }),
               }
             : {},
         ),
         Layer.mock(ProjectService.ProjectService)({
-          getByWorkspaceRoot: () => Effect.succeedSome(mockProject),
+          getByWorkspaceRoot: () => {
+            options?.onProjectLookup?.();
+            return Effect.succeedSome(mockProject);
+          },
         }),
         Layer.mock(ProviderRegistry.ProviderRegistry)({
-          getProviders: Effect.succeed(options?.providers ?? []),
+          getProviders: providerGate
+            ? Effect.promise(async () => {
+                providerReads += 1;
+                if (providerReads > 1) {
+                  options?.onDeferredProvider?.();
+                  await providerGate;
+                }
+                return options?.providers ?? [];
+              })
+            : Effect.succeed(options?.providers ?? []),
         }),
       ),
     ),
@@ -839,12 +1263,51 @@ describe("VelaDispatchService", () => {
           threadId: "thr-draft-client",
           requirement: "Check why npm test fails",
           mode: "fast",
+          enableBatchAudit: true,
           deliver: "client",
         });
       }).pipe(Effect.provide(layer));
 
       expect(clientRes.ok).toBe(true);
       expect(clientRes.prompt).toContain("Check why npm test fails");
+      expect(clientRes.prompt).toContain("enableBatchAudit: true");
+      const kickoffState = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        return yield* service.getState(repo, "thr-draft-client");
+      }).pipe(Effect.provide(layer));
+      expect(kickoffState.config.enableBatchAudit).toBe(true);
+    }),
+  );
+
+  itEffect.effect("keeps legacy review targets when applying a new default executor", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const threadId = "thread:legacy-review-config";
+      const reviewer = { providerInstanceId: "codex", model: "existing-reviewer" };
+      const defaultAgent = { providerInstanceId: "codex", model: "new-default" };
+      const updated = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId,
+          steps: [
+            {
+              id: "S1",
+              title: "Change",
+              goal: "Make a change",
+              acceptanceCriteria: ["Works"],
+              reviewer,
+            },
+          ],
+        });
+        return yield* service.updateConfig({
+          projectRoot: repo,
+          threadId,
+          defaultAgent,
+          applyToPendingSteps: true,
+        });
+      }).pipe(Effect.provide(makeDispatchTestLayer(repo)));
+      expect(updated.steps[0]).toMatchObject({ executor: defaultAgent, reviewer });
     }),
   );
 
@@ -1538,5 +2001,1178 @@ describe("VelaDispatchService", () => {
         expect(s2?.status).toBe("ready_to_accept");
         expect(settled.runs.S2?.deliverable?.text).toContain("重启前已完成排查");
       }),
+  );
+
+  itEffect.effect("lists cross-project dispatch attention items with blocked downstream steps", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const stateDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "vela-attn-state-"));
+
+      // Pre-populate a ready_to_accept step on disk for thr-attn-1 (tests disk discovery)
+      const preStore = new VelaDispatchStore(stateDir);
+      yield* Effect.promise(() =>
+        preStore.update(
+          { projectRoot: repo, threadId: "thr-attn-1" },
+          (curr) => ({
+            ...curr,
+            planTitle: "导出重构计划",
+            steps: [
+              {
+                id: "S1",
+                order: 1,
+                title: "调研编码兼容",
+                goal: "检查 BOM 与 UTF-8",
+                kind: "research",
+                isolation: "direct",
+                dependsOn: [],
+                premisesToVerify: [],
+                contextFiles: [],
+                acceptanceCriteria: [],
+                allowedGlobs: [],
+                forbiddenGlobs: [],
+                sensitiveGlobs: [],
+                hardGates: [],
+                executor: { providerInstanceId: "codex" },
+                status: "ready_to_accept",
+                createdAt: "2026-01-01T00:00:00.000Z",
+                updatedAt: "2026-01-01T00:01:00.000Z",
+              },
+              {
+                id: "S2",
+                order: 2,
+                title: "实现导出修复",
+                goal: "写入导出补丁",
+                kind: "change",
+                isolation: "direct",
+                dependsOn: ["S1"],
+                premisesToVerify: [],
+                contextFiles: [],
+                acceptanceCriteria: ["导出正常"],
+                allowedGlobs: [],
+                forbiddenGlobs: [],
+                sensitiveGlobs: [],
+                hardGates: [],
+                executor: { providerInstanceId: "codex" },
+                status: "locked",
+                createdAt: "2026-01-01T00:00:00.000Z",
+                updatedAt: "2026-01-01T00:00:00.000Z",
+              },
+            ],
+          }),
+        ),
+      );
+
+      const layer = makeDispatchTestLayer(repo, {
+        stateDir,
+        activeShell: true,
+      });
+
+      const items = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-attn-2",
+          parentThreadId: "thr-attn-2",
+          planTitle: "重试策略方案",
+          steps: [
+            {
+              id: "D1",
+              title: "选择重试策略",
+              goal: "确认指数退避还是固定间隔",
+              kind: "decision",
+              dependsOn: [],
+              decisionOptions: [
+                { id: "A", label: "指数退避" },
+                { id: "B", label: "固定间隔" },
+              ],
+            },
+            {
+              id: "D2",
+              title: "接入支付重试",
+              goal: "按所选策略改造",
+              kind: "change",
+              dependsOn: ["D1"],
+              acceptanceCriteria: ["重试生效"],
+            },
+          ],
+        });
+        return yield* service.listAttentionItems();
+      }).pipe(Effect.provide(layer));
+
+      expect(items).toHaveLength(2);
+      const acceptItem = items.find((item) => item.stepId === "S1");
+      expect(acceptItem).toMatchObject({
+        kind: "accept",
+        threadId: "thr-attn-1",
+        stepTitle: "调研编码兼容",
+        blockedStepTitles: ["S2 实现导出修复"],
+      });
+
+      const decisionItem = items.find((item) => item.stepId === "D1");
+      expect(decisionItem).toMatchObject({
+        kind: "decision",
+        threadId: "thr-attn-2",
+        stepTitle: "选择重试策略",
+        blockedStepTitles: ["D2 接入支付重试"],
+      });
+    }),
+  );
+
+  itEffect.effect("admits only one launch when the same step is started twice", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const launches: ThreadLaunchService.ThreadLaunchInput[] = [];
+      let releaseProviders!: () => void;
+      const providerGate = new Promise<void>((resolve) => {
+        releaseProviders = resolve;
+      });
+      let releaseLaunch!: () => void;
+      const launchGate = new Promise<void>((resolve) => {
+        releaseLaunch = resolve;
+      });
+      let deferredProviders = 0;
+      let lookups = 0;
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        providerGate,
+        launchGate,
+        onDeferredProvider: () => {
+          deferredProviders += 1;
+        },
+        onProjectLookup: () => {
+          lookups += 1;
+        },
+        onLaunch: (input) => {
+          launches.push(input);
+        },
+      });
+
+      const outcome = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-dup-launch",
+          parentThreadId: "thr-dup-launch",
+          steps: [
+            {
+              id: "S1",
+              title: "Inspect once",
+              goal: "Read the tree",
+              kind: "research",
+              dependsOn: [],
+              reviewer: null,
+            },
+          ],
+        });
+
+        const firstFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-dup-launch",
+            parentThreadId: "thr-dup-launch",
+            stepId: "S1",
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => deferredProviders >= 1, "first admission"));
+        const secondFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-dup-launch",
+            parentThreadId: "thr-dup-launch",
+            stepId: "S1",
+          })
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => lookups >= 3, "second lookup"));
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 0)));
+        expect(deferredProviders).toBe(1);
+        releaseProviders();
+
+        const first = yield* Fiber.join(firstFiber);
+        const secondError = yield* Fiber.join(secondFiber);
+        yield* Effect.promise(() => waitUntil(() => launches.length >= 1, "child launch"));
+        expect(launches).toHaveLength(1);
+        return { first, secondError };
+      }).pipe(Effect.provide(layer));
+
+      releaseLaunch();
+      expect(outcome.secondError.message).toContain("正在运行中");
+      expect(outcome.first.steps.find((step) => step.id === "S1")?.status).toBe("running");
+    }),
+  );
+
+  itEffect.effect("upgrades an overlapping direct-write step to a worktree instead of a second writer", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const launches: ThreadLaunchService.ThreadLaunchInput[] = [];
+      let releaseProviders!: () => void;
+      const providerGate = new Promise<void>((resolve) => {
+        releaseProviders = resolve;
+      });
+      let releaseLaunch!: () => void;
+      const launchGate = new Promise<void>((resolve) => {
+        releaseLaunch = resolve;
+      });
+      let deferredProviders = 0;
+      let lookups = 0;
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        providerGate,
+        launchGate,
+        onDeferredProvider: () => {
+          deferredProviders += 1;
+        },
+        onProjectLookup: () => {
+          lookups += 1;
+        },
+        onLaunch: (input) => {
+          launches.push(input);
+        },
+      });
+
+      const outcome = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-direct-race",
+          parentThreadId: "thr-direct-race",
+          steps: [
+            {
+              id: "S1",
+              title: "Edit A",
+              goal: "Change A",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["A updated"],
+              executor: { providerInstanceId: "codex" },
+            },
+            {
+              id: "S2",
+              title: "Edit B",
+              goal: "Change B",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["B updated"],
+              executor: { providerInstanceId: "codex" },
+            },
+          ],
+        });
+
+        const firstFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-direct-race",
+            parentThreadId: "thr-direct-race",
+            stepId: "S1",
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => deferredProviders >= 1, "first direct admission"));
+        const secondFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-direct-race",
+            parentThreadId: "thr-direct-race",
+            stepId: "S2",
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => lookups >= 3, "second direct lookup"));
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 0)));
+        expect(deferredProviders).toBe(1);
+        releaseProviders();
+
+        const first = yield* Fiber.join(firstFiber);
+        const second = yield* Fiber.join(secondFiber);
+        yield* Effect.promise(() => waitUntil(() => launches.length >= 2, "both child launches"));
+        return { first, second };
+      }).pipe(Effect.provide(layer));
+
+      const strategies = launches.map((launch) => launch.workspaceStrategy?.type).toSorted();
+      expect(strategies).toEqual(["root", "worktree"]);
+      expect(outcome.first.runs.S1?.isolation).toBe("direct");
+      expect(outcome.second.runs.S2?.isolation).toBe("worktree");
+      expect(
+        launches.filter((launch) => launch.workspaceStrategy?.type === "root"),
+      ).toHaveLength(1);
+      releaseLaunch();
+    }),
+  );
+
+  itEffect.effect("rejects a second self direct-write while another direct step is being admitted", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const sends: string[] = [];
+      let releaseProviders!: () => void;
+      const providerGate = new Promise<void>((resolve) => {
+        releaseProviders = resolve;
+      });
+      let releaseHold!: () => void;
+      const holdBackground = new Promise<void>((resolve) => {
+        releaseHold = resolve;
+      });
+      let deferredProviders = 0;
+      let lookups = 0;
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        providerGate,
+        holdBackground,
+        onDeferredProvider: () => {
+          deferredProviders += 1;
+        },
+        onProjectLookup: () => {
+          lookups += 1;
+        },
+        onSendToThread: (text) => {
+          sends.push(text);
+        },
+      });
+
+      const outcome = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-self-race",
+          parentThreadId: "thr-self-race",
+          steps: [
+            {
+              id: "S1",
+              title: "Self A",
+              goal: "Edit A in the current chat",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["A updated"],
+              executor: "self",
+            },
+            {
+              id: "S2",
+              title: "Self B",
+              goal: "Edit B in the current chat",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["B updated"],
+              executor: "self",
+            },
+          ],
+        });
+
+        const firstFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-self-race",
+            parentThreadId: "thr-self-race",
+            stepId: "S1",
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => deferredProviders >= 1, "first self admission"));
+        const secondFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-self-race",
+            parentThreadId: "thr-self-race",
+            stepId: "S2",
+          })
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => lookups >= 3, "second self lookup"));
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 0)));
+        expect(deferredProviders).toBe(1);
+        releaseProviders();
+
+        const first = yield* Fiber.join(firstFiber);
+        const secondError = yield* Fiber.join(secondFiber);
+        yield* Effect.promise(() => waitUntil(() => sends.length >= 1, "self send"));
+        return { first, secondError };
+      }).pipe(Effect.provide(layer));
+
+      expect(outcome.secondError.message).toContain("当前分支直写已有 S1 运行中");
+      expect(outcome.first.runs.S1?.isolation).toBe("direct");
+      expect(sends).toHaveLength(1);
+      releaseHold();
+    }),
+  );
+
+  itEffect.effect("sends one continuation when replyEscalation resumes overlap", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const stateDir = createTempStateDir();
+      const threadId = "thr-reply-dup";
+      const seed = new VelaDispatchStore(stateDir);
+      yield* Effect.promise(() =>
+        seed.update({ projectRoot: repo, threadId }, (curr) => ({
+          ...curr,
+          parentThreadId: threadId,
+          steps: [makeDispatchStep("S1", "needs_human_decision")],
+          runs: { S1: makeDispatchRun("S1", { workspacePath: repo, childThreadId: "thr-child-s1" }) },
+          escalations: [makeEscalation("ESC-1", "S1")],
+        })),
+      );
+      const sends: string[] = [];
+      let releaseHold!: () => void;
+      const holdBackground = new Promise<void>((resolve) => {
+        releaseHold = resolve;
+      });
+      let lookups = 0;
+      const disk = deferFirstStateJsonWrite(stateDir);
+      const layer = makeDispatchTestLayer(repo, {
+        stateDir,
+        activeShell: true,
+        holdBackground,
+        onProjectLookup: () => {
+          lookups += 1;
+        },
+        onSendToThread: (text) => {
+          sends.push(text);
+        },
+      });
+
+      const outcome = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        const reply = {
+          projectRoot: repo,
+          threadId,
+          escalationId: "ESC-1",
+          decision: "Continue with the patch",
+          resolvedBy: "human" as const,
+        };
+        const firstFiber = yield* service.replyEscalation(reply).pipe(Effect.forkChild);
+        yield* Effect.promise(() =>
+          Promise.race([
+            disk.paused,
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("reply write was not deferred")), 2000),
+            ),
+          ]),
+        );
+        const secondFiber = yield* service
+          .replyEscalation(reply)
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => lookups >= 2, "second reply lookup"));
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 0)));
+        expect(sends).toHaveLength(0);
+        disk.release();
+        const first = yield* Fiber.join(firstFiber);
+        const secondError = yield* Fiber.join(secondFiber);
+        yield* Effect.promise(() => waitUntil(() => sends.length >= 1, "reply send"));
+        yield* service.clearPlan(repo, threadId);
+        return { first, secondError };
+      }).pipe(Effect.provide(layer));
+
+      expect(outcome.secondError.message).toMatch(/正在运行中|已处理/);
+      expect(outcome.first.steps.find((step) => step.id === "S1")?.status).toBe("running");
+      expect(sends).toHaveLength(1);
+      releaseHold();
+      disk.restore();
+    }),
+  );
+
+  itEffect.effect("sends one repair when failed submitAcceptance calls overlap", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const stateDir = createTempStateDir();
+      const threadId = "thr-accept-dup";
+      const seed = new VelaDispatchStore(stateDir);
+      yield* Effect.promise(() =>
+        seed.update({ projectRoot: repo, threadId }, (curr) => ({
+          ...curr,
+          parentThreadId: threadId,
+          steps: [makeDispatchStep("S1", "awaiting_product_acceptance")],
+          runs: {
+            S1: makeDispatchRun("S1", {
+              workspacePath: repo,
+              childThreadId: "thr-child-s1",
+              status: "awaiting_product_acceptance",
+              acceptanceRound: 0,
+            }),
+          },
+        })),
+      );
+      const sends: string[] = [];
+      let releaseHold!: () => void;
+      const holdBackground = new Promise<void>((resolve) => {
+        releaseHold = resolve;
+      });
+      let lookups = 0;
+      const disk = deferFirstStateJsonWrite(stateDir);
+      const layer = makeDispatchTestLayer(repo, {
+        stateDir,
+        activeShell: true,
+        holdBackground,
+        onProjectLookup: () => {
+          lookups += 1;
+        },
+        onSendToThread: (text) => {
+          sends.push(text);
+        },
+      });
+      const acceptance = {
+        projectRoot: repo,
+        threadId,
+        stepId: "S1",
+        summary: "Export is still broken",
+        items: [{ criterion: "done", status: "failed" as const, reason: "missing export" }],
+      };
+
+      const outcome = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        const firstFiber = yield* service.submitAcceptance(acceptance).pipe(Effect.forkChild);
+        yield* Effect.promise(() =>
+          Promise.race([
+            disk.paused,
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("acceptance write was not deferred")), 2000),
+            ),
+          ]),
+        );
+        const secondFiber = yield* service
+          .submitAcceptance(acceptance)
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => lookups >= 2, "second acceptance lookup"));
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 0)));
+        expect(sends).toHaveLength(0);
+        disk.release();
+        const first = yield* Fiber.join(firstFiber);
+        const secondError = yield* Fiber.join(secondFiber);
+        yield* Effect.promise(() => waitUntil(() => sends.length >= 1, "acceptance send"));
+        yield* service.clearPlan(repo, threadId);
+        return { first, secondError };
+      }).pipe(Effect.provide(layer));
+
+      expect(outcome.secondError.message).toContain("正在运行中");
+      expect(outcome.first.steps.find((step) => step.id === "S1")?.status).toBe(
+        "fixing_acceptance",
+      );
+      expect(sends).toHaveLength(1);
+      releaseHold();
+      disk.restore();
+    }),
+  );
+
+  itEffect.effect("rejects a direct escalation resume and acceptance repair while another direct step is active", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const stateDir = createTempStateDir();
+      const threadId = "thr-direct-busy";
+      const seed = new VelaDispatchStore(stateDir);
+      yield* Effect.promise(() =>
+        seed.update({ projectRoot: repo, threadId }, (curr) => ({
+          ...curr,
+          parentThreadId: threadId,
+          steps: [
+            makeDispatchStep("S1", "running"),
+            makeDispatchStep("S2", "needs_human_decision", { order: 2 }),
+            makeDispatchStep("S3", "awaiting_product_acceptance", { order: 3 }),
+          ],
+          runs: {
+            S1: makeDispatchRun("S1", { workspacePath: repo, status: "running", childThreadId: "thr-s1" }),
+            S2: makeDispatchRun("S2", {
+              workspacePath: repo,
+              status: "needs_human_decision",
+              childThreadId: "thr-s2",
+            }),
+            S3: makeDispatchRun("S3", {
+              workspacePath: repo,
+              status: "awaiting_product_acceptance",
+              childThreadId: "thr-s3",
+              acceptanceRound: 0,
+            }),
+          },
+          escalations: [makeEscalation("ESC-2", "S2")],
+        })),
+      );
+      const sends: string[] = [];
+      const layer = makeDispatchTestLayer(repo, {
+        stateDir,
+        activeShell: true,
+        onSendToThread: (text) => {
+          sends.push(text);
+        },
+      });
+
+      const result = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        const replyError = yield* service
+          .replyEscalation({
+            projectRoot: repo,
+            threadId,
+            escalationId: "ESC-2",
+            decision: "Keep going",
+            resolvedBy: "orchestrator",
+          })
+          .pipe(Effect.flip);
+        const acceptanceError = yield* service
+          .submitAcceptance({
+            projectRoot: repo,
+            threadId,
+            stepId: "S3",
+            summary: "Still failing",
+            items: [{ criterion: "done", status: "failed", reason: "not fixed" }],
+          })
+          .pipe(Effect.flip);
+        const state = yield* Effect.promise(() =>
+          new VelaDispatchStore(stateDir).read({ projectRoot: repo, threadId }),
+        );
+        return { replyError, acceptanceError, state };
+      }).pipe(Effect.provide(layer));
+
+      expect(result.replyError.message).toContain("当前分支直写已有 S1 运行中");
+      expect(result.acceptanceError.message).toContain("当前分支直写已有 S1 运行中");
+      expect(result.state.steps.find((step) => step.id === "S2")?.status).toBe(
+        "needs_human_decision",
+      );
+      expect(result.state.steps.find((step) => step.id === "S3")?.status).toBe(
+        "awaiting_product_acceptance",
+      );
+      expect(sends).toHaveLength(0);
+    }),
+  );
+
+  itEffect.effect("does not leave a step running when replyEscalation has no child thread", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const stateDir = createTempStateDir();
+      const threadId = "thr-reply-orphan";
+      const seed = new VelaDispatchStore(stateDir);
+      yield* Effect.promise(() =>
+        seed.update({ projectRoot: repo, threadId }, (curr) => ({
+          ...curr,
+          parentThreadId: threadId,
+          steps: [makeDispatchStep("S1", "needs_human_decision")],
+          runs: {
+            S1: makeDispatchRun("S1", {
+              workspacePath: repo,
+              childThreadId: null,
+              status: "needs_human_decision",
+            }),
+          },
+          escalations: [makeEscalation("ESC-orphan", "S1")],
+        })),
+      );
+      const layer = makeDispatchTestLayer(repo, { stateDir, activeShell: true });
+      const state = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        return yield* service.replyEscalation({
+          projectRoot: repo,
+          threadId,
+          escalationId: "ESC-orphan",
+          decision: "Restart it",
+          resolvedBy: "human",
+        });
+      }).pipe(Effect.provide(layer));
+
+      expect(state.steps.find((step) => step.id === "S1")?.status).toBe("ready");
+      expect(state.runs.S1?.status).toBe("ready");
+      expect(state.escalations.find((esc) => esc.id === "ESC-orphan")?.status).toBe("resolved");
+    }),
+  );
+
+  itEffect.effect("does not resurrect a step when clearPlan overlaps launch preparation", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const launches: ThreadLaunchService.ThreadLaunchInput[] = [];
+      let releaseProviders!: () => void;
+      const providerGate = new Promise<void>((resolve) => {
+        releaseProviders = resolve;
+      });
+      let releaseLaunch!: () => void;
+      const launchGate = new Promise<void>((resolve) => {
+        releaseLaunch = resolve;
+      });
+      let deferredProviders = 0;
+      let cleared = false;
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        providerGate,
+        launchGate,
+        onDeferredProvider: () => {
+          deferredProviders += 1;
+        },
+        onLaunch: (input) => {
+          launches.push(input);
+        },
+      });
+
+      const finalState = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-clear-race",
+          parentThreadId: "thr-clear-race",
+          steps: [
+            {
+              id: "S1",
+              title: "Inspect",
+              goal: "Read",
+              kind: "research",
+              dependsOn: [],
+              reviewer: null,
+            },
+          ],
+        });
+        const launchFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-clear-race",
+            parentThreadId: "thr-clear-race",
+            stepId: "S1",
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => deferredProviders >= 1, "paused launch"));
+        const clearFiber = yield* service
+          .clearPlan(repo, "thr-clear-race")
+          .pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                cleared = true;
+              }),
+            ),
+            Effect.forkChild,
+          );
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 40)));
+        expect(cleared).toBe(false);
+        releaseProviders();
+        yield* Fiber.join(launchFiber);
+        yield* Fiber.join(clearFiber);
+        return yield* service.getState(repo, "thr-clear-race");
+      }).pipe(Effect.provide(layer));
+
+      expect(finalState.steps).toEqual([]);
+      expect(finalState.runs).toEqual({});
+      releaseLaunch();
+      expect(launches.length).toBeLessThanOrEqual(1);
+    }),
+  );
+
+  itEffect.effect("keeps a sibling running when completeSelfStep finishes its hard gate", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const started = NodePath.join(repo, "gate-started");
+      const release = NodePath.join(repo, "gate-release");
+      const command = `touch ${JSON.stringify(started)} && while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done`;
+      let releaseLaunch!: () => void;
+      const launchGate = new Promise<void>((resolve) => {
+        releaseLaunch = resolve;
+      });
+      const launches: string[] = [];
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        launchGate,
+        onLaunch: (input) => {
+          launches.push(input.title);
+        },
+      });
+
+      const state = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-self-sibling",
+          parentThreadId: "thr-self-sibling",
+          steps: [
+            {
+              id: "S1",
+              title: "Self edit",
+              goal: "Finish the local edit",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["done"],
+              executor: "self",
+              hardGates: [command],
+            },
+            {
+              id: "S2",
+              title: "Sibling research",
+              goal: "Look around",
+              kind: "research",
+              dependsOn: [],
+              reviewer: null,
+            },
+          ],
+        });
+        const selfFiber = yield* service
+          .completeSelfStep({
+            projectRoot: repo,
+            threadId: "thr-self-sibling",
+            stepId: "S1",
+            summary: "Finished locally",
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() =>
+          waitUntil(() => NodeFS.existsSync(started), "hard gate started"),
+        );
+        yield* service.dispatchStep({
+          projectRoot: repo,
+          threadId: "thr-self-sibling",
+          parentThreadId: "thr-self-sibling",
+          stepId: "S2",
+        });
+        NodeFS.writeFileSync(release, "go\n");
+        const completed = yield* Fiber.join(selfFiber);
+        return completed;
+      }).pipe(Effect.provide(layer));
+
+      expect(state.steps.find((step) => step.id === "S1")?.status).toBe("done");
+      expect(state.steps.find((step) => step.id === "S2")?.status).toBe("running");
+      expect(launches).toHaveLength(1);
+      releaseLaunch();
+    }),
+  );
+
+  itEffect.effect("still launches a step when a dispatch subscriber throws", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const launches: string[] = [];
+      let releaseLaunch!: () => void;
+      const launchGate = new Promise<void>((resolve) => {
+        releaseLaunch = resolve;
+      });
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        launchGate,
+        onLaunch: (input) => {
+          launches.push(input.title);
+        },
+      });
+
+      const subscriberThrows = { count: 0 };
+      const state = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        const unsubscribe = service.subscribe(
+          repo,
+          throwingDispatchSubscriber(subscriberThrows),
+          "thr-subscriber",
+        );
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-subscriber",
+          parentThreadId: "thr-subscriber",
+          steps: [
+            {
+              id: "S1",
+              title: "Inspect",
+              goal: "Read",
+              kind: "research",
+              dependsOn: [],
+              reviewer: null,
+            },
+          ],
+        });
+        const launched = yield* service.dispatchStep({
+          projectRoot: repo,
+          threadId: "thr-subscriber",
+          parentThreadId: "thr-subscriber",
+          stepId: "S1",
+        });
+        unsubscribe();
+        expect(subscriberThrows.count).toBeGreaterThan(0);
+        return launched;
+      }).pipe(Effect.provide(layer));
+
+      expect(state.steps.find((step) => step.id === "S1")?.status).toBe("running");
+      expect(launches).toHaveLength(1);
+      releaseLaunch();
+    }),
+  );
+
+  itEffect.effect("project clearPlan leaves a thread-scoped direct run reserved", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      let releaseLaunch!: () => void;
+      const launchGate = new Promise<void>((resolve) => {
+        releaseLaunch = resolve;
+      });
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        launchGate,
+        onLaunch: () => {},
+      });
+
+      const result = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-keep",
+          parentThreadId: "thr-keep",
+          steps: [
+            {
+              id: "S1",
+              title: "Thread edit",
+              goal: "Edit in this thread",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["done"],
+              executor: { providerInstanceId: "codex" },
+              reviewer: null,
+            },
+          ],
+        });
+        const running = yield* service.dispatchStep({
+          projectRoot: repo,
+          threadId: "thr-keep",
+          parentThreadId: "thr-keep",
+          stepId: "S1",
+        });
+        yield* service.clearPlan(repo);
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId: "thr-other",
+          parentThreadId: "thr-other",
+          steps: [
+            {
+              id: "S1",
+              title: "Other self edit",
+              goal: "Edit in another thread",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["done"],
+              executor: "self",
+            },
+          ],
+        });
+        const blocked = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId: "thr-other",
+            parentThreadId: "thr-other",
+            stepId: "S1",
+          })
+          .pipe(Effect.flip);
+        const kept = yield* service.getState(repo, "thr-keep");
+        return { running, blocked, kept };
+      }).pipe(Effect.provide(layer));
+
+      expect(result.running.runs.S1?.isolation).toBe("direct");
+      expect(result.blocked.message).toContain("同一工作区另一对话正在执行当前分支直写");
+      expect(result.kept.steps.find((step) => step.id === "S1")?.status).toBe("running");
+      releaseLaunch();
+    }),
+  );
+
+  itEffect.effect("does not append a ghost escalation when clearPlan aborts a hard gate", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const stateDir = createTempStateDir();
+      const threadId = "thr-gate-clear";
+      const started = NodePath.join(repo, "gate-started");
+      const release = NodePath.join(repo, "gate-release");
+      const command = `touch ${JSON.stringify(started)} && while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done`;
+      const layer = makeDispatchTestLayer(repo, {
+        stateDir,
+        activeShell: true,
+        onLaunch: () => {},
+        getThreadProjection: () => null,
+      });
+
+      yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId,
+          parentThreadId: threadId,
+          steps: [
+            {
+              id: "S1",
+              title: "Gated edit",
+              goal: "Run a gate",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["done"],
+              hardGates: [command],
+              reviewer: null,
+            },
+          ],
+        });
+        yield* service.dispatchStep({
+          projectRoot: repo,
+          threadId,
+          parentThreadId: threadId,
+          stepId: "S1",
+        });
+        yield* Effect.promise(() => waitUntil(() => NodeFS.existsSync(started), "hard gate started"));
+        const cleared = yield* service.clearPlan(repo, threadId);
+        NodeFS.writeFileSync(release, "go\n");
+        expect(cleared.steps).toEqual([]);
+        expect(cleared.escalations).toEqual([]);
+        yield* Effect.promise(async () => {
+          for (let attempt = 0; attempt < 40; attempt += 1) {
+            const state = await new VelaDispatchStore(stateDir).read({
+              projectRoot: repo,
+              threadId,
+            });
+            if (state.escalations.length > 0) {
+              throw new Error(`ghost escalation: ${state.escalations.map((e) => e.kind).join(",")}`);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 40));
+          }
+        });
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  itEffect.effect("does not apply a stale self-complete onto a replacement plan", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const threadId = "thr-replace-self";
+      const started = NodePath.join(repo, "gate-started-self");
+      const release = NodePath.join(repo, "gate-release-self");
+      const command = `touch ${JSON.stringify(started)} && while [ ! -f ${JSON.stringify(release)} ]; do sleep 0.05; done`;
+      const layer = makeDispatchTestLayer(repo, { activeShell: true });
+
+      const result = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId,
+          parentThreadId: threadId,
+          planTitle: "Old plan",
+          steps: [
+            {
+              id: "S1",
+              title: "Old card",
+              goal: "Old goal",
+              kind: "change",
+              isolation: "direct",
+              dependsOn: [],
+              acceptanceCriteria: ["done"],
+              executor: "self",
+              hardGates: [command],
+            },
+          ],
+        });
+        const selfFiber = yield* service
+          .completeSelfStep({
+            projectRoot: repo,
+            threadId,
+            stepId: "S1",
+            summary: "stale completion",
+          })
+          .pipe(Effect.flip, Effect.forkChild);
+        yield* Effect.promise(() =>
+          waitUntil(() => NodeFS.existsSync(started), "self gate started"),
+        );
+        const replaced = yield* service.publishPlan({
+          projectRoot: repo,
+          threadId,
+          parentThreadId: threadId,
+          planTitle: "New plan",
+          steps: [
+            {
+              id: "S1",
+              title: "Replacement card",
+              goal: "New goal",
+              kind: "research",
+              dependsOn: [],
+              reviewer: null,
+            },
+          ],
+        });
+        NodeFS.writeFileSync(release, "go\n");
+        const staleError = yield* Fiber.join(selfFiber);
+        const latest = yield* service.getState(repo, threadId);
+        return { replaced, staleError, latest };
+      }).pipe(Effect.provide(layer));
+
+      expect(result.staleError.message).toContain("协作计划已更换或清空");
+      expect(result.replaced.planTitle).toBe("New plan");
+      expect(result.latest.steps.find((step) => step.id === "S1")?.title).toBe("Replacement card");
+      expect(result.latest.steps.find((step) => step.id === "S1")?.status).toBe("ready");
+    }),
+  );
+
+  itEffect.effect("does not overwrite a replacement plan or run from an overlapping launch", () =>
+    Effect.gen(function* () {
+      const repo = createTempGitRepo();
+      const threadId = "thr-replace-launch";
+      const launches: string[] = [];
+      let releaseProviders!: () => void;
+      const providerGate = new Promise<void>((resolve) => {
+        releaseProviders = resolve;
+      });
+      let releaseFirstLaunch!: () => void;
+      const firstLaunchGate = new Promise<void>((resolve) => {
+        releaseFirstLaunch = resolve;
+      });
+      let deferredProviders = 0;
+      let launchCount = 0;
+      const layer = makeDispatchTestLayer(repo, {
+        activeShell: true,
+        providerGate,
+        onDeferredProvider: () => {
+          deferredProviders += 1;
+        },
+        launchGate: firstLaunchGate,
+        onLaunch: (input) => {
+          launchCount += 1;
+          launches.push(input.title);
+        },
+      });
+
+      const result = yield* Effect.gen(function* () {
+        const service = yield* VelaDispatchService;
+        yield* service.publishPlan({
+          projectRoot: repo,
+          threadId,
+          parentThreadId: threadId,
+          planTitle: "Old plan",
+          steps: [
+            {
+              id: "S1",
+              title: "Old card",
+              goal: "Old goal",
+              kind: "research",
+              dependsOn: [],
+              reviewer: null,
+            },
+          ],
+        });
+        const launchFiber = yield* service
+          .dispatchStep({
+            projectRoot: repo,
+            threadId,
+            parentThreadId: threadId,
+            stepId: "S1",
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* Effect.promise(() => waitUntil(() => deferredProviders >= 1, "paused launch"));
+        const replaceFiber = yield* service
+          .publishPlan({
+            projectRoot: repo,
+            threadId,
+            parentThreadId: threadId,
+            planTitle: "New plan",
+            steps: [
+              {
+                id: "S1",
+                title: "Replacement card",
+                goal: "New goal",
+                kind: "research",
+                dependsOn: [],
+                reviewer: null,
+              },
+            ],
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 30)));
+        releaseProviders();
+        yield* Fiber.join(launchFiber);
+        const replaced = yield* Fiber.join(replaceFiber);
+        // Release the aborted old launch callback after the replacement plan is active.
+        releaseFirstLaunch();
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 40)));
+        const latest = yield* service.getState(repo, threadId);
+        return { replaced, latest };
+      }).pipe(Effect.provide(layer));
+
+      expect(result.replaced.planTitle).toBe("New plan");
+      expect(result.latest.planTitle).toBe("New plan");
+      expect(result.latest.steps.find((step) => step.id === "S1")?.title).toBe("Replacement card");
+      expect(result.latest.steps.find((step) => step.id === "S1")?.status).toBe("ready");
+      expect(result.latest.runs).toEqual({});
+      expect(launchCount).toBeLessThanOrEqual(1);
+    }),
   );
 });

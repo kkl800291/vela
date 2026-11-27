@@ -61,6 +61,7 @@ export const liveThreadShell = (
 
 export const liveThreadsLayer = Layer.mock(ThreadManagement.ThreadManagementService)({
   getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+  resolveCallerRunId: () => Effect.undefined,
 });
 
 export const idleThreadProjection = (

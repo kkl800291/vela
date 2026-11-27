@@ -54,3 +54,21 @@ it("keeps a cached image out of view until it is fitted", async () => {
   expect(insertedWidth).toBeLessThanOrEqual(500);
   await vi.waitFor(() => expect(image()?.getBoundingClientRect().width).toBeGreaterThan(400));
 });
+
+it("defaults to a checkerboard backdrop and switches between light and dark backdrops", async () => {
+  const host = document.createElement("div");
+  host.style.cssText = "display:flex;flex-direction:column;width:500px;height:600px";
+  await using screen = await render(
+    <PreviewImageContent src={png(128, 128)} name="logo.png" mimeType="image/png" />,
+    { container: host },
+  );
+
+  const canvasButton = () => host.querySelector<HTMLButtonElement>("button[data-backdrop]");
+  await vi.waitFor(() => expect(canvasButton()?.dataset.backdrop).toBe("checker"));
+
+  await screen.getByRole("button", { name: "Light background" }).click();
+  expect(canvasButton()?.dataset.backdrop).toBe("light");
+
+  await screen.getByRole("button", { name: "Dark background" }).click();
+  expect(canvasButton()?.dataset.backdrop).toBe("dark");
+});

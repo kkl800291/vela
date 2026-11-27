@@ -283,11 +283,18 @@ export function useComposerMenuItems({
         ...(gitCwd !== null && activeThreadId !== null
           ? ([
               {
+                id: "slash:collab",
+                type: "slash-command",
+                command: "collab",
+                label: "/collab",
+                description: gt("Start a parallel multi-step task with isolated review"),
+              },
+              {
                 id: "slash:dispatch",
                 type: "slash-command",
                 command: "dispatch",
                 label: "/dispatch",
-                description: gt("Break work into gated steps with review and one-click rollback"),
+                description: gt("Same as /collab"),
               },
             ] as const)
           : []),

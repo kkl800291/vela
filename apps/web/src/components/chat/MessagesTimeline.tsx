@@ -64,6 +64,7 @@ import {
   CircleAlertIcon,
   MessagesSquareIcon,
   Minimize2Icon,
+  CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
 } from "lucide-react";
@@ -462,6 +463,9 @@ const ConversationTimeline = memo(function ConversationTimeline({
   const [expandedAttemptIds, setExpandedAttemptIds] = useState<ReadonlySet<RunAttemptId>>(
     () => listState.rememberedPosition?.disclosures?.attempts ?? new Set(),
   );
+  const [expandedCollabReviewIds, setExpandedCollabReviewIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   // A list that opens on a thread with find open takes the opening step below,
   // so the restore runs and releases follow once for find.
   const [positionedThreadKey, setPositionedThreadKey] = useState<string | null>(() =>
@@ -500,6 +504,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     setExpandedRunIds(paintedExpandedRunIds);
     setExpandedWorkGroupIds(paintedExpandedWorkGroupIds);
     setExpandedAttemptIds(paintedExpandedAttemptIds);
+    setExpandedCollabReviewIds(new Set());
   }
   const citationThreadRef = parseScopedThreadKey(routeThreadKey);
   const openPullRequest = useOpenPrLink(citationThreadRef ?? undefined);
@@ -590,6 +595,15 @@ const ConversationTimeline = memo(function ConversationTimeline({
       } else {
         next.add(runId);
       }
+      return next;
+    });
+  };
+  const onToggleCollabReviewFold = (rowId: string) => {
+    preserveDisclosurePosition(rowId);
+    setExpandedCollabReviewIds((existing) => {
+      const next = new Set(existing);
+      if (next.has(rowId)) next.delete(rowId);
+      else next.add(rowId);
       return next;
     });
   };
@@ -769,6 +783,8 @@ const ConversationTimeline = memo(function ConversationTimeline({
     runningRunId,
     expandedRunIds: visibleExpandedRunIds,
     expandedAttemptIds: visibleExpandedAttemptIds,
+    expandedCollabReviewIds: identityChanged ? undefined : expandedCollabReviewIds,
+    revealedCollabEntryId: findActive ? activeFindMatch?.entryId : undefined,
     expandedWorkGroupIds,
     isWorking,
     runlessWorkActive,
@@ -1158,6 +1174,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     workflowOpening,
     onForkFromRun,
     onToggleTurnFold,
+    onToggleCollabReviewFold,
     onToggleAttemptFold,
     onToggleWorkGroup,
     onToggleWorkEntry: (anchorKey, collapsed, entryId) =>
@@ -1676,7 +1693,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       className={cn(
         isWorkLogRow || isSubagentGroup
           ? undefined
-          : row.kind === "turn-fold" || row.kind === "working"
+          : row.kind === "turn-fold" || row.kind === "collab-review-fold" || row.kind === "working"
             ? "pb-1.5"
             : row.kind === "message" && row.groupedWithNext
               ? "pb-1"
@@ -1729,6 +1746,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
         </WorkLogBlock>
       ) : null}
       {row.kind === "turn-fold" ? <TurnFoldTimelineRow key={row.id} row={row} /> : null}
+      {row.kind === "collab-review-fold" ? <CollabReviewFoldTimelineRow row={row} /> : null}
       {row.kind === "attempt-fold" ? <AttemptFoldTimelineRow row={row} /> : null}
       {row.kind === "context-compaction" ? <ContextCompactionTimelineRow row={row} /> : null}
       {row.kind === "message" && row.message.role === "user" ? <UserMessageRow row={row} /> : null}
@@ -1890,6 +1908,33 @@ function WorkHistorySkeleton() {
         </div>
       ))}
     </div>
+  );
+}
+
+function CollabReviewFoldTimelineRow({
+  row,
+}: {
+  row: Extract<TimelineRow, { kind: "collab-review-fold" }>;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const label =
+    row.count === 1 ? "已审查 1 个步骤" : `已审查 ${row.count} 个步骤`;
+  return (
+    <button
+      type="button"
+      aria-expanded={row.expanded}
+      data-scroll-anchor-ignore
+      className="flex min-h-6 cursor-pointer items-center gap-1.5 rounded-md px-0.5 py-0.5 text-xs text-muted-foreground tabular-nums transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+      onClick={() => ctx.onToggleCollabReviewFold(row.id)}
+    >
+      <CheckIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground/75" />
+      <span>{label}</span>
+      {row.expanded ? (
+        <ChevronDownIcon className="size-3 shrink-0 opacity-65" />
+      ) : (
+        <ChevronRightIcon className="size-3 shrink-0 opacity-65" />
+      )}
+    </button>
   );
 }
 

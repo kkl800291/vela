@@ -15,9 +15,19 @@ let entries = 1;
 let size = 0;
 let delimiter: "," | ";" | "\t" | null = null;
 let complete = false;
-let columns = 1;
+let totalColumns = 1;
 function reply(value: TextPreviewResult) {
   self.postMessage(value, { transfer: [] });
+}
+function replyMeta(isComplete: boolean) {
+  reply({
+    type: "meta",
+    count: entries - 1,
+    displayedColumns: Math.min(LARGE_TEXT_MAX_COLUMNS, totalColumns),
+    totalColumns,
+    complete: isComplete,
+    sizeBytes: size,
+  });
 }
 function at(index: number) {
   return offsets[index >>> 16]![index & 65535]!;
@@ -163,7 +173,7 @@ async function open(input: Extract<TextPreviewRequest, { type: "open" }>) {
         if (byte === 10 || byte === 13) {
           if (entries > LARGE_TEXT_MAX_ROWS) throw new PreviewError({ code: "text-too-many-rows" });
           set(entries++, pos + 1);
-          columns = Math.min(LARGE_TEXT_MAX_COLUMNS, Math.max(columns, rowColumns));
+          totalColumns = Math.max(totalColumns, rowColumns);
           rowColumns = 1;
           fieldStart = true;
           cr = byte === 13;
@@ -171,7 +181,7 @@ async function open(input: Extract<TextPreviewRequest, { type: "open" }>) {
       }
       size += value.length;
       if (!first && entries > 1) {
-        reply({ type: "meta", count: entries - 1, columns, complete: false, sizeBytes: size });
+        replyMeta(false);
         await page(0);
         first = true;
       }
@@ -180,10 +190,10 @@ async function open(input: Extract<TextPreviewRequest, { type: "open" }>) {
     if (size > at(entries - 1)) {
       if (entries > LARGE_TEXT_MAX_ROWS) throw new PreviewError({ code: "text-too-many-rows" });
       set(entries++, size);
-      columns = Math.min(LARGE_TEXT_MAX_COLUMNS, Math.max(columns, rowColumns));
+      totalColumns = Math.max(totalColumns, rowColumns);
     }
     complete = true;
-    reply({ type: "meta", count: entries - 1, columns, complete, sizeBytes: size });
+    replyMeta(complete);
     await page(0);
   } finally {
     await reader.cancel();

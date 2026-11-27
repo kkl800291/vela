@@ -26,7 +26,7 @@ import {
 } from "./keybindings";
 
 export type ComposerTriggerKind = "path" | "pull-request" | "slash-command" | "skill";
-export type ComposerSlashCommand = "model" | "side" | "btw" | "clear" | "dispatch";
+export type ComposerSlashCommand = "model" | "side" | "btw" | "clear" | "dispatch" | "collab";
 export type ComposerSubmissionIntent = "foreground" | "background" | "alternate";
 
 export interface ComposerTrigger {

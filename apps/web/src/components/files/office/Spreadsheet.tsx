@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import { observeResize } from "~/lib/observeResize";
+import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { msg, useGT } from "gt-react";
 import { useEffect, useRef, useState } from "react";
 import { m } from "~/i18n/messages";
@@ -469,6 +470,11 @@ function SpreadsheetGrid(props: {
       );
       return cell ? { cell, x, y } : undefined;
     };
+    const inCells = (found: { readonly x: number; readonly y: number }) =>
+      found.x >= 0 &&
+      found.y >= 0 &&
+      found.x < root.clientWidth - headers.width &&
+      found.y < root.clientHeight - headers.height;
     const resizeHit = (event: PointerEvent) => {
       if (!grid || resizingPending) return;
       const rect = target.getBoundingClientRect();
@@ -513,7 +519,7 @@ function SpreadsheetGrid(props: {
       root.setPointerCapture(event.pointerId);
       drag = true;
       header = found.x < 0 ? (found.y < 0 ? "all" : "row") : found.y < 0 ? "column" : undefined;
-      pressed = header ? undefined : found.cell;
+      pressed = header || event.shiftKey || !inCells(found) ? undefined : found.cell;
       if (found.x < 0 && found.y < 0)
         select({ anchor: { row: lastCell.row, col: lastCell.col }, focus: { row: 0, col: 0 } });
       else if (found.x < 0)
@@ -540,6 +546,14 @@ function SpreadsheetGrid(props: {
       root.style.cursor = hovered ? (hovered.axis === "column" ? "col-resize" : "row-resize") : "";
       if (!drag) return;
       const found = hit(event);
+      if (
+        pressed &&
+        (!found ||
+          !inCells(found) ||
+          found.cell.row !== pressed.row ||
+          found.cell.col !== pressed.col)
+      )
+        pressed = undefined;
       if (found && header !== "all")
         select(
           extendTo(selection, {
@@ -588,9 +602,19 @@ function SpreadsheetGrid(props: {
           });
         return;
       }
+      if (event.button !== 0 || !drag) return;
       drag = false;
+      const clicked = pressed;
+      pressed = undefined;
       const found = hit(event);
-      if (!found || !pressed || found.cell.row !== pressed.row || found.cell.col !== pressed.col)
+      if (
+        !clicked ||
+        event.shiftKey ||
+        !found ||
+        !inCells(found) ||
+        found.cell.row !== clicked.row ||
+        found.cell.col !== clicked.col
+      )
         return;
       const cell = at(found.cell).anchor;
       const list = painted?.frame;
@@ -625,19 +649,30 @@ function SpreadsheetGrid(props: {
         bottom: Math.min(selected.bottom, Math.max(selected.top, used?.bottom ?? 0)),
         right: Math.min(selected.right, Math.max(selected.left, used?.right ?? 0)),
       };
+      const limitNotice = m(msg("Select fewer than 200,000 cells to copy."));
+      const failureNotice = m(msg("The selected cells could not be copied."));
       if ((clipped.bottom - clipped.top + 1) * (clipped.right - clipped.left + 1) > 200_000) {
-        setNotice(m(msg("Select fewer than 200,000 cells to copy.")));
+        setNotice(limitNotice);
         return;
       }
       void engine
         .call("copy", { sheet, range: clipped }, { signal: controller.signal })
         .then((text) => {
+          if (controller.signal.aborted) return;
           if (text === undefined) throw new Error("No cells");
-          return navigator.clipboard.writeText(text);
+          return writeTextToClipboard(text, undefined, undefined, { allowEmpty: true }).then(
+            (copied) => {
+              if (!copied) throw new Error("No cells");
+              if (!controller.signal.aborted) {
+                setNotice((current) =>
+                  current === limitNotice || current === failureNotice ? "" : current,
+                );
+              }
+            },
+          );
         })
         .catch(() => {
-          if (!controller.signal.aborted)
-            setNotice(m(msg("The selected cells could not be copied.")));
+          if (!controller.signal.aborted) setNotice(failureNotice);
         });
     };
     const key = (event: KeyboardEvent) => {

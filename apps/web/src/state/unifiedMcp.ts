@@ -49,6 +49,18 @@ export interface UnifiedMcpSnapshot {
   readonly updatedAt: string;
 }
 
+export interface McpSyncEngineResult {
+  readonly engineId: McpEngineId;
+  readonly ok: boolean;
+  readonly error?: string;
+}
+
+export interface SyncMcpServerResult {
+  readonly snapshot: UnifiedMcpSnapshot;
+  readonly results: ReadonlyArray<McpSyncEngineResult>;
+  readonly ok: boolean;
+}
+
 export interface McpTestResult {
   readonly ok: boolean;
   readonly status: "connected" | "auth_required" | "error";

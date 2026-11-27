@@ -151,6 +151,13 @@ it("splits a pasted pairing link and preserves the code during address edits", (
       expect(address.value).toBe(value);
       expect(code.value).toBe("replacement-code");
     }
+
+    enter(
+      address,
+      "t3code://pair?pairingUrl=http%3A%2F%2F100.82.53.95%3A3773%2Fpair%23token%3Ddeep-link-code",
+    );
+    expect(address.value).toBe("http://100.82.53.95:3773");
+    expect(code.value).toBe("deep-link-code");
   } finally {
     act(() => root.unmount());
   }

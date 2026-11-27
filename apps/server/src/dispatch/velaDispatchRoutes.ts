@@ -1,9 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off
-// @effect-diagnostics globalTimersInEffect:off
 import { AuthOrchestrationOperateScope, AuthOrchestrationReadScope } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   HttpRouter,
@@ -12,7 +12,11 @@ import {
   HttpServerResponse,
 } from "effect/http";
 
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
+import { eventStreamResponse } from "../eventStreamResponse.ts";
 import { authenticateRawRouteWithScope } from "../http.ts";
+import { VelaCollabEngine } from "./VelaCollabEngine.ts";
+import * as VelaCollabRoutes from "./velaCollabRoutes.ts";
 import * as VelaDispatchService from "./VelaDispatchService.ts";
 import type {
   DispatchAcceptanceItem,
@@ -75,7 +79,8 @@ function parseAgentTarget(value: unknown): DispatchAgentTarget | undefined {
   const providerInstanceId =
     typeof value.providerInstanceId === "string" ? value.providerInstanceId.trim() : "";
   if (!providerInstanceId) return undefined;
-  const model = typeof value.model === "string" && value.model.trim() ? value.model.trim() : undefined;
+  const model =
+    typeof value.model === "string" && value.model.trim() ? value.model.trim() : undefined;
   const effort =
     typeof value.effort === "string" && value.effort.trim() ? value.effort.trim() : undefined;
   const options = parseAgentOptions(value.options);
@@ -211,67 +216,91 @@ const respondResult = <A>(effect: Effect.Effect<A, Error>) =>
     }),
   );
 
-const layerGetStateRoute = HttpRouter.add(
-  "GET",
-  "/api/vela/dispatch/state",
-  Effect.gen(function* () {
-    yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const reqUrl = new URL(request.url, "http://127.0.0.1");
-    const projectRoot = reqUrl.searchParams.get("projectRoot")?.trim() ?? "";
-    if (!projectRoot) return jsonError("projectRoot is required", 400);
-    const threadId = parseOptionalThreadId(reqUrl.searchParams.get("threadId"));
-    const service = yield* VelaDispatchService.VelaDispatchService;
-    const state = yield* service.getState(projectRoot, threadId);
-    return HttpServerResponse.jsonUnsafe(state);
-  }).pipe(Effect.catchTags(handleAuthErrors)),
-);
+const encodeSse = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
-const layerStreamStateRoute = HttpRouter.add(
-  "GET",
-  "/api/vela/dispatch/stream",
-  Effect.gen(function* () {
-    yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const reqUrl = new URL(request.url, "http://127.0.0.1");
-    const projectRoot = reqUrl.searchParams.get("projectRoot")?.trim() ?? "";
-    if (!projectRoot) return jsonError("projectRoot is required", 400);
-    const threadId = parseOptionalThreadId(reqUrl.searchParams.get("threadId"));
+function dispatchStream<A, E>(
+  snapshot: Effect.Effect<A, E>,
+  subscribe: (refresh: () => void) => () => void,
+) {
+  const events = Stream.unwrap(
+    Effect.gen(function* () {
+      // One pending refresh suffices. Full projections are read sequentially.
+      const queue = yield* Queue.sliding<void>(1);
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          subscribe(() => {
+            Queue.offerUnsafe(queue, undefined);
+          }),
+        ),
+        (unsubscribe) => Effect.sync(unsubscribe),
+      );
+      yield* Queue.offer(queue, undefined);
+      return Stream.fromQueue(queue).pipe(
+        Stream.mapEffect(() =>
+          snapshot.pipe(
+            Effect.map((data) => [data]),
+            Effect.catch((cause) =>
+              Effect.logWarning("Unable to refresh the dispatch stream.", cause).pipe(
+                Effect.as([]),
+              ),
+            ),
+          ),
+        ),
+        Stream.flattenIterable,
+      );
+    }),
+  );
+  return eventStreamResponse(events, encodeSse);
+}
 
-    const service = yield* VelaDispatchService.VelaDispatchService;
-    const initial = yield* service.getState(projectRoot, threadId);
-    const encoder = new TextEncoder();
-
-    const sseStream = Stream.callback<Uint8Array>((queue) =>
-      Effect.acquireRelease(
-        Effect.sync(() => {
-          const push = (payload: unknown) => {
-            Queue.offerUnsafe(queue, encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
-          };
-          push(initial);
-          const unsub = service.subscribe(projectRoot, (next) => push(next), threadId);
-          const heartbeat = setInterval(() => {
-            Queue.offerUnsafe(queue, encoder.encode(": keepalive\n\n"));
-          }, 20_000);
-          return () => {
-            clearInterval(heartbeat);
-            unsub();
-          };
+const stateRoute = (stream: boolean) =>
+  HttpRouter.add(
+    "GET",
+    stream ? "/api/vela/dispatch/stream" : "/api/vela/dispatch/state",
+    Effect.gen(function* () {
+      yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const reqUrl = new URL(request.url, "http://127.0.0.1");
+      const projectRoot = reqUrl.searchParams.get("projectRoot")?.trim() ?? "";
+      if (!projectRoot) return jsonError("projectRoot is required", 400);
+      const threadId = parseOptionalThreadId(reqUrl.searchParams.get("threadId"));
+      const service = yield* VelaDispatchService.VelaDispatchService;
+      const engine = yield* VelaCollabEngine;
+      const environment = yield* ServerEnvironment;
+      const environmentId = yield* environment.getEnvironmentId;
+      const scope = threadId ? { environmentId, parentThreadId: threadId } : null;
+      const state = Effect.all(
+        {
+          legacy: service.getState(projectRoot, threadId),
+          collab: scope
+            ? engine.getActiveProjection(scope, { includeLatest: true })
+            : Effect.succeed(null),
+        },
+        { concurrency: 2 },
+      ).pipe(
+        Effect.map(({ legacy, collab }) => {
+          const hasLegacyWork =
+            legacy.steps.some(({ status }) => status !== "done" && status !== "cancelled") ||
+            (legacy.mode === "strict" && legacy.steps.length === 0 && legacy.blindCheck !== null);
+          const terminalCollab =
+            collab?.status === "delivered" ||
+            collab?.status === "cancelled" ||
+            collab?.status === "failed";
+          return { ...legacy, collab: terminalCollab && hasLegacyWork ? null : collab };
         }),
-        (cleanup) => Effect.sync(cleanup),
-      ).pipe(Effect.andThen(Effect.never)),
-    );
+      );
 
-    return HttpServerResponse.stream(sseStream, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-      },
-    });
-  }).pipe(Effect.catchTags(handleAuthErrors)),
-);
+      if (!stream) return yield* respondResult(state);
+      return dispatchStream(state, (refresh) => {
+        const legacy = service.subscribe(projectRoot, refresh, threadId);
+        const collab = scope && engine.subscribe(scope, refresh);
+        return () => {
+          legacy();
+          if (collab) collab();
+        };
+      });
+    }).pipe(Effect.catchTags(handleAuthErrors)),
+  );
 
 const layerListProvidersRoute = HttpRouter.add(
   "GET",
@@ -574,8 +603,9 @@ const layerStepRevertRoute = HttpRouter.add(
     if (!projectRoot || !stepId) return jsonError("projectRoot and stepId are required", 400);
     const threadId =
       parseOptionalThreadId(body.threadId) ?? parseOptionalThreadId(body.parentThreadId);
+    const force = body.force === true;
     const service = yield* VelaDispatchService.VelaDispatchService;
-    return yield* respondResult(service.revertStep(projectRoot, stepId, threadId));
+    return yield* respondResult(service.revertStep(projectRoot, stepId, threadId, { force }));
   }).pipe(Effect.catchTags(handleAuthErrors)),
 );
 
@@ -668,7 +698,9 @@ const layerEscalationHumanRoute = HttpRouter.add(
     if (!projectRoot || !escalationId) {
       return jsonError("projectRoot and escalationId are required", 400);
     }
-    const options = Array.isArray(body.options) ? (body.options as DispatchEscalationOption[]) : undefined;
+    const options = Array.isArray(body.options)
+      ? (body.options as DispatchEscalationOption[])
+      : undefined;
     const threadId =
       parseOptionalThreadId(body.threadId) ?? parseOptionalThreadId(body.parentThreadId);
     const service = yield* VelaDispatchService.VelaDispatchService;
@@ -698,8 +730,24 @@ const layerClearPlanRoute = HttpRouter.add(
     const threadId =
       parseOptionalThreadId(body.threadId) ?? parseOptionalThreadId(body.parentThreadId);
     const service = yield* VelaDispatchService.VelaDispatchService;
-    const cleared = yield* service.clearPlan(projectRoot, threadId);
-    return HttpServerResponse.jsonUnsafe(cleared);
+    const engine = yield* VelaCollabEngine;
+    const environment = yield* ServerEnvironment;
+    const environmentId = yield* environment.getEnvironmentId;
+    return yield* respondResult(
+      Effect.gen(function* () {
+        if (threadId) {
+          const scope = { environmentId, parentThreadId: threadId };
+          const active = yield* engine.getActiveProjection(scope);
+          if (active) {
+            yield* engine.cancelPlan(scope, active.planId);
+            const legacy = yield* service.getState(projectRoot, threadId);
+            const collab = yield* engine.getProjection({ ...scope, planId: active.planId });
+            return { ...legacy, collab };
+          }
+        }
+        return yield* service.clearPlan(projectRoot, threadId);
+      }),
+    );
   }).pipe(Effect.catchTags(handleAuthErrors)),
 );
 
@@ -744,10 +792,13 @@ const layerKickoffPlanRoute = HttpRouter.add(
         requirement: typeof body.requirement === "string" ? body.requirement : undefined,
         mode: body.mode === "strict" ? "strict" : "fast",
         deliver: body.deliver === "client" ? "client" : "server",
+        ...(typeof body.enableBatchAudit === "boolean"
+          ? { enableBatchAudit: body.enableBatchAudit }
+          : {}),
         ...("defaultAgent" in body
           ? {
               defaultAgent:
-                body.defaultAgent === null ? null : parseAgentTarget(body.defaultAgent) ?? null,
+                body.defaultAgent === null ? null : (parseAgentTarget(body.defaultAgent) ?? null),
             }
           : {}),
       }),
@@ -775,7 +826,7 @@ const layerUpdateConfigRoute = HttpRouter.add(
         ...("defaultAgent" in body
           ? {
               defaultAgent:
-                body.defaultAgent === null ? null : parseAgentTarget(body.defaultAgent) ?? null,
+                body.defaultAgent === null ? null : (parseAgentTarget(body.defaultAgent) ?? null),
             }
           : {}),
         applyToPendingSteps: body.applyToPendingSteps === true,
@@ -784,9 +835,39 @@ const layerUpdateConfigRoute = HttpRouter.add(
   }).pipe(Effect.catchTags(handleAuthErrors)),
 );
 
+const attentionRoute = (stream: boolean) =>
+  HttpRouter.add(
+    "GET",
+    stream ? "/api/vela/dispatch/attention/stream" : "/api/vela/dispatch/attention",
+    Effect.gen(function* () {
+      yield* authenticateRawRouteWithScope(AuthOrchestrationReadScope);
+      const service = yield* VelaDispatchService.VelaDispatchService;
+      const engine = yield* VelaCollabEngine;
+      const attention = Effect.all([service.listAttentionItems(), engine.listAttentionItems()], {
+        concurrency: 2,
+      }).pipe(
+        Effect.map(([legacy, collab]) => ({
+          items: [...legacy, ...collab].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+        })),
+      );
+      if (!stream) return yield* respondResult(attention);
+      return dispatchStream(attention, (refresh) => {
+        const legacy = service.subscribeAll(refresh);
+        const collab = engine.subscribeAll(refresh);
+        return () => {
+          legacy();
+          collab();
+        };
+      });
+    }).pipe(Effect.catchTags(handleAuthErrors)),
+  );
+
 export const layer = Layer.mergeAll(
-  layerGetStateRoute,
-  layerStreamStateRoute,
+  stateRoute(false),
+  stateRoute(true),
+  attentionRoute(false),
+  attentionRoute(true),
+  VelaCollabRoutes.layer,
   layerListProvidersRoute,
   layerBlindCheckRoute,
   layerBlindSynthesizeRoute,

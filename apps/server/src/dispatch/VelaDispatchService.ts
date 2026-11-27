@@ -1,6 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off
 // @effect-diagnostics globalDate:off
 // @effect-diagnostics effectFnOpportunity:off globalDateInEffect:off globalErrorInEffectCatch:off globalErrorInEffectFailure:off
+import {
+  hasWorkspaceAdmission,
+  registerDirectWorkspaceWriter,
+  unregisterDirectWorkspaceWriter,
+  withWorkspaceAdmission,
+} from "./workspaceAdmission.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   CommandId,
@@ -34,8 +40,9 @@ import {
   auditPathBoundaries,
   captureWorkspaceSnapshot,
   inspectWorkspaceDelta,
+  inspectWorkspaceDeltaWithTree,
   isValidGitTree,
-  revertWorkspaceToSnapshot,
+  revertStepSnapshotSafely,
   runHardGates,
 } from "./VelaDispatchGit.ts";
 import {
@@ -66,6 +73,7 @@ import type {
   DispatchAcceptanceReport,
   DispatchAgentTarget,
   DispatchArchivedPlan,
+  DispatchAttentionItem,
   DispatchBlindCheckRecord,
   DispatchDeliverable,
   DispatchEscalationKind,
@@ -212,6 +220,7 @@ export interface KickoffPlanInput {
   readonly requirement?: string | undefined;
   readonly mode: "fast" | "strict";
   readonly defaultAgent?: DispatchAgentTarget | null | undefined;
+  readonly enableBatchAudit?: boolean | undefined;
   readonly deliver?: "server" | "client" | undefined;
 }
 
@@ -220,6 +229,107 @@ export interface UpdateConfigInput {
   readonly threadId?: string | undefined;
   readonly defaultAgent?: DispatchAgentTarget | null | undefined;
   readonly applyToPendingSteps?: boolean | undefined;
+}
+
+function computeBlockedStepTitles(
+  steps: ReadonlyArray<DispatchTaskCard>,
+  stepId: string,
+): ReadonlyArray<string> {
+  const ordered = [...steps].toSorted((a, b) => a.order - b.order);
+  const usesDag = ordered.some((step) => step.dependsOn !== undefined);
+  if (usesDag) {
+    return ordered
+      .filter(
+        (step) =>
+          step.id !== stepId &&
+          step.status === "locked" &&
+          (step.dependsOn?.includes(stepId) ?? false),
+      )
+      .map((step) => `${step.id} ${step.title}`);
+  }
+  const sourceIdx = ordered.findIndex((step) => step.id === stepId);
+  if (sourceIdx === -1) return [];
+  return ordered
+    .slice(sourceIdx + 1)
+    .filter((step) => step.status === "locked")
+    .map((step) => `${step.id} ${step.title}`);
+}
+
+export function extractDispatchAttentionItems(
+  states: ReadonlyArray<VelaDispatchState>,
+): ReadonlyArray<DispatchAttentionItem> {
+  const items: DispatchAttentionItem[] = [];
+
+  for (const state of states) {
+    const scopeKey = `${state.projectRoot}::${state.parentThreadId ?? ""}`;
+    const orderedSteps = [...state.steps].toSorted((a, b) => a.order - b.order);
+
+    for (const esc of state.escalations) {
+      if (esc.status !== "open_human") continue;
+      const step = orderedSteps.find((s) => s.id === esc.stepId);
+      items.push({
+        id: `esc:${scopeKey}:${esc.id}`,
+        kind: "escalation",
+        projectRoot: state.projectRoot,
+        threadId: state.parentThreadId,
+        planTitle: state.planTitle,
+        stepId: esc.stepId,
+        stepTitle: step?.title ?? esc.title,
+        summary: esc.humanPrompt || esc.question || esc.title,
+        blockedStepTitles: computeBlockedStepTitles(orderedSteps, esc.stepId),
+        updatedAt: esc.updatedAt,
+      });
+    }
+
+    for (const step of orderedSteps) {
+      const run = state.runs[step.id];
+      const isDecisionReady =
+        step.status === "awaiting_decision" ||
+        ((step.kind ?? "change") === "decision" &&
+          step.status === "ready" &&
+          (step.decisionOptions?.length ?? 0) > 0);
+      if (isDecisionReady) {
+        items.push({
+          id: `decision:${scopeKey}:${step.id}`,
+          kind: "decision",
+          projectRoot: state.projectRoot,
+          threadId: state.parentThreadId,
+          planTitle: state.planTitle,
+          stepId: step.id,
+          stepTitle: step.title,
+          summary: run?.decisionAnalysis || step.goal || "等待选择决策方案",
+          blockedStepTitles: computeBlockedStepTitles(orderedSteps, step.id),
+          updatedAt: run?.updatedAt ?? step.updatedAt,
+        });
+        continue;
+      }
+
+      if (step.status === "ready_to_accept") {
+        const changedCount = run?.diffSummary?.changedFiles.length ?? 0;
+        const gateCount = run?.hardGate?.results.length ?? 0;
+        const summary =
+          (step.kind ?? "change") === "research"
+            ? "调研结论已就绪，等待确认"
+            : changedCount > 0
+              ? `改动 ${changedCount} 个文件${gateCount > 0 ? `，已跑 ${gateCount} 项检查` : "，未运行检查命令"}`
+              : "等待确认验收";
+        items.push({
+          id: `accept:${scopeKey}:${step.id}`,
+          kind: "accept",
+          projectRoot: state.projectRoot,
+          threadId: state.parentThreadId,
+          planTitle: state.planTitle,
+          stepId: step.id,
+          stepTitle: step.title,
+          summary,
+          blockedStepTitles: computeBlockedStepTitles(orderedSteps, step.id),
+          updatedAt: run?.updatedAt ?? step.updatedAt,
+        });
+      }
+    }
+  }
+
+  return items.toSorted((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 }
 
 export interface VelaDispatchServiceShape {
@@ -232,6 +342,8 @@ export interface VelaDispatchServiceShape {
     listener: (state: VelaDispatchState) => void,
     threadId?: string | null,
   ) => () => void;
+  readonly listAttentionItems: () => Effect.Effect<ReadonlyArray<DispatchAttentionItem>>;
+  readonly subscribeAll: (listener: (state: VelaDispatchState) => void) => () => void;
   readonly listProviders: () => Effect.Effect<ReadonlyArray<DispatchProviderSummary>>;
   readonly startBlindCheck: (
     input: StartBlindCheckInput,
@@ -286,6 +398,7 @@ export interface VelaDispatchServiceShape {
     projectRoot: string,
     stepId: string,
     threadId?: string | null,
+    options?: { readonly force?: boolean | undefined },
   ) => Effect.Effect<VelaDispatchState, Error>;
   readonly clearPlan: (
     projectRoot: string,
@@ -779,10 +892,61 @@ export const layer = Layer.effect(
     const store = new VelaDispatchStore(serverConfig.stateDir);
     /** Active cancellation controllers keyed by `${scopeKey}::${stepId}`. */
     const activeControllers = new Map<string, AbortController>();
-    /** Tracks active direct-write step runs across threads keyed by `${scopeKey}::${stepId}` -> normalizedProjectRoot. */
-    const activeDirectRuns = new Map<string, string>();
+    /**
+     * Tracks live direct-write runs by controller instance -> normalizedProjectRoot.
+     * Released only in the runner's `finally` block after cancellation/interruption
+     * settlement is confirmed, so replacing or cancelling a plan cannot admit a second
+     * direct writer prematurely.
+     */
+    type ActiveProviderRunRef = {
+      readonly projectId: ProjectId;
+      readonly threadId: ThreadId;
+      readonly runId: RunId | null;
+    };
+    const activeDirectRuns = new Map<AbortController, string>();
+    /** Signals whose provider run could not be confirmed settled yet, keeping their run ref for late reconciliation. */
+    const unsettledDirectSignals = new WeakMap<AbortSignal, ActiveProviderRunRef>();
+    /** Tracks the currently started provider run for an active runner signal until settlement is confirmed. */
+    const activeSignalRuns = new WeakMap<AbortSignal, ActiveProviderRunRef>();
     /** Serializes lazy restart reconciliation per scope key. */
     const reconcilingScopes = new Map<string, Promise<void>>();
+    const isActiveExecutionStatus = (status: string): boolean =>
+      status === "running" ||
+      status === "reviewing" ||
+      status === "fixing_review" ||
+      status === "fixing_acceptance";
+
+    const assertNoCompetingDirectWrite = (
+      state: VelaDispatchState,
+      stepId: string,
+      workspaceRoot: string,
+      _scopeThreadId?: string | null,
+    ): void => {
+      const step = state.steps.find((s) => s.id === stepId);
+      if (!step) return;
+      const isolation = state.runs[stepId]?.isolation ?? step.isolation;
+      if ((step.kind ?? "change") !== "change" || isolation !== "direct") return;
+      const other = state.steps.find((s) => {
+        if (s.id === stepId) return false;
+        if ((s.kind ?? "change") !== "change") return false;
+        if (!isActiveExecutionStatus(s.status)) return false;
+        return (state.runs[s.id]?.isolation ?? s.isolation) === "direct";
+      });
+      if (other) {
+        throw new Error(
+          `当前分支直写已有 ${other.id} 运行中；如需并行，请把 ${step.id} 的执行 AI 切换为子代理（将自动开独立 Worktree 并行）`,
+        );
+      }
+      const normalizedRoot = normalizeProjectRoot(workspaceRoot);
+      const crossThread = Array.from(activeDirectRuns.values()).some(
+        (root) => root === normalizedRoot,
+      );
+      if (crossThread) {
+        throw new Error(
+          `同一工作区另一对话正在执行当前分支直写；请把 ${step.id} 的执行 AI 切换为子代理（将自动开独立 Worktree 并行）`,
+        );
+      }
+    };
 
     const makeScope = (projectRoot: string, threadId?: string | null): DispatchScope =>
       threadId?.trim()
@@ -790,7 +954,38 @@ export const layer = Layer.effect(
         : normalizeProjectRoot(projectRoot);
 
     const activeKey = (projectRoot: string, stepId: string, threadId?: string | null) =>
-      `${normalizeDispatchScope(makeScope(projectRoot, threadId)).key}::${stepId}`;
+      `${controllerPrefix(projectRoot, threadId)}${stepId}`;
+
+    /** Project keys (`::project::`) and thread keys (`::thread::`) do not prefix each other. */
+    const controllerPrefix = (projectRoot: string, threadId?: string | null) => {
+      const normalized = normalizeDispatchScope(makeScope(projectRoot, threadId));
+      return normalized.threadId
+        ? `${normalized.projectRoot}::thread::${normalized.threadId}::`
+        : `${normalized.projectRoot}::project::`;
+    };
+
+    const abortScopeControllers = (projectRoot: string, threadId?: string | null) => {
+      const prefix = controllerPrefix(projectRoot, threadId);
+      for (const [key, ctrl] of activeControllers.entries()) {
+        if (!key.startsWith(prefix)) continue;
+        ctrl.abort();
+      }
+    };
+
+    /** Bumped on publish and clear so in-flight work cannot commit onto a replacement plan. */
+    const planVersions = new Map<string, number>();
+
+    const planVersion = (projectRoot: string, threadId?: string | null) =>
+      planVersions.get(normalizeDispatchScope(makeScope(projectRoot, threadId)).key) ?? 0;
+
+    const bumpPlanVersion = (projectRoot: string, threadId?: string | null) => {
+      const key = normalizeDispatchScope(makeScope(projectRoot, threadId)).key;
+      const next = (planVersions.get(key) ?? 0) + 1;
+      planVersions.set(key, next);
+      return next;
+    };
+
+    const stalePlanMessage = "协作计划已更换或清空，已取消这次过期执行";
 
     const resolveScopeThreadId = (
       threadId?: string | null,
@@ -936,6 +1131,97 @@ export const layer = Layer.effect(
       });
     };
 
+    const interruptThreadRun = async (input: {
+      readonly projectId: ProjectId;
+      readonly threadId: ThreadId;
+      readonly runId?: RunId | null | undefined;
+    }): Promise<boolean> => {
+      try {
+        await runPromise(
+          threadManagement
+            .interruptThread({
+              projectId: input.projectId,
+              commandId: newCommandId("vela-dispatch-cancel"),
+              threadId: input.threadId,
+              ...(input.runId ? { runId: input.runId } : {}),
+              reason: "Vela 分工协作面板中止了该任务步",
+            })
+            .pipe(Effect.ignore),
+        );
+      } catch {
+        // Continue into settlement polling even if interruptThread throws a defect.
+      }
+      // Wait for the provider run and its delegated work to be confirmed settled before returning,
+      // so `launchStepBackground`'s `finally` does not release `activeDirectRuns` prematurely.
+      // Never treat transient waitForThread failures or defects as settled.
+      const settleDeadline = Date.now() + MAX_STEP_WAIT_MS;
+      while (Date.now() < settleDeadline) {
+        let outcome: "pending" | "settled" | "error";
+        try {
+          outcome = await runPromise(
+            threadManagement
+              .waitForThread({
+                projectId: input.projectId,
+                threadId: input.threadId,
+                ...(input.runId ? { runId: input.runId } : {}),
+                timeoutMs: WAIT_CHUNK_MS,
+                untilDelegatedWorkSettled: true,
+              })
+              .pipe(
+                Effect.map((res) => (res.timedOut ? ("pending" as const) : ("settled" as const))),
+                Effect.catch((err) =>
+                  Effect.succeed(
+                    err &&
+                      typeof err === "object" &&
+                      "_tag" in err &&
+                      err._tag === "ThreadManagementThreadNotFoundError"
+                      ? ("settled" as const)
+                      : ("error" as const),
+                  ),
+                ),
+              ),
+          );
+        } catch {
+          outcome = "error";
+        }
+        if (outcome === "settled") return true;
+        if (outcome === "error") {
+          try {
+            await runPromise(Effect.sleep("1 second"));
+          } catch {
+            return false;
+          }
+        }
+      }
+      return false;
+    };
+
+    const reconcileUnsettledDirectRun = (
+      key: string,
+      controller: AbortController,
+      runRef: ActiveProviderRunRef,
+    ): void => {
+      void (async () => {
+        while (activeDirectRuns.has(controller) || activeControllers.get(key) === controller) {
+          const settled = await interruptThreadRun(runRef);
+          if (settled) {
+            unsettledDirectSignals.delete(controller.signal);
+            activeDirectRuns.delete(controller);
+            unregisterDirectWorkspaceWriter(controller);
+            if (activeControllers.get(key) === controller) {
+              activeControllers.delete(key);
+            }
+            return;
+          }
+          try {
+            await runPromise(Effect.sleep("5 seconds"));
+          } catch {
+            return;
+          }
+        }
+      })();
+    };
+
     const waitForThreadRun = async (input: {
       readonly projectId: ProjectId;
       readonly threadId: ThreadId;
@@ -943,25 +1229,36 @@ export const layer = Layer.effect(
       readonly signal: AbortSignal;
       readonly onProgress?: ((activityText: string) => Promise<void>) | undefined;
     }): Promise<{ readonly status: string; readonly assistantText: string; readonly aborted: boolean }> => {
+      const runRef: ActiveProviderRunRef = {
+        projectId: input.projectId,
+        threadId: input.threadId,
+        runId: input.runId,
+      };
+      const settleInterrupted = async (): Promise<{
+        readonly status: string;
+        readonly assistantText: string;
+        readonly aborted: boolean;
+      }> => {
+        const settled = await interruptThreadRun(runRef);
+        if (!settled) unsettledDirectSignals.set(input.signal, runRef);
+        activeSignalRuns.delete(input.signal);
+        return { status: "cancelled", assistantText: "", aborted: true };
+      };
+
+      activeSignalRuns.set(input.signal, {
+        projectId: input.projectId,
+        threadId: input.threadId,
+        runId: input.runId,
+      });
+
       const deadline = Date.now() + MAX_STEP_WAIT_MS;
       let lastReportedActivity: string | null = null;
       while (Date.now() < deadline) {
         if (input.signal.aborted) {
-          await runPromise(
-            threadManagement
-              .interruptThread({
-                projectId: input.projectId,
-                commandId: newCommandId("vela-dispatch-cancel"),
-                threadId: input.threadId,
-                ...(input.runId ? { runId: input.runId } : {}),
-                reason: "Vela 分工协作面板中止了该任务步",
-              })
-              .pipe(Effect.ignore),
-          );
-          return { status: "cancelled", assistantText: "", aborted: true };
+          return await settleInterrupted();
         }
 
-        const waitRes = await runPromise(
+        const waitOutcome = await runPromise(
           threadManagement
             .waitForThread({
               projectId: input.projectId,
@@ -970,15 +1267,46 @@ export const layer = Layer.effect(
               timeoutMs: WAIT_CHUNK_MS,
               untilDelegatedWorkSettled: true,
             })
-            .pipe(Effect.orElseSucceed(() => ({ threadId: input.threadId, run: null, timedOut: false }))),
+            .pipe(
+              Effect.map((res) => ({ _tag: "ok" as const, res })),
+              Effect.catch((err) =>
+                Effect.succeed(
+                  err &&
+                    typeof err === "object" &&
+                    "_tag" in err &&
+                    err._tag === "ThreadManagementThreadNotFoundError"
+                    ? ({
+                        _tag: "ok" as const,
+                        res: { threadId: input.threadId, run: null, timedOut: false },
+                      })
+                    : ({ _tag: "error" as const }),
+                ),
+              ),
+            ),
         );
 
+        if (waitOutcome._tag === "error") {
+          if (input.signal.aborted) {
+            return await settleInterrupted();
+          }
+          await runPromise(Effect.sleep("1 second"));
+          continue;
+        }
+
+        const waitRes = waitOutcome.res;
         if (!waitRes.timedOut) {
+          activeSignalRuns.delete(input.signal);
+          if (input.signal.aborted) {
+            return { status: "cancelled", assistantText: "", aborted: true };
+          }
           const projection = await runPromise(
             threadManagement
               .getThreadProjection(input.threadId)
               .pipe(Effect.orElseSucceed(() => null)),
           );
+          if (input.signal.aborted) {
+            return { status: "cancelled", assistantText: "", aborted: true };
+          }
           const finalRun = ("resultRun" in waitRes ? waitRes.resultRun : undefined) ?? waitRes.run;
           const status = finalRun?.status ?? "completed";
           const assistantText = projection
@@ -1003,6 +1331,12 @@ export const layer = Layer.effect(
         }
       }
 
+      if (input.signal.aborted) {
+        return await settleInterrupted();
+      }
+      const settled = await interruptThreadRun(runRef);
+      if (!settled) unsettledDirectSignals.set(input.signal, runRef);
+      activeSignalRuns.delete(input.signal);
       return { status: "failed", assistantText: "执行超时（超过 30 分钟）", aborted: false };
     };
 
@@ -1018,9 +1352,13 @@ export const layer = Layer.effect(
       readonly options?: ReadonlyArray<DispatchEscalationOption> | undefined;
       readonly forceHuman?: boolean | undefined;
       readonly targetStatus: DispatchStepStatus;
+      readonly expectedPlanVersion?: number | undefined;
+      readonly signal?: AbortSignal | undefined;
     }): Promise<{ readonly escalation: DispatchEscalationRecord; readonly state: VelaDispatchState }> => {
       const now = new Date().toISOString();
       const scope = makeScope(input.projectRoot, input.threadId);
+      const scopeKey = normalizeDispatchScope(scope).key;
+      const expectedPlanVersion = input.expectedPlanVersion ?? planVersions.get(scopeKey) ?? 0;
       const current = await store.read(scope);
       const existingRun = current.runs[input.step.id];
       const nextRounds = (existingRun?.escalationRounds ?? 0) + 1;
@@ -1050,9 +1388,16 @@ export const layer = Layer.effect(
 
       const finalStatus: DispatchStepStatus = toHuman ? "needs_human_decision" : input.targetStatus;
 
+      if (input.signal?.aborted) {
+        return { escalation, state: current };
+      }
+
       const state = await store.update(
         scope,
         (curr) => {
+          if (input.signal?.aborted) return curr;
+          if ((planVersions.get(scopeKey) ?? 0) !== expectedPlanVersion) return curr;
+          if (!curr.steps.some((s) => s.id === input.step.id)) return curr;
           const run = curr.runs[input.step.id];
           return {
             ...curr,
@@ -1080,6 +1425,9 @@ export const layer = Layer.effect(
           text: `${toHuman ? "触发人工拍板" : "提交主控工单"} (${escalation.id})：${input.title}`,
         },
       );
+
+      const persisted = state.escalations.some((entry) => entry.id === escalation.id);
+      if (!persisted) return { escalation, state };
 
       if (!toHuman && state.parentThreadId) {
         const wakeText = [
@@ -1113,6 +1461,18 @@ export const layer = Layer.effect(
       if (input.signal.aborted) return;
 
       const scope = makeScope(input.projectRoot, input.threadId);
+      const pipelinePlanVersion = planVersion(input.projectRoot, input.threadId);
+      const savePipelineEscalation = (
+        escalationInput: Omit<
+          Parameters<typeof createEscalationAndSave>[0],
+          "expectedPlanVersion" | "signal"
+        >,
+      ) =>
+        createEscalationAndSave({
+          ...escalationInput,
+          expectedPlanVersion: pipelinePlanVersion,
+          signal: input.signal,
+        });
       let state = await store.read(scope);
       let step = state.steps.find((s) => s.id === input.stepId);
       let run = state.runs[input.stepId];
@@ -1135,7 +1495,7 @@ export const layer = Layer.effect(
             },
           };
         });
-        await createEscalationAndSave({
+        await savePipelineEscalation({
           projectRoot: input.projectRoot,
           threadId: input.threadId,
           projectId: input.projectId,
@@ -1152,7 +1512,7 @@ export const layer = Layer.effect(
       // 1b. Check NEED_DECISION protocol
       const question = parseExecutorQuestion(input.assistantText);
       if (question) {
-        await createEscalationAndSave({
+        await savePipelineEscalation({
           projectRoot: input.projectRoot,
           threadId: input.threadId,
           projectId: input.projectId,
@@ -1169,7 +1529,7 @@ export const layer = Layer.effect(
       }
 
       if (input.runStatus === "failed" || input.runStatus === "interrupted") {
-        await createEscalationAndSave({
+        await savePipelineEscalation({
           projectRoot: input.projectRoot,
           threadId: input.threadId,
           projectId: input.projectId,
@@ -1249,7 +1609,7 @@ export const layer = Layer.effect(
           return;
         }
 
-        await createEscalationAndSave({
+        await savePipelineEscalation({
           projectRoot: input.projectRoot,
           threadId: input.threadId,
           projectId: input.projectId,
@@ -1267,7 +1627,7 @@ export const layer = Layer.effect(
 
       if (kind === "research") {
         const verifyResearchGuards = async (activeStep: DispatchTaskCard, activeRun: DispatchStepRun) => {
-          const diffSummary = await inspectWorkspaceDelta(
+          const { diff: diffSummary, currentTree } = await inspectWorkspaceDeltaWithTree(
             activeRun.workspacePath,
             activeRun.isolation === "direct" ? activeRun.baselineTree : null,
           );
@@ -1281,6 +1641,7 @@ export const layer = Layer.effect(
                 [activeStep.id]: {
                   ...r,
                   diffSummary,
+                  ...(activeRun.isolation === "direct" ? { completedTree: currentTree } : {}),
                   updatedAt: new Date().toISOString(),
                 },
               },
@@ -1288,7 +1649,7 @@ export const layer = Layer.effect(
           });
 
           if (diffSummary.changedFiles.length > 0) {
-            await createEscalationAndSave({
+            await savePipelineEscalation({
               projectRoot: input.projectRoot,
               threadId: input.threadId,
               projectId: input.projectId,
@@ -1307,7 +1668,9 @@ export const layer = Layer.effect(
             const hardGate = await runHardGates(activeRun.workspacePath, gateCommands, {
               signal: input.signal,
             });
+            if (input.signal.aborted) return false;
             await store.update(scope, (curr) => {
+              if (input.signal.aborted) return curr;
               const r = curr.runs[activeStep.id];
               if (!r) return curr;
               return {
@@ -1322,9 +1685,10 @@ export const layer = Layer.effect(
                 },
               };
             });
+            if (input.signal.aborted) return false;
             if (!hardGate.ok) {
               const failedCmd = hardGate.results.find((r) => !r.ok);
-              await createEscalationAndSave({
+              await savePipelineEscalation({
                 projectRoot: input.projectRoot,
                 threadId: input.threadId,
                 projectId: input.projectId,
@@ -1421,6 +1785,14 @@ export const layer = Layer.effect(
               }),
             );
 
+            const reviewRunId = reviewLaunch.projection.runs.at(-1)?.id ?? null;
+            activeSignalRuns.set(input.signal, {
+              projectId: input.projectId,
+              threadId: reviewLaunch.threadId,
+              runId: reviewRunId,
+            });
+            if (input.signal.aborted) return;
+
             await store.update(scope, (curr) => {
               const r = curr.runs[step!.id];
               if (!r || r.reviewerThreadIds.includes(reviewLaunch.threadId)) return curr;
@@ -1437,14 +1809,27 @@ export const layer = Layer.effect(
               };
             });
 
-            const reviewRunId = reviewLaunch.projection.runs.at(-1)?.id ?? null;
             const reviewWait = await waitForThreadRun({
               projectId: input.projectId,
               threadId: reviewLaunch.threadId,
               runId: reviewRunId,
               signal: input.signal,
             });
-            if (reviewWait.aborted) return;
+            if (reviewWait.aborted || unsettledDirectSignals.has(input.signal)) return;
+            if (reviewWait.status === "failed" || reviewWait.status === "interrupted") {
+              await savePipelineEscalation({
+                projectRoot: input.projectRoot,
+                threadId: input.threadId,
+                projectId: input.projectId,
+                step,
+                kind: "review_limit",
+                title: `${step.id} 第 ${round} 轮调研复查执行异常 (${reviewWait.status})`,
+                question:
+                  reviewWait.assistantText.slice(-1200) || `调研复查运行状态：${reviewWait.status}`,
+                targetStatus: "needs_human_decision",
+              });
+              return;
+            }
 
             const verdict: DispatchReviewVerdict = parseReviewVerdict(reviewWait.assistantText, {
               round,
@@ -1454,6 +1839,12 @@ export const layer = Layer.effect(
             await store.update(
               scope,
               (curr) => {
+                if (
+                  input.signal.aborted ||
+                  planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion
+                ) {
+                  return curr;
+                }
                 const r = curr.runs[step!.id];
                 if (!r) return curr;
                 return {
@@ -1477,10 +1868,16 @@ export const layer = Layer.effect(
               },
             );
 
+            if (
+              input.signal.aborted ||
+              planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion
+            ) {
+              return;
+            }
             if (verdict.verdict === "pass") break;
 
             if (round >= maxRounds) {
-              await createEscalationAndSave({
+              await savePipelineEscalation({
                 projectRoot: input.projectRoot,
                 threadId: input.threadId,
                 projectId: input.projectId,
@@ -1507,10 +1904,19 @@ export const layer = Layer.effect(
             const issuesToFix = blocking.length > 0 ? blocking : verdict.issues;
             if (!run.childThreadId) return;
 
+            let enteredResearchFix = false;
             await store.update(
               scope,
               (curr) => {
+                if (
+                  input.signal.aborted ||
+                  planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion ||
+                  !curr.steps.some((s) => s.id === step!.id)
+                ) {
+                  return curr;
+                }
                 const r = curr.runs[step!.id];
+                enteredResearchFix = true;
                 return {
                   ...curr,
                   steps: curr.steps.map((s) =>
@@ -1531,6 +1937,13 @@ export const layer = Layer.effect(
               },
               { stepId: step.id, text: `自动打回原调研子线程修订报告（第 ${round} 轮复查问题）` },
             );
+            if (
+              !enteredResearchFix ||
+              input.signal.aborted ||
+              planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion
+            ) {
+              return;
+            }
 
             const fixParentTid = resolveSubagentParentThreadId(
               state.parentThreadId ?? input.threadId,
@@ -1550,6 +1963,14 @@ export const layer = Layer.effect(
               }),
             );
 
+            const researchFixThreadId = ThreadId.make(run.childThreadId);
+            activeSignalRuns.set(input.signal, {
+              projectId: input.projectId,
+              threadId: researchFixThreadId,
+              runId: fixSend.run.id,
+            });
+            if (input.signal.aborted) return;
+
             await store.update(scope, (curr) => {
               const r = curr.runs[step!.id];
               if (!r) return curr;
@@ -1568,15 +1989,15 @@ export const layer = Layer.effect(
 
             const fixWait = await waitForThreadRun({
               projectId: input.projectId,
-              threadId: ThreadId.make(run.childThreadId),
+              threadId: researchFixThreadId,
               runId: fixSend.run.id,
               signal: input.signal,
             });
-            if (fixWait.aborted) return;
+            if (fixWait.aborted || unsettledDirectSignals.has(input.signal)) return;
 
             const fixQuestion = parseExecutorQuestion(fixWait.assistantText);
             if (fixQuestion) {
-              await createEscalationAndSave({
+              await savePipelineEscalation({
                 projectRoot: input.projectRoot,
                 threadId: input.threadId,
                 projectId: input.projectId,
@@ -1615,11 +2036,22 @@ export const layer = Layer.effect(
           }
         }
 
+        if (input.signal.aborted) return;
+
+        let finalizedResearch = false;
         const latestState = await store.update(
           scope,
           (curr) => {
+            if (
+              input.signal.aborted ||
+              planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion ||
+              !curr.steps.some((s) => s.id === step!.id)
+            ) {
+              return curr;
+            }
             const r = curr.runs[step!.id];
             const now = new Date().toISOString();
+            finalizedResearch = true;
             return {
               ...curr,
               steps: curr.steps.map((s) =>
@@ -1641,6 +2073,7 @@ export const layer = Layer.effect(
           },
           { stepId: step.id, text: "只读调研完成，等待用户确认结论" },
         );
+        if (!finalizedResearch || input.signal.aborted) return;
 
         const researchStepId = step.id;
         const researchStepTitle = step.title;
@@ -1680,7 +2113,7 @@ export const layer = Layer.effect(
       }
 
       const verifyGates = async (activeStep: DispatchTaskCard, activeRun: DispatchStepRun) => {
-        const diffSummary = await inspectWorkspaceDelta(
+        const { diff: diffSummary, currentTree } = await inspectWorkspaceDeltaWithTree(
           activeRun.workspacePath,
           activeRun.isolation === "direct" ? activeRun.baselineTree : null,
         );
@@ -1706,6 +2139,7 @@ export const layer = Layer.effect(
                 [activeStep.id]: {
                   ...r,
                   diffSummary,
+                  ...(activeRun.isolation === "direct" ? { completedTree: currentTree } : {}),
                   boundaryAudit,
                   headline: "正在运行边界审计与强制检查命令...",
                   updatedAt: new Date().toISOString(),
@@ -1728,7 +2162,7 @@ export const layer = Layer.effect(
             parts.push(`触碰敏感文件：${boundaryAudit.sensitiveFiles.join(", ")}`);
           }
           const msg = parts.join("；");
-          await createEscalationAndSave({
+          await savePipelineEscalation({
             projectRoot: input.projectRoot,
             threadId: input.threadId,
             projectId: input.projectId,
@@ -1750,6 +2184,7 @@ export const layer = Layer.effect(
         const hardGate = await runHardGates(activeRun.workspacePath, gateCommands, {
           signal: input.signal,
         });
+        if (input.signal.aborted) return null;
 
         await store.update(scope, (curr) => {
           const r = curr.runs[activeStep.id];
@@ -1771,7 +2206,7 @@ export const layer = Layer.effect(
 
         if (!hardGate.ok) {
           const failedCmd = hardGate.results.find((r) => !r.ok);
-          await createEscalationAndSave({
+          await savePipelineEscalation({
             projectRoot: input.projectRoot,
             threadId: input.threadId,
             projectId: input.projectId,
@@ -1875,6 +2310,14 @@ export const layer = Layer.effect(
             }),
           );
 
+          const reviewRunId = reviewLaunch.projection.runs.at(-1)?.id ?? null;
+          activeSignalRuns.set(input.signal, {
+            projectId: input.projectId,
+            threadId: reviewLaunch.threadId,
+            runId: reviewRunId,
+          });
+          if (input.signal.aborted) return;
+
           await store.update(scope, (curr) => {
             const r = curr.runs[step!.id];
             if (!r || r.reviewerThreadIds.includes(reviewLaunch.threadId)) return curr;
@@ -1891,14 +2334,26 @@ export const layer = Layer.effect(
             };
           });
 
-          const reviewRunId = reviewLaunch.projection.runs.at(-1)?.id ?? null;
           const reviewWait = await waitForThreadRun({
             projectId: input.projectId,
             threadId: reviewLaunch.threadId,
             runId: reviewRunId,
             signal: input.signal,
           });
-          if (reviewWait.aborted) return;
+          if (reviewWait.aborted || unsettledDirectSignals.has(input.signal)) return;
+          if (reviewWait.status === "failed" || reviewWait.status === "interrupted") {
+            await savePipelineEscalation({
+              projectRoot: input.projectRoot,
+              threadId: input.threadId,
+              projectId: input.projectId,
+              step,
+              kind: "review_limit",
+              title: `${step.id} 第 ${round} 轮独立复查执行异常 (${reviewWait.status})`,
+              question: reviewWait.assistantText.slice(-1200) || `独立复查运行状态：${reviewWait.status}`,
+              targetStatus: "needs_human_decision",
+            });
+            return;
+          }
 
           const verdict: DispatchReviewVerdict = parseReviewVerdict(reviewWait.assistantText, {
             round,
@@ -1908,6 +2363,12 @@ export const layer = Layer.effect(
           await store.update(
             scope,
             (curr) => {
+              if (
+                input.signal.aborted ||
+                planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion
+              ) {
+                return curr;
+              }
               const r = curr.runs[step!.id];
               if (!r) return curr;
               return {
@@ -1931,12 +2392,18 @@ export const layer = Layer.effect(
             },
           );
 
+          if (
+            input.signal.aborted ||
+            planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion
+          ) {
+            return;
+          }
           if (verdict.verdict === "pass") {
             break;
           }
 
           if (round >= maxRounds) {
-            await createEscalationAndSave({
+            await savePipelineEscalation({
               projectRoot: input.projectRoot,
               threadId: input.threadId,
               projectId: input.projectId,
@@ -1964,10 +2431,19 @@ export const layer = Layer.effect(
           const issuesToFix = blocking.length > 0 ? blocking : verdict.issues;
           if (!run.childThreadId) return;
 
+          let enteredReviewFix = false;
           await store.update(
             scope,
             (curr) => {
+              if (
+                input.signal.aborted ||
+                planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion ||
+                !curr.steps.some((s) => s.id === step!.id)
+              ) {
+                return curr;
+              }
               const r = curr.runs[step!.id];
+              enteredReviewFix = true;
               return {
                 ...curr,
                 steps: curr.steps.map((s) =>
@@ -1988,6 +2464,13 @@ export const layer = Layer.effect(
             },
             { stepId: step.id, text: `自动打回原执行子线程返修（第 ${round} 轮复查问题）` },
           );
+          if (
+            !enteredReviewFix ||
+            input.signal.aborted ||
+            planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion
+          ) {
+            return;
+          }
 
           const fixParentTid = resolveSubagentParentThreadId(
             state.parentThreadId ?? input.threadId,
@@ -2007,9 +2490,27 @@ export const layer = Layer.effect(
             }),
           );
 
+          const fixChildThreadId = run.childThreadId;
+          const fixStartedAt = run.startedAt;
+          const fixThreadId = ThreadId.make(fixChildThreadId);
+          activeSignalRuns.set(input.signal, {
+            projectId: input.projectId,
+            threadId: fixThreadId,
+            runId: fixSend.run.id,
+          });
+          if (input.signal.aborted) return;
+
           await store.update(scope, (curr) => {
+            if (
+              input.signal.aborted ||
+              planVersion(input.projectRoot, input.threadId) !== pipelinePlanVersion
+            ) {
+              return curr;
+            }
             const r = curr.runs[step!.id];
-            if (!r) return curr;
+            if (!r || r.childThreadId !== fixChildThreadId || r.startedAt !== fixStartedAt) {
+              return curr;
+            }
             return {
               ...curr,
               runs: {
@@ -2025,15 +2526,15 @@ export const layer = Layer.effect(
 
           const fixWait = await waitForThreadRun({
             projectId: input.projectId,
-            threadId: ThreadId.make(run.childThreadId),
+            threadId: fixThreadId,
             runId: fixSend.run.id,
             signal: input.signal,
           });
-          if (fixWait.aborted) return;
+          if (fixWait.aborted || unsettledDirectSignals.has(input.signal)) return;
 
           const fixQuestion = parseExecutorQuestion(fixWait.assistantText);
           if (fixQuestion) {
-            await createEscalationAndSave({
+            await savePipelineEscalation({
               projectRoot: input.projectRoot,
               threadId: input.threadId,
               projectId: input.projectId,
@@ -2159,11 +2660,11 @@ export const layer = Layer.effect(
       if (prev) prev.abort();
 
       const controller = new AbortController();
+      const expectedPlanVersion = planVersion(projectRoot, threadId);
       activeControllers.set(key, controller);
       if (options?.isDirectWrite) {
-        activeDirectRuns.set(key, normalizeProjectRoot(projectRoot));
-      } else {
-        activeDirectRuns.delete(key);
+        activeDirectRuns.set(controller, normalizeProjectRoot(projectRoot));
+        registerDirectWorkspaceWriter(controller, projectRoot);
       }
 
       void (async () => {
@@ -2175,6 +2676,13 @@ export const layer = Layer.effect(
           await store.update(
             scope,
             (curr) => {
+              if (
+                controller.signal.aborted ||
+                planVersion(projectRoot, threadId) !== expectedPlanVersion ||
+                !curr.steps.some((s) => s.id === stepId)
+              ) {
+                return curr;
+              }
               const r = curr.runs[stepId];
               const now = new Date().toISOString();
               return {
@@ -2199,9 +2707,24 @@ export const layer = Layer.effect(
             { stepId, text: `执行异常：${message}` },
           ).catch(() => undefined);
         } finally {
-          if (activeControllers.get(key) === controller) {
-            activeControllers.delete(key);
-            activeDirectRuns.delete(key);
+          const danglingRun = activeSignalRuns.get(controller.signal);
+          if (danglingRun) {
+            activeSignalRuns.delete(controller.signal);
+            const settled = await interruptThreadRun(danglingRun).catch(() => false);
+            if (!settled) unsettledDirectSignals.set(controller.signal, danglingRun);
+          }
+          const unsettledRun = unsettledDirectSignals.get(controller.signal);
+          if (!unsettledRun) {
+            activeDirectRuns.delete(controller);
+            unregisterDirectWorkspaceWriter(controller);
+            if (activeControllers.get(key) === controller) {
+              activeControllers.delete(key);
+            }
+          } else if (
+            activeDirectRuns.has(controller) ||
+            activeControllers.get(key) === controller
+          ) {
+            reconcileUnsettledDirectRun(key, controller, unsettledRun);
           }
         }
       })();
@@ -2211,6 +2734,10 @@ export const layer = Layer.effect(
       const { projectId, workspaceRoot } = await resolveProject(input.projectRoot);
       const scopeThreadId = resolveScopeThreadId(input.threadId, input.parentThreadId);
       const scope = makeScope(workspaceRoot, scopeThreadId);
+      const expectedPlanVersion = planVersion(workspaceRoot, scopeThreadId);
+      // Callers (dispatchStep, dispatchStepsParallel) await this and do not re-enter it.
+      // Resume, completeSelf, and acceptance repair launch background work directly.
+      return await withWorkspaceAdmission(workspaceRoot, async () => {
       const current = await store.read(scope);
       const step = current.steps.find((s) => s.id === input.stepId);
       if (!step) throw new Error(`未找到任务步：${input.stepId}`);
@@ -2305,12 +2832,9 @@ export const layer = Layer.effect(
             return activeIso === "direct";
           });
 
-      const currentStepActiveKey = activeKey(workspaceRoot, step.id, scopeThreadId);
       const otherDirectActiveCrossThread = readOnly
         ? false
-        : Array.from(activeDirectRuns.entries()).some(
-            ([k, root]) => root === workspaceRoot && k !== currentStepActiveKey,
-          );
+        : Array.from(activeDirectRuns.values()).some((root) => root === workspaceRoot);
       const hasOtherDirectActive = readOnly
         ? false
         : Boolean(otherDirectActiveInScope) || otherDirectActiveCrossThread;
@@ -2388,9 +2912,31 @@ export const layer = Layer.effect(
         updatedAt: now,
       };
 
+      const sharedContractText = await store.readSharedContract(scope);
+      const upstream = collectUpstreamDeliverables(current, step);
+      const basePrompt = buildTaskExecutionPrompt({
+        task: step,
+        sharedContractText,
+        sharedContractPath: current.sharedContractPath ?? undefined,
+        skipPremiseCheck: input.skipPremiseCheck,
+        upstream,
+      });
+      const prompt = isSelf
+        ? `${basePrompt}\n\n（本步由你当前主控对话直接执行；完成后直接结束回复即可自动过边界与门禁检查，也可调用 \`vela_dispatch_step\`（\`action: "complete_self"\`, \`stepId: "${step.id}"\`）主动提交。）`
+        : basePrompt;
+      const parentRuntimeMode = await resolveParentRuntimeMode(parentThreadId);
+      const execTarget = step.executor;
+
       const nextState = await store.update(
         scope,
-        (curr) => ({
+        (curr) => {
+          if (planVersion(workspaceRoot, scopeThreadId) !== expectedPlanVersion) {
+            throw new Error(stalePlanMessage);
+          }
+          if (!curr.steps.some((s) => s.id === step.id)) {
+            throw new Error(`任务步 ${step.id} 已不在当前计划中`);
+          }
+          return {
           ...curr,
           projectId,
           parentThreadId,
@@ -2404,7 +2950,8 @@ export const layer = Layer.effect(
               ? { ...e, status: "dismissed", updatedAt: now }
               : e,
           ),
-        }),
+          };
+        },
         {
           stepId: step.id,
           text: `派发 ${step.id}（${
@@ -2420,21 +2967,6 @@ export const layer = Layer.effect(
           } -> ${execLabel}）`,
         },
       );
-
-      const sharedContractText = await store.readSharedContract(scope);
-      const upstream = collectUpstreamDeliverables(nextState, step);
-      const basePrompt = buildTaskExecutionPrompt({
-        task: step,
-        sharedContractText,
-        sharedContractPath: nextState.sharedContractPath ?? undefined,
-        skipPremiseCheck: input.skipPremiseCheck,
-        upstream,
-      });
-      const prompt = isSelf
-        ? `${basePrompt}\n\n（本步由你当前主控对话直接执行；完成后直接结束回复即可自动过边界与门禁检查，也可调用 \`vela_dispatch_step\`（\`action: "complete_self"\`, \`stepId: "${step.id}"\`）主动提交。）`
-        : basePrompt;
-      const parentRuntimeMode = await resolveParentRuntimeMode(parentThreadId);
-      const execTarget = step.executor;
 
       launchStepBackground(
         workspaceRoot,
@@ -2478,9 +3010,19 @@ export const layer = Layer.effect(
               }),
             );
 
+            activeSignalRuns.set(signal, {
+              projectId,
+              threadId: selfThreadId,
+              runId: sent.run.id,
+            });
+            if (signal.aborted) return;
+
             await store.update(scope, (curr) => {
+              if (signal.aborted || planVersion(workspaceRoot, scopeThreadId) !== expectedPlanVersion) {
+                return curr;
+              }
               const r = curr.runs[step.id];
-              if (!r) return curr;
+              if (!r || r.startedAt !== initialRun.startedAt) return curr;
               return {
                 ...curr,
                 runs: {
@@ -2502,7 +3044,7 @@ export const layer = Layer.effect(
               signal,
               onProgress: onStepProgress,
             });
-            if (waitRes.aborted) return;
+            if (waitRes.aborted || unsettledDirectSignals.has(signal)) return;
 
             const afterSelf = await store.read(scope);
             const latestStepStatus = afterSelf.steps.find((s) => s.id === step.id)?.status;
@@ -2562,6 +3104,13 @@ export const layer = Layer.effect(
           );
 
           const childRunId = launched.projection.runs.at(-1)?.id ?? null;
+          activeSignalRuns.set(signal, {
+            projectId,
+            threadId: launched.threadId,
+            runId: childRunId,
+          });
+          if (signal.aborted) return;
+
           const childWorkspacePath = launched.projection.thread.worktreePath ?? workspaceRoot;
           const runningHeadline =
             kind === "research"
@@ -2571,8 +3120,11 @@ export const layer = Layer.effect(
                 : `${execTarget.providerInstanceId} 正在${effectiveIsolation === "worktree" ? "独立 Worktree" : "当前分支"}中执行代码修改...`;
 
           await store.update(scope, (curr) => {
+            if (signal.aborted || planVersion(workspaceRoot, scopeThreadId) !== expectedPlanVersion) {
+              return curr;
+            }
             const r = curr.runs[step.id];
-            if (!r) return curr;
+            if (!r || r.startedAt !== initialRun.startedAt) return curr;
             return {
               ...curr,
               runs: {
@@ -2596,7 +3148,7 @@ export const layer = Layer.effect(
             signal,
             onProgress: onStepProgress,
           });
-          if (waitRes.aborted) return;
+          if (waitRes.aborted || unsettledDirectSignals.has(signal)) return;
 
           await runPostExecutionPipeline({
             projectRoot: workspaceRoot,
@@ -2612,6 +3164,7 @@ export const layer = Layer.effect(
       );
 
       return nextState;
+      });
     };
 
     const completeBlindCheckRun = async (input: {
@@ -2648,7 +3201,7 @@ export const layer = Layer.effect(
             "",
             input.assistantText.slice(0, 3000),
             "",
-            "请把盲审查到的真实代码事实与你的方案并排给用户对比；确认后调用 `vela_dispatch_plan`（`action: \"save_synthesis\"`）并按最终方案调用 `vela_dispatch_plan`（`action: \"publish\"`）拆单。",
+            "请把盲审查到的真实代码事实与你的方案并排给用户对比；确认后调用 `vela_dispatch_plan`（`action: \"save_synthesis\"`）并按最终方案调用 `vela_dispatch_plan`（`action: \"publish\", engineVersion: 1`）拆单。",
           ].join("\n"),
         });
       }
@@ -2680,7 +3233,9 @@ export const layer = Layer.effect(
       }
 
       const task = (async () => {
+        if (hasWorkspaceAdmission(normalized.projectRoot)) return;
         const state = await store.read(scope);
+        if (hasWorkspaceAdmission(normalized.projectRoot)) return;
         const scopeThreadId = normalized.threadId ?? state.parentThreadId ?? undefined;
         const orphanedBlind =
           state.blindCheck?.status === "running" &&
@@ -2695,6 +3250,7 @@ export const layer = Layer.effect(
         );
 
         if (!orphanedBlind && orphanedSteps.length === 0) return;
+        if (hasWorkspaceAdmission(normalized.projectRoot)) return;
 
         let resolvedProjectId: ProjectId | null = state.projectId
           ? ProjectId.make(state.projectId)
@@ -2873,7 +3429,7 @@ export const layer = Layer.effect(
                   runId: targetRun.id,
                   signal,
                 });
-                if (waitRes.aborted) return;
+                if (waitRes.aborted || unsettledDirectSignals.has(signal)) return;
                 await runPostExecutionPipeline({
                   projectRoot: state.projectRoot,
                   threadId: scopeThreadId,
@@ -2936,6 +3492,39 @@ export const layer = Layer.effect(
         void reconcileOrphanedRuns(scope);
         return unsubscribe;
       },
+
+      listAttentionItems: () =>
+        Effect.promise(async () => {
+          const allStates = await store.listAllStates();
+          const rawItems = extractDispatchAttentionItems(allStates);
+          if (rawItems.length === 0) return rawItems;
+
+          const activeByThreadId = new Map<string, boolean>();
+          const filtered: DispatchAttentionItem[] = [];
+          for (const item of rawItems) {
+            if (!item.threadId) {
+              filtered.push(item);
+              continue;
+            }
+            let isActive = activeByThreadId.get(item.threadId);
+            if (isActive === undefined) {
+              const shell = await runPromise(
+                threadManagement
+                  .getThreadShell(ThreadId.make(item.threadId))
+                  .pipe(Effect.orElseSucceed(() => null)),
+              );
+              isActive =
+                shell !== null && shell.deletedAt === null && shell.archivedAt === null;
+              activeByThreadId.set(item.threadId, isActive);
+            }
+            if (isActive) {
+              filtered.push(item);
+            }
+          }
+          return filtered;
+        }),
+
+      subscribeAll: (listener) => store.subscribeAll(listener),
 
       listProviders: () =>
         providerRegistry.getProviders.pipe(
@@ -3121,16 +3710,8 @@ export const layer = Layer.effect(
             const { projectId, workspaceRoot } = await resolveProject(input.projectRoot);
             const scopeThreadId = resolveScopeThreadId(input.threadId, input.parentThreadId);
             const scope = makeScope(workspaceRoot, scopeThreadId);
+            return await withWorkspaceAdmission(workspaceRoot, async () => {
             const current = await store.read(scope);
-
-            if (!input.append) {
-              const busyStep = current.steps.find((s) => BUSY_STEP_STATUSES.has(s.status));
-              if (busyStep) {
-                throw new Error(
-                  `当前计划有步骤正在执行（${busyStep.id}），请先中止或用 append 追加`,
-                );
-              }
-            }
 
             const providers = await runPromise(providerRegistry.getProviders);
             const parentThreadId = scopeThreadId ?? current.parentThreadId;
@@ -3276,7 +3857,9 @@ export const layer = Layer.effect(
 
             const steps = unlockReadySteps(attachLintWarnings(rawSteps, lintResult.warningsByStep));
 
-            return await store.update(
+            // Only advance the plan generation and abort active runs after the replacement
+            // has been persisted cleanly (never on lint failure, append, or disk write failure).
+            const replacedState = await store.update(
               scope,
               (curr) => ({
                 ...curr,
@@ -3308,6 +3891,12 @@ export const layer = Layer.effect(
                   .join("、")}）`,
               },
             );
+            if (!input.append) {
+              bumpPlanVersion(workspaceRoot, scopeThreadId);
+              abortScopeControllers(workspaceRoot, scopeThreadId);
+            }
+            return replacedState;
+            });
           },
           catch: (e) => (e instanceof Error ? e : new Error(String(e))),
         }),
@@ -3427,25 +4016,58 @@ export const layer = Layer.effect(
         Effect.tryPromise({
           try: async () => {
             const workspaceRoot = normalizeProjectRoot(projectRoot);
-            const scope = makeScope(workspaceRoot, threadId);
-            const key = activeKey(workspaceRoot, stepId, threadId);
-            const controller = activeControllers.get(key);
-            if (controller) {
-              controller.abort();
-              activeControllers.delete(key);
-            }
-            activeDirectRuns.delete(key);
-            const curr = await store.read(scope);
+            return await withWorkspaceAdmission(workspaceRoot, async () => {
+              const scope = makeScope(workspaceRoot, threadId);
+              const key = activeKey(workspaceRoot, stepId, threadId);
+              const controller = activeControllers.get(key);
+              if (controller) {
+                controller.abort();
+              }
+              const curr = await store.read(scope);
 
-            if (stepId === "__blind_check__") {
-              if (curr.blindCheck?.checkerThreadId && curr.projectId) {
+              if (stepId === "__blind_check__") {
+                if (curr.blindCheck?.checkerThreadId && curr.projectId) {
+                  await runPromise(
+                    threadManagement
+                      .interruptThread({
+                        projectId: ProjectId.make(curr.projectId),
+                        commandId: newCommandId("vela-dispatch-stop-blind"),
+                        threadId: ThreadId.make(curr.blindCheck.checkerThreadId),
+                        reason: "用户中止了只读代码盲审",
+                      })
+                      .pipe(Effect.ignore),
+                  );
+                }
+                const now = new Date().toISOString();
+                return await store.update(
+                  scope,
+                  (state) => ({
+                    ...state,
+                    blindCheck:
+                      state.steps.length === 0
+                        ? null
+                        : state.blindCheck
+                          ? {
+                              ...state.blindCheck,
+                              status: "failed",
+                              error: "已手动中止盲审",
+                              updatedAt: now,
+                            }
+                          : null,
+                  }),
+                  { text: "已手动中止只读代码盲审" },
+                );
+              }
+
+              const run = curr.runs[stepId];
+              if (run?.childThreadId && curr.projectId) {
                 await runPromise(
                   threadManagement
                     .interruptThread({
                       projectId: ProjectId.make(curr.projectId),
-                      commandId: newCommandId("vela-dispatch-stop-blind"),
-                      threadId: ThreadId.make(curr.blindCheck.checkerThreadId),
-                      reason: "用户中止了只读代码盲审",
+                      commandId: newCommandId("vela-dispatch-stop"),
+                      threadId: ThreadId.make(run.childThreadId),
+                      reason: "用户中止了该协作任务步",
                     })
                     .pipe(Effect.ignore),
                 );
@@ -3453,64 +4075,31 @@ export const layer = Layer.effect(
               const now = new Date().toISOString();
               return await store.update(
                 scope,
-                (state) => ({
-                  ...state,
-                  blindCheck:
-                    state.steps.length === 0
-                      ? null
-                      : state.blindCheck
-                        ? {
-                            ...state.blindCheck,
-                            status: "failed",
-                            error: "已手动中止盲审",
+                (state) => {
+                  const r = state.runs[stepId];
+                  return {
+                    ...state,
+                    steps: state.steps.map((s) =>
+                      s.id === stepId && s.status !== "done"
+                        ? { ...s, status: "ready", updatedAt: now }
+                        : s,
+                    ),
+                    runs: r
+                      ? {
+                          ...state.runs,
+                          [stepId]: {
+                            ...r,
+                            status: "cancelled",
+                            headline: "已手动中止，可重新派发或撤回本步",
                             updatedAt: now,
-                          }
-                        : null,
-                }),
-                { text: "已手动中止只读代码盲审" },
+                          },
+                        }
+                      : state.runs,
+                  };
+                },
+                { stepId, text: `已中止任务步 ${stepId}` },
               );
-            }
-
-            const run = curr.runs[stepId];
-            if (run?.childThreadId && curr.projectId) {
-              await runPromise(
-                threadManagement
-                  .interruptThread({
-                    projectId: ProjectId.make(curr.projectId),
-                    commandId: newCommandId("vela-dispatch-stop"),
-                    threadId: ThreadId.make(run.childThreadId),
-                    reason: "用户中止了该协作任务步",
-                  })
-                  .pipe(Effect.ignore),
-              );
-            }
-            const now = new Date().toISOString();
-            return await store.update(
-              scope,
-              (state) => {
-                const r = state.runs[stepId];
-                return {
-                  ...state,
-                  steps: state.steps.map((s) =>
-                    s.id === stepId && s.status !== "done"
-                      ? { ...s, status: "ready", updatedAt: now }
-                      : s,
-                  ),
-                  runs: r
-                    ? {
-                        ...state.runs,
-                        [stepId]: {
-                          ...r,
-                          status: "cancelled",
-                          headline: "已手动中止，可重新派发或撤回本步",
-                          updatedAt: now,
-                        },
-                      }
-                    : state.runs,
-                };
-              },
-              { stepId, text: `已中止任务步 ${stepId}` },
-            );
+            });
           },
           catch: (e) => (e instanceof Error ? e : new Error(String(e))),
         }),
@@ -3520,11 +4109,22 @@ export const layer = Layer.effect(
           try: async () => {
             const { projectId, workspaceRoot } = await resolveProject(input.projectRoot);
             const scope = makeScope(workspaceRoot, input.threadId);
+            const expectedPlanVersion = planVersion(workspaceRoot, input.threadId);
+            return await withWorkspaceAdmission(workspaceRoot, async () => {
+            if (planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+              throw new Error(stalePlanMessage);
+            }
             const current = await store.read(scope);
             const esc = current.escalations.find((e) => e.id === input.escalationId);
             if (!esc) throw new Error(`未找到工单：${input.escalationId}`);
+            if (esc.status !== "open_orchestrator" && esc.status !== "open_human") {
+              throw new Error(`工单 ${esc.id} 已处理，无法重复续跑`);
+            }
             const step = current.steps.find((s) => s.id === esc.stepId);
             if (!step) throw new Error(`未找到工单关联的任务步：${esc.stepId}`);
+            if (isActiveExecutionStatus(step.status)) {
+              throw new Error(`任务步 ${step.id} 正在运行中`);
+            }
             const run = current.runs[step.id];
             const now = new Date().toISOString();
 
@@ -3574,9 +4174,67 @@ export const layer = Layer.effect(
               );
             }
 
+            if (!run?.childThreadId) {
+              return await store.update(
+                scope,
+                (curr) => {
+                  if (planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+                    throw new Error(stalePlanMessage);
+                  }
+                  if (!curr.steps.some((s) => s.id === step.id)) return curr;
+                  const live = curr.runs[step.id];
+                  return {
+                    ...curr,
+                    steps: curr.steps.map((s) =>
+                      s.id === step.id ? { ...patchedStep, status: "ready", updatedAt: now } : s,
+                    ),
+                    runs: live
+                      ? {
+                          ...curr.runs,
+                          [step.id]: {
+                            ...live,
+                            status: "ready",
+                            headline: "工单已答复，但没有可续跑的执行子线程，请重新派发",
+                            lastError: null,
+                            updatedAt: now,
+                          },
+                        }
+                      : curr.runs,
+                    escalations: curr.escalations.map((e) =>
+                      e.id === esc.id
+                        ? {
+                            ...e,
+                            status: "resolved",
+                            resolution: {
+                              resolvedBy: input.resolvedBy,
+                              decision: input.decision,
+                              ...(input.selectedOptionId
+                                ? { selectedOptionId: input.selectedOptionId }
+                                : {}),
+                              resolvedAt: now,
+                            },
+                            updatedAt: now,
+                          }
+                        : e,
+                    ),
+                  };
+                },
+                {
+                  stepId: step.id,
+                  text: `工单 ${esc.id} 已答复，但缺少执行子线程，已恢复为可重新派发`,
+                },
+              );
+            }
+
+            assertNoCompetingDirectWrite(current, step.id, workspaceRoot, input.threadId);
+
             const nextState = await store.update(
               scope,
-              (curr) => ({
+              (curr) => {
+                if (planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+                  throw new Error(stalePlanMessage);
+                }
+                return {
                 ...curr,
                 steps: curr.steps.map((s) =>
                   s.id === step.id ? { ...patchedStep, status: "running", updatedAt: now } : s,
@@ -3610,16 +4268,13 @@ export const layer = Layer.effect(
                       }
                     : e,
                 ),
-              }),
+                };
+              },
               {
                 stepId: step.id,
                 text: `${input.resolvedBy === "human" ? "用户" : "主控"}已答复工单 ${esc.id}，恢复原执行子线程续跑`,
               },
             );
-
-            if (!run?.childThreadId) {
-              return nextState;
-            }
 
             const replyPrompt = buildEscalationReplyPrompt({
               task: patchedStep,
@@ -3651,9 +4306,21 @@ export const layer = Layer.effect(
                   }),
                 );
 
+                activeSignalRuns.set(signal, {
+                  projectId,
+                  threadId: ThreadId.make(run.childThreadId!),
+                  runId: sent.run.id,
+                });
+                if (signal.aborted) return;
+
                 await store.update(scope, (curr) => {
+                  if (signal.aborted || planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+                    return curr;
+                  }
                   const r = curr.runs[step.id];
-                  if (!r) return curr;
+                  if (!r || r.childThreadId !== run.childThreadId || r.startedAt !== run.startedAt) {
+                    return curr;
+                  }
                   return {
                     ...curr,
                     runs: {
@@ -3673,7 +4340,7 @@ export const layer = Layer.effect(
                   runId: sent.run.id,
                   signal,
                 });
-                if (waitRes.aborted) return;
+                if (waitRes.aborted || unsettledDirectSignals.has(signal)) return;
 
                 await runPostExecutionPipeline({
                   projectRoot: workspaceRoot,
@@ -3689,6 +4356,7 @@ export const layer = Layer.effect(
             );
 
             return nextState;
+            });
           },
           catch: (e) => (e instanceof Error ? e : new Error(String(e))),
         }),
@@ -3749,11 +4417,20 @@ export const layer = Layer.effect(
           try: async () => {
             const { projectId, workspaceRoot } = await resolveProject(input.projectRoot);
             const scope = makeScope(workspaceRoot, input.threadId);
+            const expectedPlanVersion = planVersion(workspaceRoot, input.threadId);
+            return await withWorkspaceAdmission(workspaceRoot, async () => {
+            if (planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+              throw new Error(stalePlanMessage);
+            }
             const current = await store.read(scope);
             const step = current.steps.find((s) => s.id === input.stepId);
             if (!step) throw new Error(`未找到任务步：${input.stepId}`);
             const run = current.runs[step.id];
             if (!run) throw new Error(`任务步 ${step.id} 尚未执行`);
+            if (step.status === "done") throw new Error(`任务步 ${step.id} 已完成并验收`);
+            if (isActiveExecutionStatus(step.status)) {
+              throw new Error(`任务步 ${step.id} 正在运行中`);
+            }
 
             const failedItems = input.items.filter((item) => item.status === "failed");
             const passed = failedItems.length === 0;
@@ -3835,10 +4512,20 @@ export const layer = Layer.effect(
             }
 
             // Automatically send acceptance fix prompt back to original executor child thread!
+            if (!run.childThreadId) {
+              throw new Error(`任务步 ${step.id} 没有可返修的执行子线程`);
+            }
+            assertNoCompetingDirectWrite(current, step.id, workspaceRoot, input.threadId);
             const nextState = await store.update(
               scope,
               (curr) => {
-                const r = curr.runs[step.id]!;
+                if (planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+                  throw new Error(stalePlanMessage);
+                }
+                const r = curr.runs[step.id];
+                if (!r || !curr.steps.some((s) => s.id === step.id)) {
+                  throw new Error(stalePlanMessage);
+                }
                 return {
                   ...curr,
                   steps: curr.steps.map((s) =>
@@ -3887,9 +4574,21 @@ export const layer = Layer.effect(
                   }),
                 );
 
+                activeSignalRuns.set(signal, {
+                  projectId,
+                  threadId: ThreadId.make(childThreadId),
+                  runId: sent.run.id,
+                });
+                if (signal.aborted) return;
+
                 await store.update(scope, (curr) => {
+                  if (signal.aborted || planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+                    return curr;
+                  }
                   const r = curr.runs[step.id];
-                  if (!r) return curr;
+                  if (!r || r.childThreadId !== run.childThreadId || r.startedAt !== run.startedAt) {
+                    return curr;
+                  }
                   return {
                     ...curr,
                     runs: {
@@ -3909,7 +4608,7 @@ export const layer = Layer.effect(
                   runId: sent.run.id,
                   signal,
                 });
-                if (waitRes.aborted) return;
+                if (waitRes.aborted || unsettledDirectSignals.has(signal)) return;
 
                 await runPostExecutionPipeline({
                   projectRoot: workspaceRoot,
@@ -3925,6 +4624,7 @@ export const layer = Layer.effect(
             );
 
             return nextState;
+            });
           },
           catch: (e) => (e instanceof Error ? e : new Error(String(e))),
         }),
@@ -3967,6 +4667,7 @@ export const layer = Layer.effect(
           try: async () => {
             const workspaceRoot = normalizeProjectRoot(input.projectRoot);
             const scope = makeScope(workspaceRoot, input.threadId);
+            const expectedPlanVersion = planVersion(workspaceRoot, input.threadId);
             const current = await store.read(scope);
             const step = current.steps.find((s) => s.id === input.stepId);
             if (!step) throw new Error(`未找到任务步：${input.stepId}`);
@@ -3992,23 +4693,22 @@ export const layer = Layer.effect(
                 ? "hard_gate_failed"
                 : "done";
 
-            const nextSteps = current.steps.map((s) =>
-              s.id === step.id ? { ...s, status, updatedAt: now } : s,
-            );
-            const unlockedSteps = ok ? unlockReadySteps(nextSteps) : nextSteps;
-
-            if (ok) {
-              await store.appendLedger(
-                scope,
-                `## ${step.id} ${step.title} (self)\n- 时间：${now}\n- 摘要：${input.summary}\n- 改动文件：${diffSummary.changedFiles.join(", ") || "无"}`,
-              );
-            }
-
-            return await store.update(
+            const updatedState = await store.update(
               scope,
-              (curr) => ({
+              (curr) => {
+                if (planVersion(workspaceRoot, input.threadId) !== expectedPlanVersion) {
+                  throw new Error(stalePlanMessage);
+                }
+                const liveStep = curr.steps.find((s) => s.id === step.id);
+                if (!liveStep || liveStep.createdAt !== step.createdAt) {
+                  throw new Error(stalePlanMessage);
+                }
+                const nextSteps = curr.steps.map((s) =>
+                  s.id === step.id ? { ...s, status, updatedAt: now } : s,
+                );
+                return {
                 ...curr,
-                steps: unlockedSteps,
+                steps: ok ? unlockReadySteps(nextSteps) : nextSteps,
                 runs: {
                   ...curr.runs,
                   [step.id]: {
@@ -4037,12 +4737,22 @@ export const layer = Layer.effect(
                     updatedAt: now,
                   },
                 },
-              }),
+                };
+              },
               {
                 stepId: step.id,
                 text: ok ? `主控自执行 ${step.id} 已通过检查并解锁下一步` : `主控自执行 ${step.id} 未通过检查`,
               },
             );
+
+            if (ok) {
+              await store.appendLedger(
+                scope,
+                `## ${step.id} ${step.title} (self)\n- 时间：${now}\n- 摘要：${input.summary}\n- 改动文件：${diffSummary.changedFiles.join(", ") || "无"}`,
+              );
+            }
+
+            return updatedState;
           },
           catch: (e) => (e instanceof Error ? e : new Error(String(e))),
         }),
@@ -4282,64 +4992,82 @@ export const layer = Layer.effect(
           catch: (e) => (e instanceof Error ? e : new Error(String(e))),
         }),
 
-      revertStep: (projectRoot, stepId, threadId) =>
+      revertStep: (projectRoot, stepId, threadId, options) =>
         Effect.tryPromise({
           try: async () => {
             const workspaceRoot = normalizeProjectRoot(projectRoot);
-            const scope = makeScope(workspaceRoot, threadId);
-            const key = activeKey(workspaceRoot, stepId, threadId);
-            const controller = activeControllers.get(key);
-            if (controller) {
-              controller.abort();
-              activeControllers.delete(key);
-            }
-            activeDirectRuns.delete(key);
+            return await withWorkspaceAdmission(workspaceRoot, async () => {
+              const scope = makeScope(workspaceRoot, threadId);
+              const key = activeKey(workspaceRoot, stepId, threadId);
+              const controller = activeControllers.get(key);
+              if (controller) {
+                controller.abort();
+              }
 
-            const current = await store.read(scope);
-            const step = current.steps.find((s) => s.id === stepId);
-            if (!step) throw new Error(`未找到任务步：${stepId}`);
-            const run = current.runs[stepId];
+              const current = await store.read(scope);
+              const step = current.steps.find((s) => s.id === stepId);
+              if (!step) throw new Error(`未找到任务步：${stepId}`);
+              const run = current.runs[stepId];
 
-            if (run?.childThreadId && current.projectId) {
-              await runPromise(
-                threadManagement
-                  .interruptThread({
-                    projectId: ProjectId.make(current.projectId),
-                    commandId: newCommandId("vela-dispatch-revert-stop"),
-                    threadId: ThreadId.make(run.childThreadId),
-                    reason: "撤回任务步并回滚工作区",
-                  })
-                  .pipe(Effect.ignore),
+              if (run?.childThreadId && current.projectId) {
+                const settled = await interruptThreadRun({
+                  projectId: ProjectId.make(current.projectId),
+                  threadId: ThreadId.make(run.childThreadId),
+                });
+                if (!settled) {
+                  throw new Error("原执行子线程尚未确认中止，暂不能安全撤回工作区改动");
+                }
+              }
+
+              let revertNote = "已重置该任务步";
+              if (run?.isolation === "direct" && run.baselineTree) {
+                if (Array.from(activeDirectRuns.values()).some((root) => root === workspaceRoot)) {
+                  throw new Error("工作区仍有运行中的直写任务尚未停止，请待其完全中止后再撤回文件");
+                }
+                const reverted = await revertStepSnapshotSafely(workspaceRoot, {
+                  baselineTree: run.baselineTree,
+                  completedTree: run.completedTree,
+                  trackedFiles: run.diffSummary?.changedFiles,
+                  force: options?.force,
+                });
+                if (reverted.conflicts.length > 0) {
+                  const detail = reverted.conflicts
+                    .map((c) => `${c.file}（${c.reason}）`)
+                    .join("；");
+                  throw new Error(`撤回存在冲突，已中止回滚以避免覆盖你的手工改动：${detail}`);
+                }
+                const parts = [
+                  `已回滚 ${reverted.restoredFiles.length} 个文件`,
+                  `清理 ${reverted.removedFiles.length} 个新建文件`,
+                ];
+                if (reverted.mergedFiles.length > 0) {
+                  parts.push(`自动三方合并保留手工改动 ${reverted.mergedFiles.length} 个文件`);
+                }
+                revertNote = parts.join("、");
+              }
+
+              const now = new Date().toISOString();
+              return await store.update(
+                scope,
+                (curr) => {
+                  const { [stepId]: _removed, ...restRuns } = curr.runs;
+                  return {
+                    ...curr,
+                    steps: curr.steps.map((s) =>
+                      s.id === stepId ? { ...s, status: "ready", updatedAt: now } : s,
+                    ),
+                    runs: restRuns,
+                    escalations: curr.escalations.map((e) =>
+                      e.stepId === stepId &&
+                      (e.status === "open_orchestrator" || e.status === "open_human")
+                        ? { ...e, status: "dismissed", updatedAt: now }
+                        : e,
+                    ),
+                  };
+                },
+                { stepId, text: `撤回 ${stepId}：${revertNote}` },
               );
-            }
-
-            let revertNote = "已重置该任务步";
-            if (run?.isolation === "direct" && run.baselineTree) {
-              const reverted = await revertWorkspaceToSnapshot(workspaceRoot, run.baselineTree);
-              revertNote = `已回滚 ${reverted.restoredFiles.length} 个文件、清理 ${reverted.removedFiles.length} 个新建文件`;
-            }
-
-            const now = new Date().toISOString();
-            return await store.update(
-              scope,
-              (curr) => {
-                const { [stepId]: _removed, ...restRuns } = curr.runs;
-                return {
-                  ...curr,
-                  steps: curr.steps.map((s) =>
-                    s.id === stepId ? { ...s, status: "ready", updatedAt: now } : s,
-                  ),
-                  runs: restRuns,
-                  escalations: curr.escalations.map((e) =>
-                    e.stepId === stepId &&
-                    (e.status === "open_orchestrator" || e.status === "open_human")
-                      ? { ...e, status: "dismissed", updatedAt: now }
-                      : e,
-                  ),
-                };
-              },
-              { stepId, text: `撤回 ${stepId}：${revertNote}` },
-            );
+            });
           },
           catch: (e) => (e instanceof Error ? e : new Error(String(e))),
         }),
@@ -4347,24 +5075,20 @@ export const layer = Layer.effect(
       clearPlan: (projectRoot, threadId) =>
         Effect.promise(async () => {
           const workspaceRoot = normalizeProjectRoot(projectRoot);
-          const scope = makeScope(workspaceRoot, threadId);
-          const scopePrefix = `${normalizeDispatchScope(scope).key}::`;
-          for (const [key, ctrl] of activeControllers.entries()) {
-            if (key.startsWith(scopePrefix)) {
-              ctrl.abort();
-              activeControllers.delete(key);
-              activeDirectRuns.delete(key);
-            }
-          }
-          return await store.update(scope, (curr) => {
-            const now = new Date().toISOString();
-            const history = archiveCurrentPlan(curr, now);
-            return {
-              ...createEmptyDispatchState(workspaceRoot, threadId),
-              projectId: curr.projectId,
-              config: curr.config,
-              history,
-            };
+          bumpPlanVersion(workspaceRoot, threadId);
+          return await withWorkspaceAdmission(workspaceRoot, async () => {
+            const scope = makeScope(workspaceRoot, threadId);
+            abortScopeControllers(workspaceRoot, threadId);
+            return await store.update(scope, (curr) => {
+              const now = new Date().toISOString();
+              const history = archiveCurrentPlan(curr, now);
+              return {
+                ...createEmptyDispatchState(workspaceRoot, threadId),
+                projectId: curr.projectId,
+                config: curr.config,
+                history,
+              };
+            });
           });
         }),
 
@@ -4419,8 +5143,8 @@ export const layer = Layer.effect(
               "1. 仅拆解当前对话**最近一轮对齐、尚未落地**的需求，忽略前面已完成或无关的讨论；若存在多个未决话题或范围不清，请先反问用户确认，不要直接发布。",
               "2. 调用 `publish` 时必须传入 `requirementSummary`（3~8 行，写清「做什么 / 不做什么」）。",
               "3. 每张任务卡都必须明确设置 `kind`：调研、排查、核对类任务用 `research`（只读，产出结论报告，禁止改文件）；需要用户选方案的用 `decision`（已知选项直接填 `decisionOptions`，未知时留空让执行代理只读调研后提出 2~4 个选项）；只有真的要修改代码/文档/配置才用 `change`。**严禁把非开发任务包装成 `change`。**",
-              "4. `change` 卡必须填写 `acceptanceCriteria`，尽量填写 `allowedGlobs`；`hardGates` 只放可执行终端命令（如 `vp run typecheck`），文字约束放 `contractNote`。",
-              "5. 互相独立的模块设 `dependsOn: []` 以便同时解锁并行执行，有先后依赖的才填前置 `stepId`；未指定专用模型时省略 `executor` 与 `reviewer`；发布后停下等用户在右侧面板确认或派发，不要自动开跑。",
+              "4. `change` 卡必须填写验收条目，尽量填写 `allowedGlobs`；`hardGates` 只放可执行终端命令（如 `vp run typecheck`），文字约束放 `contractNote`。",
+              "5. 互相独立的模块设 `dependsOn: []` 以便同时解锁并行执行，有先后依赖的才填前置 `stepId`；未指定专用模型时省略 `executor` 与 `reviewer`。",
             ];
 
             const prompt =
@@ -4430,7 +5154,7 @@ export const layer = Layer.effect(
                       ? `请使用 Vela 任务派发严谨模式处理以下需求：\n\n${req}`
                       : "请基于我们当前对话最近一轮对齐且尚未落地的需求，启用 Vela 任务派发严谨模式推进。",
                     "",
-                    "请先调用 `vela_dispatch_plan`（`action: \"blind_check\"`）只传客观需求与技术背景启动只读盲审（如无特殊指定请省略 `checker` 字段以沿用用户选定的默认 AI）；等盲审返回后与你的方案对比确认，再调用 `vela_dispatch_plan`（`action: \"publish\"`）发布任务卡。",
+                    "请先调用 `vela_dispatch_plan`（`action: \"blind_check\"`）只传客观需求与技术背景启动只读盲审（如无特殊指定请省略 `checker` 字段以沿用用户选定的默认 AI）；等盲审返回后与你的方案对比确认，再调用 `vela_dispatch_plan`（`action: \"publish\", engineVersion: 1`）发布任务卡。`change` 卡请填写 `acceptanceCriteria`，发布后等用户确认派发。",
                     "",
                     ...commonRules,
                   ].join("\n")
@@ -4439,7 +5163,10 @@ export const layer = Layer.effect(
                       ? `请把以下需求拆解为结构化任务卡发布到 Vela 任务派发面板：\n\n${req}`
                       : "请把我们当前对话最近一轮对齐、尚未落地的方案拆解为有序的结构化任务卡，发布到 Vela 任务派发面板。",
                     "",
-                    "请直接调用 `vela_dispatch_plan`（`action: \"publish\"`），不要启动 `blind_check` 子代理，也不要自动调用 `vela_dispatch_step` 开跑。",
+                    "请调用 `vela_dispatch_plan`（`action: \"publish\"`）发布 v2 协作计划，每条 `criteria` 填写稳定的 `id` 和 `text`。默认启动受管 worktree；若用户要求先审计划，传 `autoStart: false`。主控按队列审查冻结快照，批验通过后由用户在面板一次确认交付。",
+                    ...(input.enableBatchAudit === true
+                      ? ["用户已开启交付前冷眼终审。发布时设置 `enableBatchAudit: true`。"]
+                      : []),
                     "",
                     ...commonRules,
                   ].join("\n");
@@ -4455,14 +5182,13 @@ export const layer = Layer.effect(
                   userInput: req || undefined,
                   capturedAt: now,
                 },
-                ...(input.defaultAgent !== undefined
-                  ? {
-                      config: {
-                        ...curr.config,
-                        defaultAgent: input.defaultAgent,
-                      },
-                    }
-                  : {}),
+                config: {
+                  ...curr.config,
+                  ...(input.defaultAgent === undefined ? {} : { defaultAgent: input.defaultAgent }),
+                  ...(input.mode === "fast" && input.enableBatchAudit !== undefined
+                    ? { enableBatchAudit: input.enableBatchAudit }
+                    : {}),
+                },
               }),
               {
                 text:
@@ -4533,7 +5259,6 @@ export const layer = Layer.effect(
                       return {
                         ...s,
                         executor: resolvedFallback,
-                        reviewer: s.reviewer === null ? null : resolvedFallback,
                         updatedAt: now,
                       };
                     })

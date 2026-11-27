@@ -2,14 +2,19 @@ import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { m } from "~/i18n/messages";
 import { useScopedSettingsWriteAllowed } from "./useScopedSettings";
 import { AuthSettingsWriteScope } from "@t3tools/contracts";
-import { EnvironmentId, type T3ProjectFileScript } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  LEGACY_T3_PROJECT_FILE_NAME,
+  T3_PROJECT_FILE_NAME,
+  type T3ProjectFileScript,
+} from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { ChevronDownIcon, PlusIcon } from "lucide-react";
-import { T, useGT } from "gt-react";
+import { T, Var, useGT } from "gt-react";
 import { useState } from "react";
 import { useT3ProjectFileState } from "../../hooks/useT3ProjectFileScripts";
 import { useEnvironments } from "../../state/environments";
@@ -146,10 +151,18 @@ export function ProjectActionsSettings() {
                 <MenuPopup align="end">
                   <MenuGroup>
                     <MenuGroupLabel>
-                      <T>Import from vela.json</T>
+                      <T>
+                        Import from <Var>{t3File.fileName ?? T3_PROJECT_FILE_NAME}</Var>
+                      </T>
                     </MenuGroupLabel>
                     <p className="px-2 pb-2 text-pretty text-sm text-muted-foreground">
-                      <T>Add actions declared by this checkout without editing them first.</T>
+                      {t3File.fileName === LEGACY_T3_PROJECT_FILE_NAME ? (
+                        <T>
+                          Reading legacy t3.json. Rename it to vela.json to follow the new format.
+                        </T>
+                      ) : (
+                        <T>Add actions declared by this checkout without editing them first.</T>
+                      )}
                     </p>
                   </MenuGroup>
                   <MenuSeparator />

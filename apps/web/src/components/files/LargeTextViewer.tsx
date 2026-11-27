@@ -6,7 +6,11 @@ import { parseDelimitedPreview } from "@t3tools/shared/delimitedPreview";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import { useClientSettings } from "~/hooks/useSettings";
 import { FileSurfaceFailure, FileSurfaceLoading, FileSurfaceNotice } from "./fileSurfaceChrome";
-import { PREVIEW_PAGE_ROWS, type TextPreviewResult } from "./largeTextProtocol";
+import {
+  LARGE_TEXT_MAX_COLUMNS,
+  PREVIEW_PAGE_ROWS,
+  type TextPreviewResult,
+} from "./largeTextProtocol";
 import { previewFailureText } from "./previewFailureMessages";
 import VirtualTablePreview from "./VirtualTablePreview";
 
@@ -17,7 +21,7 @@ function firstScreen(text: string, delimiter: "," | "\t" | null, complete: boole
   const rows = delimiter
     ? parseDelimitedPreview(text, delimiter, {
         maxRows: PREVIEW_PAGE_ROWS * 2 + 1,
-        maxColumns: 1024,
+        maxColumns: LARGE_TEXT_MAX_COLUMNS,
         maxCellLength: FIRST_SCREEN_BYTES,
       }).rows
     : text
@@ -35,6 +39,10 @@ type Meta = Extract<TextPreviewResult, { type: "meta" }>;
 function firstScreenState(text: string, delimiter: "," | "\t" | null, complete: boolean) {
   const rows = firstScreen(text, delimiter, complete);
   if (!rows.length) return null;
+  const displayedColumns = Math.min(
+    LARGE_TEXT_MAX_COLUMNS,
+    rows.reduce((max, row) => Math.max(max, row.length), 1),
+  );
   return {
     pages: new Map(
       [0, PREVIEW_PAGE_ROWS]
@@ -44,7 +52,8 @@ function firstScreenState(text: string, delimiter: "," | "\t" | null, complete: 
     meta: {
       type: "meta",
       count: rows.length,
-      columns: rows.reduce((max, row) => Math.max(max, row.length), 1),
+      displayedColumns,
+      totalColumns: displayedColumns,
       complete: false,
     } satisfies Meta as Meta,
   };
@@ -249,7 +258,9 @@ export default function LargeTextViewer(props: {
   if (!meta || (meta.count > 0 && !pages.has(0))) return <FileSurfaceLoading />;
   const header = props.delimiter ? pages.get(0)?.[0] : undefined;
   const rowCount = Math.max(0, meta.count - 1);
-  const columnCount = meta.count ? meta.columns : 0;
+  const totalColumns = meta.count ? meta.totalColumns : 0;
+  const displayedColumns = meta.count ? Math.min(meta.displayedColumns, LARGE_TEXT_MAX_COLUMNS) : 0;
+  const columnsTruncated = Boolean(props.delimiter) && totalColumns > LARGE_TEXT_MAX_COLUMNS;
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div
@@ -264,8 +275,8 @@ export default function LargeTextViewer(props: {
                 count: rowCount,
                 formatted: rowCount.toLocaleString(),
               })} · ${gt("{count, plural, one {{formatted} column} other {{formatted} columns}}", {
-                count: columnCount,
-                formatted: columnCount.toLocaleString(),
+                count: totalColumns,
+                formatted: totalColumns.toLocaleString(),
               })}`
             : gt("{count, plural, one {{formatted} line} other {{formatted} lines}}", {
                 count: meta.count,
@@ -280,7 +291,7 @@ export default function LargeTextViewer(props: {
           <Spinner size="md" tone="muted" />
         </div>
       ) : null}
-      {meta.columns === 1024 ? (
+      {columnsTruncated ? (
         <FileSurfaceNotice>
           <T>Showing the first 1,024 columns. Source and Save retain every column.</T>
         </FileSurfaceNotice>
@@ -289,7 +300,7 @@ export default function LargeTextViewer(props: {
         <VirtualTablePreview
           name={props.name}
           count={meta.count}
-          columns={meta.columns}
+          columns={displayedColumns}
           header={header}
           source={!props.delimiter}
           wrap={wordWrap}

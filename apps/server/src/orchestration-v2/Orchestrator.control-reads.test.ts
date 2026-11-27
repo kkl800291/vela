@@ -80,6 +80,53 @@ const layerTest = Layer.mergeAll(
   ),
 );
 
+it.effect("refuses to promote a queued system collaboration wake to Steer", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("collaboration-steer-thread");
+    const projectId = ProjectId.make("collaboration-steer-project");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("collaboration-steer-create"),
+      threadId,
+      projectId,
+      title: "Collaboration",
+      modelSelection,
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    for (const actor of ["user", "system"] as const) {
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`collaboration-steer-${actor}`),
+        threadId,
+        messageId: MessageId.make(`collaboration-steer-${actor}`),
+        text: actor === "system" ? "[Vela collaboration review]" : "Existing user turn",
+        attachments: [],
+        dispatchMode: { type: actor === "system" ? "queue_after_active" : "start_immediately" },
+        createdBy: actor,
+        creationSource: actor === "system" ? "server" : "web",
+      });
+    }
+    const { runs } = yield* orchestrator.getThreadProjection(threadId);
+    const active = runs.find((run) => run.userMessageId === MessageId.make("collaboration-steer-user"))!;
+    const queued = runs.find((run) => run.userMessageId === MessageId.make("collaboration-steer-system"))!;
+    assert.equal(queued.status, "queued");
+    const error = yield* Effect.flip(orchestrator.dispatch({
+      type: "queued-message.promote-to-steer",
+      commandId: CommandId.make("promote-collaboration-wake"),
+      threadId, queuedRunId: queued.id, targetRunId: active.id,
+    }));
+    assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
+    assert.match(String(error.cause), /System collaboration messages cannot be promoted to Steer/);
+    assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs.find(({ id }) => id === queued.id)?.status, "queued");
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect.each(
   (["provider.switch", "thread.model-selection.set"] as const).flatMap((type) =>
     [

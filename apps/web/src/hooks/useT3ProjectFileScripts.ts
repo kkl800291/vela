@@ -1,4 +1,5 @@
 import {
+  LEGACY_T3_PROJECT_FILE_NAME,
   T3_PROJECT_FILE_NAME,
   type EnvironmentId,
   type T3ProjectFile,
@@ -12,6 +13,7 @@ const NO_SCRIPTS: ReadonlyArray<T3ProjectFileScript> = [];
 
 export interface T3ProjectFileState {
   status: "loading" | "missing" | "invalid" | "valid";
+  fileName: string | null;
   file: T3ProjectFile | null;
   scripts: ReadonlyArray<T3ProjectFileScript>;
 }
@@ -20,21 +22,48 @@ export function useT3ProjectFileState(
   environmentId: EnvironmentId,
   cwd: string | null,
 ): T3ProjectFileState {
-  const query = useProjectFileQuery(environmentId, cwd ?? "", T3_PROJECT_FILE_NAME, cwd !== null);
-  const contents = query.data && !query.data.truncated ? query.data.contents : null;
-  const isPending = query.isPending;
+  const primaryQuery = useProjectFileQuery(
+    environmentId,
+    cwd ?? "",
+    T3_PROJECT_FILE_NAME,
+    cwd !== null,
+  );
+  const primaryContents =
+    primaryQuery.data && !primaryQuery.data.truncated ? primaryQuery.data.contents : null;
+  const shouldCheckLegacy = cwd !== null && !primaryQuery.isPending && primaryContents === null;
+  const legacyQuery = useProjectFileQuery(
+    environmentId,
+    cwd ?? "",
+    LEGACY_T3_PROJECT_FILE_NAME,
+    shouldCheckLegacy,
+  );
+  const legacyContents =
+    shouldCheckLegacy && legacyQuery.data && !legacyQuery.data.truncated
+      ? legacyQuery.data.contents
+      : null;
+
+  const isPending = primaryQuery.isPending || (shouldCheckLegacy && legacyQuery.isPending);
+  const contents = primaryContents ?? legacyContents;
+  const fileName =
+    primaryContents !== null
+      ? T3_PROJECT_FILE_NAME
+      : legacyContents !== null
+        ? LEGACY_T3_PROJECT_FILE_NAME
+        : null;
+
   if (contents === null) {
     return {
       status: isPending ? "loading" : "missing",
+      fileName: null,
       file: null,
       scripts: NO_SCRIPTS,
     } as const;
   }
   const file = parseT3ProjectFile(contents);
   if (file === null) {
-    return { status: "invalid", file: null, scripts: NO_SCRIPTS } as const;
+    return { status: "invalid", fileName, file: null, scripts: NO_SCRIPTS } as const;
   }
-  return { status: "valid", file, scripts: file.scripts ?? NO_SCRIPTS } as const;
+  return { status: "valid", fileName, file, scripts: file.scripts ?? NO_SCRIPTS } as const;
 }
 
 export function useT3ProjectFileScripts(

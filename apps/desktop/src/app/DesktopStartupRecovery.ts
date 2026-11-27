@@ -20,7 +20,7 @@ import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopObservability from "./DesktopObservability.ts";
 import * as DesktopState from "./DesktopState.ts";
 
-const RELEASES_URL = "https://github.com/pingdotgg/t3code/releases";
+const RELEASES_URL = "https://github.com/kkl800291/vela/releases";
 const LAST_STARTED_VERSION_FILE = "desktop-last-started-version";
 // Buttons are plain links to this host; will-navigate cancels them and runs the action.
 const ACTION_ORIGIN = "https://startup-recovery.invalid";
@@ -204,7 +204,7 @@ export const listen: Effect.Effect<
   );
 
   const windowRef = yield* Ref.make(Option.none<Electron.BrowserWindow>());
-  // The failure that opened the window; later restarts do not reload its details.
+  // Latest failure backing the recovery UI and "Copy details" action.
   const failureRef = yield* Ref.make(Option.none<BackendStartupFailure>());
   const renderedHtmlRef = yield* Ref.make("");
   const checkedRef = yield* Ref.make(false);
@@ -380,9 +380,13 @@ export const listen: Effect.Effect<
           return;
         }
         if (startup._tag !== "Failing") return;
-        if (Option.isSome(yield* Ref.get(failureRef))) return;
+        const alreadyShowingFailure = Option.isSome(yield* Ref.get(failureRef));
         const { _tag, ...failure } = startup;
         yield* Ref.set(failureRef, Option.some(failure));
+        if (alreadyShowingFailure) {
+          yield* render;
+          return;
+        }
         // The backend manager already logs each failure's reason.
         yield* logWarning("primary backend failing to start");
         yield* show();

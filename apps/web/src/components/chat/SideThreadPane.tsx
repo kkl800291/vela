@@ -91,7 +91,6 @@ export default function SideThreadPane(props: {
   // A tab opens for side chats and subagents only, so an unloaded one is still one of them.
   const kind = sideThreadKindOf(thread) ?? "subagent";
   const isSideChat = kind === "side-chat";
-  const isDispatchSubagent = !isSideChat && thread?.workflowRun?.workflow === "vela-dispatch";
   const canOperate = useEnvironmentScope(parentRef.environmentId, AuthOrchestrationOperateScope);
   const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
   const confirmThreadDelete = useClientSettings((settings) => settings.confirmThreadDelete);
@@ -196,27 +195,6 @@ export default function SideThreadPane(props: {
             onClick={props.onClose}
           >
             <XIcon />
-          </Button>
-        </div>
-      ) : isDispatchSubagent ? (
-        <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border pr-2 pl-3">
-          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-            {gt("Dispatch subagent · Continue in main chat")}
-          </span>
-          <Button
-            variant="ghost"
-            size="xs"
-            onClick={() => useRightPanelStore.getState().open(parentRef, "dispatch")}
-          >
-            {gt("Dispatch")}
-          </Button>
-          <Button
-            variant="ghost"
-            size="xs"
-            aria-disabled={!canAddToChat || undefined}
-            onClick={addToChat}
-          >
-            <T>Add to chat</T>
           </Button>
         </div>
       ) : null}

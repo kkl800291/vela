@@ -533,6 +533,13 @@ export type MessagesTimelineRow = MessagesTimelineRowContent & {
 
 type MessagesTimelineRowContent =
   | {
+      kind: "collab-review-fold";
+      id: string;
+      createdAt: string;
+      count: number;
+      expanded: boolean;
+    }
+  | {
       kind: "worktree-setup";
       id: string;
       createdAt: string | null;
@@ -1616,6 +1623,130 @@ function deriveTimelineTurnFolds(
   });
 }
 
+function isCollabReviewWake(message: ChatMessage): boolean {
+  return (
+    message.role !== "assistant" &&
+    message.id.startsWith("vela-collab:") &&
+    message.createdBy === "system" &&
+    message.creationSource === "server" &&
+    /^\[Vela collaboration review\](?:\r?\n|$)/.test(message.text)
+  );
+}
+
+interface CollabReviewGroup {
+  readonly id: string;
+  readonly createdAt: string;
+  count: number;
+}
+
+function foldCollabReviewRows(
+  rows: MessagesTimelineRow[],
+  input: MessagesTimelineRowsInput,
+  unsettledRunId: RunId | null,
+): MessagesTimelineRow[] {
+  if (
+    !input.timelineEntries.some(
+      (entry) => entry.kind === "message" && isCollabReviewWake(entry.message),
+    )
+  ) {
+    return rows;
+  }
+  const userActionRuns = new Set<RunId>();
+  for (const entry of input.timelineEntries) {
+    if (entry.kind !== "work" || !entry.entry.runId) continue;
+    const item = entry.entry.projectedItem?.item;
+    if (
+      entry.entry.itemType === "user_input_request" ||
+      (item?.type === "approval_request" && input.pendingApprovalRequestIds?.has(item.requestId))
+    ) {
+      userActionRuns.add(entry.entry.runId);
+    }
+  }
+  const wakes = new Map<MessageId, CollabReviewGroup>();
+  const runs = new Map<RunId, CollabReviewGroup>();
+  let group: CollabReviewGroup | undefined;
+  for (const entry of input.timelineEntries) {
+    if (entry.kind !== "message") continue;
+    const { message } = entry;
+    if (message.role === "assistant") {
+      if (message.runId && runs.get(message.runId) !== group) group = undefined;
+      continue;
+    }
+    if (!isCollabReviewWake(message) || (message.runId && userActionRuns.has(message.runId))) {
+      group = undefined;
+      continue;
+    }
+    group ??= { id: `collab-review:${message.id}`, createdAt: entry.createdAt, count: 0 };
+    group.count++;
+    wakes.set(message.id, group);
+    if (message.runId) runs.set(message.runId, group);
+  }
+  if (wakes.size === 0) return rows;
+
+  const groupForRun = (runId: RunId | null | undefined) => (runId ? runs.get(runId) : undefined);
+  const groupsByEntryId = new Map<string, CollabReviewGroup>();
+  let focused: CollabReviewGroup | undefined;
+  for (const entry of input.timelineEntries) {
+    const match =
+      entry.kind === "message" && entry.message.role !== "assistant"
+        ? wakes.get(entry.message.id)
+        : groupForRun(
+            entry.kind === "event" ? entry.projectedItem.item.runId : timelineEntryRunId(entry),
+          );
+    if (match) {
+      if (
+        entry.id === input.revealedCollabEntryId ||
+        (entry.kind === "message" && entry.message.id === input.revealedMessageId)
+      ) {
+        focused = match;
+      }
+      groupsByEntryId.set(entry.id, match);
+      if (entry.kind === "work") {
+        groupsByEntryId.set(`${workGroupId(entry.id)}:viewed-images`, match);
+      }
+    }
+  }
+  const seen = new Set<CollabReviewGroup>();
+  const result: MessagesTimelineRow[] = [];
+  for (const row of rows) {
+    let match = groupsByEntryId.get(row.id);
+    switch (row.kind) {
+      case "assistant-meta":
+        match = groupForRun(row.message.runId);
+        break;
+      case "turn-fold":
+      case "attempt-fold":
+      case "work-toggle":
+        match ??= groupForRun(row.runId);
+        break;
+      case "work-live":
+        match ??= groupForRun(row.entry.runId);
+        break;
+      case "work":
+        match = groupForRun(row.groupedEntries[0]?.runId);
+        if (match && row.groupedEntries.some((entry) => groupForRun(entry.runId) !== match)) {
+          match = undefined;
+        }
+        break;
+      case "working":
+      case "thinking":
+        match ??= groupForRun(unsettledRunId);
+        break;
+    }
+    if (match === undefined) {
+      result.push(row);
+      continue;
+    }
+    const expanded = focused === match || input.expandedCollabReviewIds?.has(match.id) === true;
+    if (!seen.has(match)) {
+      seen.add(match);
+      result.push({ kind: "collab-review-fold", ...match, expanded });
+    }
+    if (expanded) result.push(row);
+  }
+  return result;
+}
+
 export function deriveMessagesTimelineRows(
   input: {
     timelineEntries: ReadonlyArray<TimelineEntry>;
@@ -1627,6 +1758,8 @@ export function deriveMessagesTimelineRows(
     expandedRunIds?: ReadonlySet<RunId>;
     expandedAttemptIds?: ReadonlySet<RunAttemptId>;
     expandedWorkGroupIds?: ReadonlySet<string>;
+    expandedCollabReviewIds?: ReadonlySet<string> | undefined;
+    revealedCollabEntryId?: string | undefined;
     isWorking: boolean;
     /** Native subagent work has no app run; runless entries form the live response. */
     runlessWorkActive?: boolean;
@@ -2429,8 +2562,12 @@ export function deriveMessagesTimelineRows(
     }
   }
 
-  const result = attachTrailingToolGroupsToAssistant(
-    attachCreatedThreadSummaries(nextRows, timelineEntries, collapsedFoldMemberIds),
+  const result = foldCollabReviewRows(
+    attachTrailingToolGroupsToAssistant(
+      attachCreatedThreadSummaries(nextRows, timelineEntries, collapsedFoldMemberIds),
+    ),
+    input,
+    unsettledRunId,
   );
   return result.map((row, index) => {
     if (timelineRowIsWorkLog(row) && timelineRowIsWorkLog(result[index + 1])) {
@@ -2576,6 +2713,7 @@ function replaceStreamingMessageRows(
     expandedRunIds: previousExpandedRuns,
     expandedAttemptIds: previousExpandedAttempts,
     expandedWorkGroupIds: previousExpandedGroups,
+    expandedCollabReviewIds: previousExpandedCollabReviews,
     pendingApprovalRequestIds: previousPendingApprovalRequestIds,
     availableRevertTurnCounts: previousAvailableRevertTurnCounts,
     ...previousContext
@@ -2587,6 +2725,7 @@ function replaceStreamingMessageRows(
     expandedRunIds,
     expandedAttemptIds,
     expandedWorkGroupIds,
+    expandedCollabReviewIds,
     pendingApprovalRequestIds,
     availableRevertTurnCounts,
     ...context
@@ -2599,6 +2738,7 @@ function replaceStreamingMessageRows(
     !shallow(previousExpandedRuns, expandedRunIds) ||
     !shallow(previousExpandedAttempts, expandedAttemptIds) ||
     !shallow(previousExpandedGroups, expandedWorkGroupIds) ||
+    !shallow(previousExpandedCollabReviews, expandedCollabReviewIds) ||
     !shallow(previousPendingApprovalRequestIds, pendingApprovalRequestIds) ||
     !shallow(previousAvailableRevertTurnCounts, availableRevertTurnCounts) ||
     !sameCheckpointSummaries(previousCheckpoints, turnDiffSummaries)
@@ -2779,6 +2919,12 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
   if (a.kind !== b.kind || a.id !== b.id) return false;
 
   switch (a.kind) {
+    case "collab-review-fold": {
+      const next = b as typeof a;
+      return (
+        a.createdAt === next.createdAt && a.count === next.count && a.expanded === next.expanded
+      );
+    }
     case "working":
       return (
         a.createdAt === (b as typeof a).createdAt && a.compacting === (b as typeof a).compacting

@@ -44,6 +44,16 @@ describe("extractPairingUrlFromQrPayload", () => {
         "t3code://pair?pairingUrl=https%3A%2F%2Fremote.example.com%2Fpair%23token%3Dpairing-token",
       ),
     ).toBe("https://remote.example.com/pair#token=pairing-token");
+    expect(
+      extractPairingUrlFromQrPayload(
+        "vela://pair?pairingUrl=https%3A%2F%2Fremote.example.com%2Fpair%23token%3Dpairing-token",
+      ),
+    ).toBe("https://remote.example.com/pair#token=pairing-token");
+  });
+
+  it("rejects arbitrary plain text or deep links missing a valid http pairing url", () => {
+    expect(() => extractPairingUrlFromQrPayload("just some random text")).toThrow();
+    expect(() => extractPairingUrlFromQrPayload("t3code://pair")).toThrow();
   });
 });
 
@@ -56,6 +66,25 @@ describe("parsePairingUrl", () => {
     ).toEqual({
       host: "https://desktop.tailnet.ts.net",
       code: "pairing-token",
+    });
+  });
+
+  it("unwraps pasted t3code:// and vela:// pairing links the same as QR scanning", () => {
+    expect(
+      parsePairingUrl(
+        "t3code://pair?pairingUrl=http%3A%2F%2F100.82.53.91%3A3773%2Fpair%23token%3Dpasted-code",
+      ),
+    ).toEqual({
+      host: "http://100.82.53.91:3773",
+      code: "pasted-code",
+    });
+    expect(
+      parsePairingUrl(
+        "vela://pair?pairingUrl=https%3A%2F%2Fdesktop.tailnet.ts.net%2Fpair%23token%3Dvela-code",
+      ),
+    ).toEqual({
+      host: "https://desktop.tailnet.ts.net",
+      code: "vela-code",
     });
   });
 });

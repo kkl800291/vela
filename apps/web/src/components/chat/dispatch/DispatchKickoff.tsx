@@ -2,33 +2,40 @@
 import {
   BotIcon,
   ExternalLinkIcon,
-  FileCode2Icon,
-  GitForkIcon,
   LayersIcon,
   Loader2Icon,
   SearchCheckIcon,
-  SearchIcon,
   SquareIcon,
 } from "lucide-react";
 import { useState } from "react";
 
+interface KickoffDraft {
+  readonly input: string;
+  readonly mode: "fast" | "strict";
+}
+
+const kickoffDraftByThread = new Map<string, KickoffDraft>();
+
 import ChatMarkdown from "~/components/ChatMarkdown";
 import { Button } from "~/components/ui/button";
 import { Textarea } from "~/components/ui/textarea";
-import { Toggle, ToggleGroup } from "~/components/ui/toggle-group";
+import { Switch } from "~/components/ui/switch";
 import type {
   DispatchAgentTarget,
   DispatchBlindCheckRecord,
   DispatchProviderSummary,
 } from "~/state/velaDispatch";
 import { AgentTargetPicker } from "./AgentTargetPicker";
-import { formatAgentTarget, KIND_META } from "./dispatchModel";
+import { formatAgentTarget } from "./dispatchModel";
 
 export function DispatchKickoff({
   workspaceRoot,
+  threadId,
   providers,
   blindCheck,
   selectedDefaultAgent,
+  defaultEnableBatchAudit,
+  hasConversationMessages = true,
   busyKey,
   onSelectDefaultAgent,
   onKickoff,
@@ -38,19 +45,37 @@ export function DispatchKickoff({
   onOpenManualCreate,
 }: {
   readonly workspaceRoot: string;
+  readonly threadId: string;
   readonly providers: ReadonlyArray<DispatchProviderSummary>;
   readonly blindCheck: DispatchBlindCheckRecord | null;
   readonly selectedDefaultAgent: DispatchAgentTarget | null;
+  readonly defaultEnableBatchAudit: boolean;
+  readonly hasConversationMessages?: boolean | undefined;
   readonly busyKey: string | null;
   readonly onSelectDefaultAgent: (next: DispatchAgentTarget | null) => void;
-  readonly onKickoff: (requirement: string, mode: "fast" | "strict") => Promise<boolean>;
+  readonly onKickoff: (
+    requirement: string,
+    mode: "fast" | "strict",
+    enableBatchAudit: boolean,
+  ) => Promise<boolean>;
   readonly onCancelBlindCheck: () => void;
   readonly onClear: () => void;
   readonly onOpenCheckerThread: (threadId: string) => void;
   readonly onOpenManualCreate: () => void;
 }) {
-  const [kickoffMode, setKickoffMode] = useState<"fast" | "strict">("fast");
-  const [kickoffInput, setKickoffInput] = useState("");
+  const initialDraft = kickoffDraftByThread.get(threadId);
+  const [kickoffMode, setKickoffMode] = useState<"fast" | "strict">(initialDraft?.mode ?? "fast");
+  const [kickoffInput, setKickoffInput] = useState(initialDraft?.input ?? "");
+  const [batchAuditOverride, setBatchAuditOverride] = useState<boolean | null>(null);
+  const enableBatchAudit = batchAuditOverride ?? defaultEnableBatchAudit;
+
+  const updateKickoffDraft = (nextInput: string, nextMode: "fast" | "strict") => {
+    if (!nextInput && nextMode === "fast") {
+      kickoffDraftByThread.delete(threadId);
+    } else {
+      kickoffDraftByThread.set(threadId, { input: nextInput, mode: nextMode });
+    }
+  };
 
   if (blindCheck) {
     return (
@@ -108,7 +133,7 @@ export function DispatchKickoff({
                   size="sm"
                   variant="default"
                   disabled={busyKey !== null}
-                  onClick={() => void onKickoff("", "fast")}
+                  onClick={() => void onKickoff("", "fast", false)}
                 >
                   结合盲审结论让主控拆单上板
                 </Button>
@@ -139,103 +164,60 @@ export function DispatchKickoff({
     );
   }
 
+  const trimmedInput = kickoffInput.trim();
+  const emptyWithoutConversation = !hasConversationMessages && !trimmedInput;
+
   const submitKickoff = async () => {
-    const ok = await onKickoff(kickoffInput.trim(), kickoffMode);
+    if (emptyWithoutConversation) return;
+    const ok = await onKickoff(trimmedInput, kickoffMode, enableBatchAudit);
     if (ok) {
       setKickoffInput("");
+      kickoffDraftByThread.delete(threadId);
     }
   };
 
-  return (
-    <div className="space-y-5 p-4">
-      <div className="space-y-3">
-        <div className="flex items-start gap-3">
-          <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-muted/35 text-foreground">
-            <LayersIcon className="size-4" />
-          </div>
-          <div className="min-w-0 space-y-1">
-            <h2 className="text-sm font-semibold text-foreground">
-              把需求拆成可验收的任务
-            </h2>
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              主控拆成有序步骤卡，独立执行并逐关校验后再合入当前分支。
-            </p>
-          </div>
-        </div>
+  const primaryCtaLabel = emptyWithoutConversation
+    ? "输入需求后生成分步计划"
+    : trimmedInput
+      ? kickoffMode === "strict"
+        ? "先核查代码并生成计划"
+        : "生成分步计划"
+      : kickoffMode === "strict"
+        ? "对当前对话先核查再拆单"
+        : "从当前对话生成分步计划";
 
-        <div className="grid gap-2">
-          <div className="flex items-start gap-2.5 rounded-lg border border-border/50 bg-muted/15 px-3 py-2">
-            <SearchIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 space-y-0.5">
-              <span className="text-xs font-medium text-foreground">
-                {KIND_META.research.label}
-              </span>
-              <span className="ml-2 text-xs leading-relaxed text-muted-foreground">
-                {KIND_META.research.description}
-              </span>
-            </div>
-          </div>
-          <div className="flex items-start gap-2.5 rounded-lg border border-border/50 bg-muted/15 px-3 py-2">
-            <GitForkIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 space-y-0.5">
-              <span className="text-xs font-medium text-foreground">
-                {KIND_META.decision.label}
-              </span>
-              <span className="ml-2 text-xs leading-relaxed text-muted-foreground">
-                {KIND_META.decision.description}
-              </span>
-            </div>
-          </div>
-          <div className="flex items-start gap-2.5 rounded-lg border border-border/50 bg-muted/15 px-3 py-2">
-            <FileCode2Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 space-y-0.5">
-              <span className="text-xs font-medium text-foreground">
-                {KIND_META.change.label}
-              </span>
-              <span className="ml-2 text-xs leading-relaxed text-muted-foreground">
-                {KIND_META.change.description}
-              </span>
-            </div>
-          </div>
+  return (
+    <div className="space-y-4 p-4">
+      <div className="flex items-start gap-3">
+        <div className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-muted/35 text-foreground">
+          <LayersIcon className="size-4" />
+        </div>
+        <div className="min-w-0 space-y-0.5">
+          <h2 className="text-sm font-semibold text-foreground">发起协作计划</h2>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            多代理并行开发，主控按完成顺序依次审查，整批验证后一次应用。
+          </p>
         </div>
       </div>
 
-      <div className="space-y-3.5 border-t border-border/50 pt-4">
+      <div className="space-y-3.5">
         <Textarea
           rows={3}
-          placeholder="这次要做什么？留空则由主控从当前对话提炼最近对齐的需求"
+          placeholder={
+            hasConversationMessages
+              ? "补充或调整需求（留空则按当前对话方案拆成步骤）"
+              : "这次要做什么？输入需求后由主控拆成可验收的步骤"
+          }
           value={kickoffInput}
-          onChange={(e) => setKickoffInput(e.target.value)}
+          onChange={(e) => {
+            const nextVal = e.target.value;
+            setKickoffInput(nextVal);
+            updateKickoffDraft(nextVal, kickoffMode);
+          }}
         />
 
-        <div className="space-y-2">
-          <ToggleGroup
-            value={[kickoffMode]}
-            onValueChange={(next) => {
-              const first = next[0];
-              if (first === "fast" || first === "strict") setKickoffMode(first);
-            }}
-            className="w-full"
-          >
-            <Toggle value="fast" className="h-8 flex-1">
-              快速拆单
-            </Toggle>
-            <Toggle value="strict" className="h-8 flex-1">
-              先核查代码再拆
-            </Toggle>
-          </ToggleGroup>
-          <div className="flex flex-wrap items-center justify-between gap-2 text-xs leading-relaxed text-muted-foreground">
-            <span>
-              {kickoffMode === "strict"
-                ? "先拉起只读子线程核查真实代码，再由主控对比拆单"
-                : "直接由左侧主控按当前上下文拆成步骤卡"}
-            </span>
-            <span className="shrink-0 text-xs text-muted-foreground/85">长对话建议先核查</span>
-          </div>
-        </div>
-
         <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-          <span>默认子代理 AI</span>
+          <span>默认开发代理</span>
           <AgentTargetPicker
             value={selectedDefaultAgent ?? "inherit"}
             providers={providers}
@@ -246,34 +228,50 @@ export function DispatchKickoff({
             }}
           />
         </div>
+        {kickoffMode === "fast" && (
+          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span>交付前冷眼终审</span>
+            <Switch
+              size="sm"
+              checked={enableBatchAudit}
+              onCheckedChange={setBatchAuditOverride}
+              aria-label="交付前冷眼终审"
+            />
+          </div>
+        )}
+
+        <details
+          className="space-y-2 text-xs text-muted-foreground"
+          open={kickoffMode === "strict" || undefined}
+        >
+          <summary className="w-fit cursor-pointer">高级选项</summary>
+          <div className="flex items-center justify-between gap-2">
+            <span>先核查代码再拆</span>
+            <Switch
+              size="sm"
+              checked={kickoffMode === "strict"}
+              aria-label="先核查代码再拆"
+              onCheckedChange={(checked) => {
+                const mode = checked ? "strict" : "fast";
+                setKickoffMode(mode);
+                updateKickoffDraft(kickoffInput, mode);
+              }}
+            />
+          </div>
+          <Button size="xs" variant="ghost" onClick={onOpenManualCreate}>
+            手动建卡
+          </Button>
+        </details>
 
         <Button
           size="sm"
           className="w-full"
-          disabled={busyKey !== null}
+          disabled={busyKey !== null || emptyWithoutConversation}
           onClick={() => void submitKickoff()}
         >
           <BotIcon className="size-3.5" />
-          {kickoffInput.trim()
-            ? kickoffMode === "strict"
-              ? "先核查代码，再让主控拆单"
-              : "发送给主控自动拆单"
-            : kickoffMode === "strict"
-              ? "对当前对话需求先核查再拆单"
-              : "把当前对话方案拆单上板"}
+          {primaryCtaLabel}
         </Button>
-
-        <p className="text-center text-xs leading-relaxed text-muted-foreground">
-          聊天框输入 <code className="font-mono text-foreground">/dispatch</code> 也能随时唤起
-          {" · "}
-          <button
-            type="button"
-            onClick={onOpenManualCreate}
-            className="underline underline-offset-2 hover:text-foreground"
-          >
-            手动建卡
-          </button>
-        </p>
       </div>
     </div>
   );

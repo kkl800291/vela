@@ -5,12 +5,20 @@ import * as Application from "expo-application";
 import Constants from "expo-constants";
 import { settlePromise } from "@t3tools/client-runtime/state/runtime";
 import { useRef, useState } from "react";
-import { Pressable, View } from "react-native";
+import { Linking, Platform, Pressable, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { useDeadlinePassed } from "../../lib/clock";
+import { useWorkspaceEnvironments } from "../../state/workspace";
+import {
+  fetchMobileApkMeta,
+  requestMobileApkDownloadTicket,
+  resolveEnvironmentUrl,
+  type MobileApkMeta,
+} from "../collab/collabApi";
+import { formatByteSize } from "../collab/collabModel";
 import {
   type AppUpdateCheckState,
   isAppUpdateCheckAvailable,
@@ -35,6 +43,7 @@ export function SettingsAboutRouteScreen() {
         contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
       >
         <AppSettingsSection />
+        {Platform.OS === "android" ? <AndroidDirectApkUpdateSection /> : null}
       </ScrollView>
     </SettingsScreen>
   );
@@ -153,6 +162,83 @@ function AppSettingsSection() {
       ) : (
         versionRow
       )}
+    </SettingsSection>
+  );
+}
+
+function AndroidDirectApkUpdateSection() {
+  const environments = useWorkspaceEnvironments();
+  const connected = environments.find((env) => env.connectionState === "connected") ?? null;
+  const [meta, setMeta] = useState<MobileApkMeta | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [statusText, setStatusText] = useState<string | null>(null);
+
+  async function handleCheckAndDownload() {
+    if (!connected || busy) return;
+    setBusy(true);
+    setStatusText("正在检查电脑端最新 APK…");
+    await fetchMobileApkMeta(connected.environmentId)
+      .then(async (info) => {
+        setMeta(info);
+        if (!info.available) {
+          setStatusText("电脑端尚未生成最新 APK");
+          return;
+        }
+        setStatusText("正在获取下载链接…");
+        const ticket = await requestMobileApkDownloadTicket(connected.environmentId);
+        const url = resolveEnvironmentUrl(connected.environmentId, ticket.downloadPath);
+        if (!url) {
+          setStatusText("当前环境地址不可用");
+          return;
+        }
+        setStatusText(`已拉起浏览器下载 ${ticket.fileName}`);
+        await Linking.openURL(url);
+      })
+      .catch((error: unknown) => {
+        const msgText = error instanceof Error ? error.message : String(error);
+        setStatusText(null);
+        Dialog.alert("在线更新失败", msgText);
+      });
+    setBusy(false);
+  }
+
+  return (
+    // oxlint-disable-next-line t3code/no-untranslated-copy -- Vela direct APK update copy
+    <SettingsSection title="免 USB 在线更新（Android）">
+      <Pressable
+        accessibilityRole="button"
+        disabled={!connected || busy}
+        onPress={() => void handleCheckAndDownload()}
+        className="flex-row items-center gap-4 p-4 active:opacity-75"
+      >
+        <SymbolView
+          name="arrow.down.circle"
+          size={22}
+          tintColorClassName="accent-icon"
+          type="monochrome"
+          weight="regular"
+        />
+        <View className="min-w-0 flex-1">
+          <Text className="text-lg text-foreground">
+            {busy ? "正在准备下载…" : "下载并覆盖安装最新 APK"}
+          </Text>
+          <Text className="mt-0.5 text-xs text-foreground-muted">
+            {!connected
+              ? "请先连接 Mac 桌面端 Vela（Tailscale / Wi-Fi）"
+              : statusText
+                ? statusText
+                : meta?.available && meta.sizeBytes
+                  ? `${meta.fileName ?? "Vela.apk"} · ${formatByteSize(meta.sizeBytes)}`
+                  : `通过 ${connected.environmentLabel} 直接走 Tailscale/局域网下载，保留全部配对数据`}
+          </Text>
+        </View>
+        <SymbolView
+          name="chevron.right"
+          size={14}
+          tintColorClassName="accent-icon-muted"
+          type="monochrome"
+        />
+      </Pressable>
     </SettingsSection>
   );
 }

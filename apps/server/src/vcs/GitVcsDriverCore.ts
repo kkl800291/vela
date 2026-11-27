@@ -3957,15 +3957,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       };
     }
 
-    yield* executeGitWithStableDiagnostics("GitVcsDriver.pushCurrentBranch.push", cwd, ["push"], {
-      timeoutMs: null,
+    // An implicit push can match private collaboration refs through mirror or configured refspecs.
+    return yield* new GitCommandError({
+      ...gitCommandContext({ operation: "GitVcsDriver.pushCurrentBranch", cwd, args: ["push"] }),
+      detail: "Cannot push because the branch destination could not be resolved.",
     });
-    return {
-      status: "pushed" as const,
-      branch,
-      ...(details.upstreamRef ? { upstreamBranch: details.upstreamRef } : {}),
-      setUpstream: false,
-    };
   });
 
   const pullCurrentBranch: GitVcsDriver.GitVcsDriver["Service"]["pullCurrentBranch"] = Effect.fn(

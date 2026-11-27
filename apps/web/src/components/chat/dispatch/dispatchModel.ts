@@ -1,9 +1,18 @@
 /* oxlint-disable t3code/no-untranslated-copy -- Vela dispatch UI keeps inline Chinese copy without modifying i18n catalogs */
 import { isReasoningControl, isReasoningSelect, selectableProviderOptionChoices } from "@t3tools/client-runtime/model-traits";
-import { ProviderDriverKind, type ProviderOptionDescriptor } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  type CollabAttentionReason,
+  type CollabPlanStatus,
+  type CollabStepPhase,
+  type CollabStepStatus,
+  type ProviderOptionDescriptor,
+  type VelaCollabProjection,
+} from "@t3tools/contracts";
 import type {
   DispatchAgentOptionSelection,
   DispatchAgentTarget,
+  DispatchAttentionItem,
   DispatchEscalationOption,
   DispatchProviderSummary,
   DispatchStepKind,
@@ -11,6 +20,273 @@ import type {
   DispatchStepStatus,
   DispatchTaskCard,
 } from "~/state/velaDispatch";
+
+export const COLLAB_STEP_LABEL: Record<CollabStepStatus, string> = {
+  locked: "待执行",
+  ready: "待执行",
+  developing: "执行中",
+  verifying_gates: "自动检查中",
+  queued_for_review: "待审查",
+  reviewing: "审查中",
+  integrating: "汇总改动中",
+  integrated: "已完成",
+  done: "已完成",
+  needs_attention: "待处理",
+  cancelled: "已取消",
+};
+
+export const COLLAB_PHASE_LABEL: Record<CollabStepPhase, string> = {
+  initial: "执行中",
+  repair: "修改中",
+  conflict: "解决冲突中",
+};
+
+export const COLLAB_ATTENTION_LABEL: Record<CollabAttentionReason | "ready_to_deliver", string> = {
+  decision: "待决定",
+  escalation: "待回复问题",
+  gate_failed: "检查未通过",
+  repair_limit: "多次修改未通过",
+  conflict_limit: "代码冲突未解决",
+  review_incomplete: "审查未完成",
+  evidence_error: "改动读取异常",
+  manual_check_required: "待人工确认",
+  ready_to_deliver: "已完成，待应用",
+};
+
+export function collabAttentionLabel(
+  item: Pick<DispatchAttentionItem, "engineVersion" | "attentionReason">,
+): string | undefined {
+  if (item.engineVersion !== 2) return undefined;
+  return item.attentionReason ? COLLAB_ATTENTION_LABEL[item.attentionReason] : "待处理";
+}
+
+const COLLAB_PLAN_LABEL: Record<CollabPlanStatus, string> = {
+  draft: "待开始",
+  running: "执行中",
+  batch_verifying: "整体验证中",
+  ready_to_deliver: "待应用",
+  delivered: "已应用",
+  cancelled: "已取消",
+  failed: "执行失败",
+};
+
+export function collabPlanLabel(collab: VelaCollabProjection): string {
+  if (collab.appliedDelivery?.revertedAt) return "已撤回";
+  if (
+    collab.status === "running" &&
+    (collab.blocked || collab.canRetryBatch || (collab.batchAudit?.blockingFindings ?? 0) > 0)
+  ) {
+    return "有待处理项";
+  }
+  return COLLAB_PLAN_LABEL[collab.status];
+}
+
+export function isActiveCollabPlan(status: CollabPlanStatus): boolean {
+  return (
+    status === "draft" ||
+    status === "running" ||
+    status === "batch_verifying" ||
+    status === "ready_to_deliver"
+  );
+}
+
+export type CollabStep = VelaCollabProjection["steps"][number];
+
+export function isCollabStepDone(status: CollabStepStatus): boolean {
+  return status === "integrated" || status === "done";
+}
+
+export function isCollabStepActive(status: CollabStepStatus): boolean {
+  return (
+    status === "developing" ||
+    status === "verifying_gates" ||
+    status === "reviewing" ||
+    status === "integrating"
+  );
+}
+
+export function collabStepIndexMap(collab: VelaCollabProjection): ReadonlyMap<string, number> {
+  return new Map(collab.steps.map((step, index) => [step.stepId, index + 1] as const));
+}
+
+export function formatCollabDependsOn(
+  collab: VelaCollabProjection,
+  dependsOn: ReadonlyArray<string> | undefined,
+  mode: "draft" | "locked" = "draft",
+): string | null {
+  if (!dependsOn?.length) return null;
+  const indexMap = collabStepIndexMap(collab);
+  const nums = dependsOn
+    .map((id) => indexMap.get(id))
+    .filter((n): n is number => n !== undefined)
+    .toSorted((a, b) => a - b);
+  if (nums.length === 0) return null;
+  const verb = mode === "draft" ? "依赖" : "等待";
+  if (nums.length === 1) return `${verb}第 ${nums[0]} 步`;
+  if (nums.length === 2) return `${verb}第 ${nums[0]}、${nums[1]} 步`;
+  return `${verb}第 ${nums[0]} 步等 ${nums.length} 项`;
+}
+
+export function findCollabStepDependents(
+  collab: VelaCollabProjection,
+  stepId: string,
+): ReadonlyArray<{ readonly stepId: string; readonly number: number }> {
+  const result: Array<{ readonly stepId: string; readonly number: number }> = [];
+  collab.steps.forEach((step, index) => {
+    if (step.status === "cancelled") return;
+    if (step.dependsOn?.includes(stepId)) {
+      result.push({ stepId: step.stepId, number: index + 1 });
+    }
+  });
+  return result;
+}
+
+/**
+ * Opus 5.5 Rule A3: only collapse the top contiguous completed run when total > 6 and >= 2 top steps are completed.
+ */
+export function computeTopCompletedRunCount(steps: ReadonlyArray<CollabStep>): number {
+  if (steps.length <= 6) return 0;
+  let count = 0;
+  for (const step of steps) {
+    if (isCollabStepDone(step.status)) {
+      count += 1;
+    } else {
+      break;
+    }
+  }
+  return count >= 2 ? count : 0;
+}
+
+export function formatCollabAttentionShort(step: CollabStep): string {
+  switch (step.attentionReason) {
+    case "decision":
+      return "待决定";
+    case "escalation":
+      return "待回复问题";
+    case "gate_failed":
+      return "检查未通过";
+    case "repair_limit":
+      return step.attempt > 1 ? `${step.attempt} 轮修改未通过` : "多次修改未通过";
+    case "conflict_limit":
+      return "代码冲突未解决";
+    case "review_incomplete":
+      return "审查未完成";
+    case "evidence_error":
+      return "改动读取异常";
+    case "manual_check_required": {
+      const count = step.manualChecks?.length ?? 0;
+      return count > 0 ? `待确认 ${count} 项` : "待人工确认";
+    }
+    default:
+      return "待处理";
+  }
+}
+
+export function formatCollabStepModelShort(
+  target: DispatchAgentTarget | undefined,
+  providers: ReadonlyArray<DispatchProviderSummary>,
+): string | null {
+  if (!target) return null;
+  const display = resolveAgentTargetDisplay(target, providers);
+  return display.modelName || display.providerLabel || null;
+}
+
+export function formatCollabStepStatusText(
+  step: CollabStep,
+  collab: VelaCollabProjection,
+  providers: ReadonlyArray<DispatchProviderSummary>,
+  isReviewing: boolean,
+): { readonly primary: string; readonly modelSuffix?: string } {
+  if (isReviewing || step.status === "reviewing") {
+    return {
+      primary: step.attempt > 1 ? `审查中 · 第 ${step.attempt} 轮` : "审查中",
+    };
+  }
+  switch (step.status) {
+    case "locked":
+      return {
+        primary: formatCollabDependsOn(collab, step.dependsOn, "locked") ?? "待执行",
+      };
+    case "ready":
+      return { primary: "待执行" };
+    case "developing": {
+      const effectiveTarget = step.executor ?? collab.config.defaultDevAgent;
+      const modelShort = formatCollabStepModelShort(effectiveTarget, providers) ?? undefined;
+      if (step.phase === "conflict") {
+        return { primary: "解决冲突中", ...(modelShort ? { modelSuffix: modelShort } : {}) };
+      }
+      if (step.phase === "repair") {
+        return {
+          primary: `修改中 · 第 ${Math.max(2, step.attempt)} 轮`,
+          ...(modelShort ? { modelSuffix: modelShort } : {}),
+        };
+      }
+      return { primary: "执行中", ...(modelShort ? { modelSuffix: modelShort } : {}) };
+    }
+    case "verifying_gates":
+      return { primary: "自动检查中" };
+    case "queued_for_review":
+      return {
+        primary:
+          step.queuePosition !== undefined ? `待审查 · 第 ${step.queuePosition} 位` : "待审查",
+      };
+    case "integrating":
+      return { primary: "汇总改动中" };
+    case "integrated":
+    case "done":
+      return { primary: "已完成" };
+    case "needs_attention":
+      return { primary: formatCollabAttentionShort(step) };
+    case "cancelled":
+      return { primary: "已取消" };
+  }
+}
+
+export function compareCollabReviewQueue(a: CollabStep, b: CollabStep): number {
+  if ((a.status === "reviewing") !== (b.status === "reviewing")) {
+    return a.status === "reviewing" ? -1 : 1;
+  }
+  return (
+    (a.queuePosition ?? Number.MAX_SAFE_INTEGER) - (b.queuePosition ?? Number.MAX_SAFE_INTEGER)
+  );
+}
+
+export function partitionCollabSteps(collab: VelaCollabProjection) {
+  const developing: CollabStep[] = [];
+  const reviewQueue: CollabStep[] = [];
+  const integrationAndDelivery: CollabStep[] = [];
+  const attention: CollabStep[] = [];
+  for (const step of collab.steps) {
+    switch (step.status) {
+      case "locked":
+      case "ready":
+      case "developing":
+      case "verifying_gates":
+        developing.push(step);
+        break;
+      case "queued_for_review":
+      case "reviewing":
+        reviewQueue.push(step);
+        break;
+      case "needs_attention":
+        attention.push(step);
+        break;
+      case "integrating":
+      case "integrated":
+      case "done":
+      case "cancelled":
+        integrationAndDelivery.push(step);
+        break;
+    }
+  }
+  const activeReview = collab.activeInbox?.kind === "review" ? collab.activeInbox : undefined;
+  reviewQueue.sort((a, b) => {
+    const activeOrder =
+      Number(activeReview?.stepId === b.stepId) - Number(activeReview?.stepId === a.stepId);
+    return activeOrder || compareCollabReviewQueue(a, b);
+  });
+  return { developing, reviewQueue, integrationAndDelivery, attention };
+}
 
 export const STATUS_LABEL: Record<DispatchStepStatus, string> = {
   locked: "待前序完成后解锁",
@@ -126,27 +402,29 @@ export interface ProgressSegmentToneInfo {
 export function progressSegmentTone(status: DispatchStepStatus): ProgressSegmentToneInfo {
   switch (status) {
     case "done":
-      return { tone: "done", className: "bg-foreground/80", sweep: false };
+      return { tone: "done", className: "bg-foreground/85", sweep: false };
     case "needs_human_decision":
     case "awaiting_decision":
       return { tone: "attention", className: "bg-warning", sweep: false };
     case "ready_to_accept":
-      return { tone: "ready_to_accept", className: "bg-foreground/50", sweep: false };
+      return { tone: "ready_to_accept", className: "bg-success", sweep: false };
     case "running":
     case "reviewing":
     case "fixing_review":
     case "fixing_acceptance":
     case "awaiting_product_acceptance":
     case "waiting_orchestrator":
-      return { tone: "busy", className: "bg-foreground/30", sweep: true };
+      return { tone: "busy", className: "bg-foreground/35", sweep: true };
     case "premise_failed":
     case "boundary_violation":
     case "hard_gate_failed":
-      return { tone: "failed", className: "bg-destructive/70", sweep: false };
-    case "locked":
+      return { tone: "failed", className: "bg-destructive/80", sweep: false };
     case "ready":
-    case "cancelled":
+      return { tone: "muted", className: "bg-info/60", sweep: false };
+    case "locked":
       return { tone: "muted", className: "bg-muted", sweep: false };
+    case "cancelled":
+      return { tone: "muted", className: "bg-muted-foreground/30", sweep: false };
   }
 }
 
@@ -818,4 +1096,212 @@ export function stripMarkdownPreview(markdown: string, maxChars = 160): string {
   if (maxChars <= 0) return "";
   if (plain.length <= maxChars) return plain;
   return `${plain.slice(0, maxChars).trimEnd()}...`;
+}
+
+export interface StepVerificationSummary {
+  readonly summaryText: string;
+  readonly changedFiles: ReadonlyArray<string>;
+  readonly hasPatch: boolean;
+  readonly checksRunCount: number;
+  readonly checksPassedCount: number;
+  readonly checkLabel: string;
+  readonly reviewLabel: string;
+  readonly targetBranchLabel: string;
+}
+
+export function summarizeStepVerification(
+  step: Pick<DispatchTaskCard, "goal" | "reviewer" | "isolation">,
+  run:
+    | Pick<
+        DispatchStepRun,
+        "deliverable" | "acceptanceReports" | "reviews" | "diffSummary" | "hardGate" | "isolation"
+      >
+    | undefined,
+  currentBranch?: string | null,
+): StepVerificationSummary {
+  const deliverableText = run?.deliverable?.text
+    ? stripMarkdownPreview(run.deliverable.text, 200)
+    : "";
+  const acceptanceSummary = run?.acceptanceReports.at(-1)?.summary?.trim() ?? "";
+  const reviewSummary = run?.reviews.at(-1)?.summary?.trim() ?? "";
+  const goalText = step.goal.trim();
+  const summaryText = deliverableText || acceptanceSummary || reviewSummary || goalText;
+
+  const changedFiles = run?.diffSummary?.changedFiles ?? [];
+  const hasPatch = Boolean(run?.diffSummary?.patch.trim());
+  const gateResults = run?.hardGate?.results ?? [];
+  const checksRunCount = gateResults.length;
+  const checksPassedCount = gateResults.filter((r) => r.ok).length;
+
+  let checkLabel: string;
+  if (checksRunCount === 0) {
+    checkLabel = "未运行检查命令";
+  } else if (run?.hardGate?.ok) {
+    checkLabel = `已运行 ${checksRunCount} 项检查，全部通过`;
+  } else {
+    checkLabel = `检查未通过（${checksPassedCount}/${checksRunCount} 通过）`;
+  }
+
+  let reviewLabel: string;
+  if (step.reviewer === null) {
+    reviewLabel = "未启用独立复查";
+  } else if ((run?.reviews.length ?? 0) > 0) {
+    reviewLabel = run!.reviews.at(-1)!.verdict === "pass" ? "独立复查通过" : "独立复查未通过";
+  } else {
+    reviewLabel = "未运行独立复查";
+  }
+
+  const branchName = currentBranch?.trim();
+  const branchSuffix = branchName ? `（${branchName}）` : "";
+  const effectiveIsolation = run?.isolation ?? step.isolation;
+  const targetBranchLabel =
+    effectiveIsolation === "worktree"
+      ? `确认后合并 Worktree 改动到当前分支${branchSuffix}未提交列表`
+      : `改动已在当前分支${branchSuffix}未提交列表，确认后解锁后续步骤`;
+
+  return {
+    summaryText,
+    changedFiles,
+    hasPatch,
+    checksRunCount,
+    checksPassedCount,
+    checkLabel,
+    reviewLabel,
+    targetBranchLabel,
+  };
+}
+
+export function computeBlockedDownstreamSteps<
+  T extends Pick<DispatchTaskCard, "id" | "order" | "status" | "dependsOn">,
+>(steps: ReadonlyArray<T>, stepId: string): ReadonlyArray<T> {
+  const ordered = [...steps].toSorted((a, b) => a.order - b.order);
+  const usesDag = ordered.some((step) => step.dependsOn !== undefined);
+  if (usesDag) {
+    return ordered.filter(
+      (step) =>
+        step.id !== stepId &&
+        step.status === "locked" &&
+        (step.dependsOn?.includes(stepId) ?? false),
+    );
+  }
+  const sourceIndex = ordered.findIndex((step) => step.id === stepId);
+  if (sourceIndex === -1) return [];
+  return ordered.slice(sourceIndex + 1).filter((step) => step.status === "locked");
+}
+
+export type UnifiedDiffLineKind = "meta" | "hunk" | "add" | "del" | "context";
+
+export interface ParsedUnifiedDiffLine {
+  readonly id: string;
+  readonly text: string;
+  readonly kind: UnifiedDiffLineKind;
+  readonly filePath?: string;
+}
+
+const DIFF_HEADER_PREFIXES = [
+  "index ",
+  "--- ",
+  "+++ ",
+  "new file mode",
+  "deleted file mode",
+  "old mode",
+  "new mode",
+  "similarity index",
+  "dissimilarity index",
+  "rename from ",
+  "rename to ",
+  "copy from ",
+  "copy to ",
+  "Binary files ",
+] as const;
+
+function unquoteGitPath(raw: string): string {
+  if (!raw.startsWith('"') || !raw.endsWith('"') || raw.length < 2) {
+    return raw;
+  }
+  return raw
+    .slice(1, -1)
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+}
+
+function extractDiffGitPath(line: string): string | undefined {
+  const rest = line.slice("diff --git ".length).trim();
+  if (!rest) return undefined;
+  // Quoted: "a/foo bar" "b/foo bar" or mixed
+  const quotedMatch = rest.match(/^"(?:[^"\\]|\\.)+"\s+"b\/((?:[^"\\]|\\.)+)"$/);
+  if (quotedMatch?.[1]) {
+    return unquoteGitPath(`"${quotedMatch[1]}"`);
+  }
+  const bMarker = " b/";
+  const idx = rest.lastIndexOf(bMarker);
+  if (idx !== -1) {
+    return unquoteGitPath(rest.slice(idx + bMarker.length));
+  }
+  return undefined;
+}
+
+/**
+ * Parse a unified git diff line-by-line with hunk state tracking so lines like
+ * `--- old SQL comment` (deletion of `-- old SQL comment`) or `+++ note` inside
+ * a hunk are classified as `"del"` / `"add"` rather than file header `"meta"`.
+ */
+export function parseUnifiedDiffLines(patch: string): ParsedUnifiedDiffLine[] {
+  if (!patch) return [];
+  const rawLines = patch.split("\n");
+  const result: ParsedUnifiedDiffLine[] = [];
+  let inHunk = false;
+  let sawDiffGit = false;
+
+  for (const [index, text] of rawLines.entries()) {
+    const id = `l-${index}`;
+
+    if (text.startsWith("diff --git ")) {
+      inHunk = false;
+      sawDiffGit = true;
+      const filePath = extractDiffGitPath(text);
+      result.push({
+        id,
+        text,
+        kind: "meta",
+        ...(filePath ? { filePath } : {}),
+      });
+      continue;
+    }
+
+    if (!inHunk) {
+      if (text.startsWith("@@")) {
+        inHunk = true;
+        result.push({ id, text, kind: "hunk" });
+        continue;
+      }
+      if (DIFF_HEADER_PREFIXES.some((prefix) => text.startsWith(prefix))) {
+        const fallbackFilePath =
+          !sawDiffGit && text.startsWith("+++ b/") ? unquoteGitPath(text.slice(6)) : undefined;
+        result.push({
+          id,
+          text,
+          kind: "meta",
+          ...(fallbackFilePath ? { filePath: fallbackFilePath } : {}),
+        });
+        continue;
+      }
+      result.push({ id, text, kind: "context" });
+      continue;
+    }
+
+    if (text.startsWith("@@")) {
+      result.push({ id, text, kind: "hunk" });
+    } else if (text.startsWith("+")) {
+      result.push({ id, text, kind: "add" });
+    } else if (text.startsWith("-")) {
+      result.push({ id, text, kind: "del" });
+    } else if (text.startsWith("\\ No newline")) {
+      result.push({ id, text, kind: "meta" });
+    } else {
+      result.push({ id, text, kind: "context" });
+    }
+  }
+
+  return result;
 }

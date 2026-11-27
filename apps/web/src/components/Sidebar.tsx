@@ -108,6 +108,7 @@ import { isMacPlatform } from "~/lib/utils";
 import { readLocalApi } from "../localApi";
 import { configuredHostedAppUrl } from "../hostedPairing";
 import { useSidebarPendingFileDropStore } from "../sidebarPendingFileDropStore";
+import { SidebarAttentionSection } from "./sidebar/SidebarAttentionSection";
 import { SidebarFolderDrop } from "./sidebar/SidebarFolderDrop";
 import {
   pickableProjectGroups,
@@ -3399,6 +3400,17 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         }
       >
         <SidebarGroup className="flex-1" role="presentation">
+          {!isSearchingThreads ? (
+            <SidebarAttentionSection
+              connectedEnvironmentIds={connectedEnvironmentIds}
+              threads={threads}
+              projectDisplayNameByKey={projectDisplayNameByKey}
+              activeThreadKey={routeThreadKey}
+              onSelectThread={(threadRef) => {
+                void navigateToThread(threadRef);
+              }}
+            />
+          ) : null}
           {isSearchingThreads ? (
             threadSearchResults.length > 0 ? (
               <TooltipProvider

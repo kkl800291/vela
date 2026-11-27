@@ -75,7 +75,9 @@ import { useClientSettings, updateClientSettings } from "../hooks/useSettings";
 import { formatRelativeTimeLabel, formatShortTimestamp } from "../timestampFormat";
 import { DiffFilePathCopyButton } from "./DiffFilePathCopyButton";
 import { DiffPanelLoadingState, DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
+import { CollabDiffSurface } from "./chat/dispatch/CollabDiffSurface";
 import { DiffStatLabel } from "./chat/DiffStatLabel";
+import { useVelaDispatchState } from "~/state/velaDispatch";
 import { AnnotatableCodeView, type AnnotatableCodeViewHandle } from "./diffs/AnnotatableCodeView";
 import { DiffFileTree } from "./diffs/DiffFileTree";
 import { FileExplorerPane } from "./files/FileExplorerPane";
@@ -300,6 +302,12 @@ export default function DiffPanel({
   const storedDiffSelection = useDiffPanelStore((state) =>
     selectThreadDiffPanelSelection(state.byThreadKey, routeThreadRef),
   );
+  const { state: diffDispatchState } = useVelaDispatchState(
+    activeCwd,
+    activeCwd && routeThreadRef ? routeThreadRef.threadId : undefined,
+    activeCwd && routeThreadRef ? routeThreadRef.environmentId : undefined,
+  );
+  const diffCollab = diffDispatchState?.collab ?? null;
   const threadFolderIsRepo = gitStatusQuery.data?.isRepo ?? true;
   // The checkout the Git scopes read: the thread's folder, or a repository the thread changed.
   // A plain folder has no history of its own, so it starts on the latest one changed.
@@ -356,7 +364,8 @@ export default function DiffPanel({
     turnDiffsOnly &&
     latestTurn !== undefined &&
     storedDiffSelection.kind !== "turn" &&
-    storedDiffSelection.kind !== "tool-call"
+    storedDiffSelection.kind !== "tool-call" &&
+    storedDiffSelection.kind !== "collab"
       ? { kind: "turn", turnId: latestTurn.runId, filePath: null, revealRequestId: 0 }
       : storedDiffSelection;
   const rememberedBaseRef = useDiffPanelStore((state) =>
@@ -1041,6 +1050,48 @@ export default function DiffPanel({
                 </span>
               </DropdownMenuRadioItem>
             </DropdownMenuRadioGroup>
+            {diffCollab && routeThreadRef && (diffCollab.delivery || diffCollab.steps.some((s) => Boolean(s.reviewId ?? s.latestVerdict?.reviewId))) ? (
+              /* oxlint-disable t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>并行任务预览</DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="max-w-72">
+                  {diffCollab.delivery ? (
+                    <DropdownMenuItem
+                      onClick={() =>
+                        useDiffPanelStore.getState().selectCollabEvidence(routeThreadRef, {
+                          planId: diffCollab.planId,
+                          target: { deliveryId: diffCollab.delivery!.deliveryId },
+                          label: "全部待应用改动",
+                        })
+                      }
+                    >
+                      全部待应用改动
+                    </DropdownMenuItem>
+                  ) : null}
+                  {diffCollab.steps.map((step, idx) => {
+                    const rid = step.reviewId ?? step.latestVerdict?.reviewId;
+                    if (!rid) return null;
+                    return (
+                      <DropdownMenuItem
+                        key={step.stepId}
+                        onClick={() =>
+                          useDiffPanelStore.getState().selectCollabEvidence(routeThreadRef, {
+                            planId: diffCollab.planId,
+                            target: { reviewId: rid },
+                            label: `第 ${idx + 1} 步 · ${step.title}`,
+                          })
+                        }
+                      >
+                        <span className="truncate">
+                          第 {idx + 1} 步 · {step.title}
+                        </span>
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              /* oxlint-enable t3code/no-untranslated-copy */
+            ) : null}
             <DropdownMenuSub>
               <DropdownMenuSubTrigger>
                 <T context="agent turn">Turn</T>
@@ -1573,6 +1624,23 @@ export default function DiffPanel({
       </div>
     </>
   );
+
+  if (diffSelection.kind === "collab" && routeThreadRef) {
+    return (
+      <CollabDiffSurface
+        key={
+          "reviewId" in diffSelection.target
+            ? diffSelection.target.reviewId
+            : diffSelection.target.deliveryId
+        }
+        threadRef={routeThreadRef}
+        workspaceRoot={activeCwd}
+        planId={diffSelection.planId}
+        target={diffSelection.target}
+        label={diffSelection.label}
+      />
+    );
+  }
 
   return (
     <DiffPanelShell mode={mode} header={headerRow}>

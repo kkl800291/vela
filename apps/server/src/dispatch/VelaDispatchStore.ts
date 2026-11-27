@@ -156,6 +156,8 @@ export function unlockReadySteps(
 export class VelaDispatchStore {
   private readonly emitter = new NodeEvents.EventEmitter();
   private readonly cache = new Map<string, VelaDispatchState>();
+  /** Monotonic per-scope commit count. Cold disk reads must not cache if this moves mid-await. */
+  private readonly scopeVersions = new Map<string, number>();
   private readonly writeLocks = new Map<string, Promise<unknown>>();
   private readonly stateDir: string;
 
@@ -178,55 +180,167 @@ export class VelaDispatchStore {
     };
   }
 
+  public subscribeAll(listener: (state: VelaDispatchState) => void): () => void {
+    this.emitter.on("state:*", listener);
+    return () => {
+      this.emitter.off("state:*", listener);
+    };
+  }
+
   private emit(scopeKey: string, state: VelaDispatchState): void {
-    this.emitter.emit(`state:${scopeKey}`, state);
+    const deliver = (eventName: string) => {
+      for (const listener of this.emitter.listeners(eventName)) {
+        try {
+          if (typeof listener === "function") {
+            (listener as (next: VelaDispatchState) => void)(state);
+          }
+        } catch {
+          // A subscriber must not reject a write that is already on disk and in cache.
+        }
+      }
+    };
+    deliver(`state:${scopeKey}`);
+    deliver("state:*");
+  }
+
+  private hydrateState(
+    parsed: Partial<VelaDispatchState>,
+    projectRoot: string,
+    threadId?: string | null,
+  ): VelaDispatchState {
+    const fallbackRoot = projectRoot.trim() || ".";
+    return {
+      ...createEmptyDispatchState(fallbackRoot, threadId),
+      ...parsed,
+      version: 1,
+      projectRoot: normalizeProjectRoot(fallbackRoot),
+      parentThreadId: parsed.parentThreadId ?? (threadId?.trim() || null),
+      config: {
+        ...DEFAULT_DISPATCH_CONFIG,
+        ...parsed.config,
+      },
+      steps: Array.isArray(parsed.steps) ? parsed.steps : [],
+      runs: parsed.runs && typeof parsed.runs === "object" ? parsed.runs : {},
+      escalations: Array.isArray(parsed.escalations) ? parsed.escalations : [],
+      events: Array.isArray(parsed.events) ? parsed.events : [],
+      history: Array.isArray(parsed.history) ? parsed.history : [],
+    };
+  }
+
+  public async listAllStates(): Promise<ReadonlyArray<VelaDispatchState>> {
+    const byKey = new Map<string, VelaDispatchState>();
+
+    const dispatchRoot = NodePath.join(this.stateDir, "dispatch");
+    if (NodeFS.existsSync(dispatchRoot)) {
+      const candidateFiles: Array<{ readonly filePath: string; readonly isProjectScoped: boolean }> =
+        [];
+      const slugEntries = await NodeFSP.readdir(dispatchRoot, { withFileTypes: true }).catch(
+        () => [],
+      );
+      for (const slugEntry of slugEntries) {
+        if (!slugEntry.isDirectory()) continue;
+        const slugDir = NodePath.join(dispatchRoot, slugEntry.name);
+        const rootStateFile = NodePath.join(slugDir, "state.json");
+        if (NodeFS.existsSync(rootStateFile)) {
+          candidateFiles.push({ filePath: rootStateFile, isProjectScoped: true });
+        }
+        const threadsDir = NodePath.join(slugDir, "threads");
+        if (NodeFS.existsSync(threadsDir)) {
+          const threadEntries = await NodeFSP.readdir(threadsDir, { withFileTypes: true }).catch(
+            () => [],
+          );
+          for (const threadEntry of threadEntries) {
+            if (!threadEntry.isDirectory()) continue;
+            const threadStateFile = NodePath.join(threadsDir, threadEntry.name, "state.json");
+            if (NodeFS.existsSync(threadStateFile)) {
+              candidateFiles.push({ filePath: threadStateFile, isProjectScoped: false });
+            }
+          }
+        }
+      }
+
+      for (const candidate of candidateFiles) {
+        try {
+          const raw = await NodeFSP.readFile(candidate.filePath, "utf8");
+          const parsed = JSON.parse(raw) as Partial<VelaDispatchState>;
+          if (typeof parsed.projectRoot !== "string" || !parsed.projectRoot.trim()) continue;
+          const normalized = candidate.isProjectScoped
+            ? normalizeDispatchScope({ projectRoot: parsed.projectRoot, threadId: null })
+            : normalizeDispatchScope({
+                projectRoot: parsed.projectRoot,
+                threadId: parsed.parentThreadId ?? null,
+              });
+          if (!candidate.isProjectScoped) {
+            const threadId = parsed.parentThreadId?.trim();
+            const storedAt = NodePath.resolve(dispatchStateFileOf(normalized, this.stateDir));
+            if (!threadId || storedAt !== NodePath.resolve(candidate.filePath)) continue;
+          }
+          if (byKey.has(normalized.key)) continue;
+          const hydrated = this.hydrateState(parsed, normalized.projectRoot, normalized.threadId);
+          byKey.set(normalized.key, hydrated);
+        } catch {
+          // Ignore malformed dispatch state file on disk
+        }
+      }
+    }
+
+    // Live cache wins over anything observed from disk during the async scan,
+    // including entries added or updated while reads were in flight.
+    for (const [key, cached] of this.cache) {
+      byKey.set(key, cached);
+    }
+
+    return [...byKey.values()].filter(
+      (state) => state.steps.length > 0 || state.escalations.length > 0,
+    );
   }
 
   public async read(scope: DispatchScope): Promise<VelaDispatchState> {
     const normalized = normalizeDispatchScope(scope);
     const { projectRoot, threadId, key } = normalized;
-    const cached = this.cache.get(key);
-    if (cached) return cached;
 
-    const primaryFile = dispatchStateFileOf(normalized, this.stateDir);
-    const legacyFile = NodePath.join(legacyDispatchDirOf(normalized), "state.json");
-    const filePath = NodeFS.existsSync(primaryFile)
-      ? primaryFile
-      : NodeFS.existsSync(legacyFile)
-        ? legacyFile
-        : null;
-    if (!filePath) {
-      const empty = createEmptyDispatchState(projectRoot, threadId);
-      this.cache.set(key, empty);
-      return empty;
-    }
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const cached = this.cache.get(key);
+      if (cached) return cached;
 
-    try {
-      const raw = await NodeFSP.readFile(filePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<VelaDispatchState>;
-      const hydrated: VelaDispatchState = {
-        ...createEmptyDispatchState(projectRoot, threadId),
-        ...parsed,
-        version: 1,
-        projectRoot,
-        parentThreadId: parsed.parentThreadId ?? threadId,
-        config: {
-          ...DEFAULT_DISPATCH_CONFIG,
-          ...parsed.config,
-        },
-        steps: Array.isArray(parsed.steps) ? parsed.steps : [],
-        runs: parsed.runs && typeof parsed.runs === "object" ? parsed.runs : {},
-        escalations: Array.isArray(parsed.escalations) ? parsed.escalations : [],
-        events: Array.isArray(parsed.events) ? parsed.events : [],
-        history: Array.isArray(parsed.history) ? parsed.history : [],
+      const startVersion = this.scopeVersions.get(key) ?? 0;
+      const primaryFile = dispatchStateFileOf(normalized, this.stateDir);
+      const legacyFile = NodePath.join(legacyDispatchDirOf(normalized), "state.json");
+      const filePath = NodeFS.existsSync(primaryFile)
+        ? primaryFile
+        : NodeFS.existsSync(legacyFile)
+          ? legacyFile
+          : null;
+
+      const installIfUnchanged = (state: VelaDispatchState): VelaDispatchState | undefined => {
+        const latest = this.cache.get(key);
+        if (latest) return latest;
+        if ((this.scopeVersions.get(key) ?? 0) !== startVersion) return undefined;
+        this.cache.set(key, state);
+        return state;
       };
-      this.cache.set(key, hydrated);
-      return hydrated;
-    } catch {
-      const empty = createEmptyDispatchState(projectRoot, threadId);
-      this.cache.set(key, empty);
-      return empty;
+
+      if (!filePath) {
+        const installed = installIfUnchanged(createEmptyDispatchState(projectRoot, threadId));
+        if (installed) return installed;
+        continue;
+      }
+
+      try {
+        const raw = await NodeFSP.readFile(filePath, "utf8");
+        const parsed = JSON.parse(raw) as Partial<VelaDispatchState>;
+        const hydrated = this.hydrateState(parsed, projectRoot, threadId);
+        const installed = installIfUnchanged(hydrated);
+        if (installed) return installed;
+      } catch {
+        const installed = installIfUnchanged(createEmptyDispatchState(projectRoot, threadId));
+        if (installed) return installed;
+      }
     }
+
+    const latest = this.cache.get(key);
+    if (latest) return latest;
+    return createEmptyDispatchState(projectRoot, threadId);
   }
 
   public async update(
@@ -243,6 +357,9 @@ export class VelaDispatchStore {
         const current = await this.read(normalized);
         const now = new Date().toISOString();
         let next = updater(current);
+        if (next === current) {
+          return current;
+        }
         if (eventLog?.text.trim()) {
           const entry: DispatchEventLogEntry = {
             at: now,
@@ -266,6 +383,7 @@ export class VelaDispatchStore {
         await NodeFSP.writeFile(tmpPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
         await NodeFSP.rename(tmpPath, filePath);
 
+        this.scopeVersions.set(key, (this.scopeVersions.get(key) ?? 0) + 1);
         this.cache.set(key, next);
         this.emit(key, next);
         return next;

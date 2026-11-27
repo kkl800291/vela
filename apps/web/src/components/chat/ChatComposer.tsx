@@ -128,7 +128,14 @@ import {
 } from "./composerContextUndo";
 import { ComposerBanner } from "./ComposerBanner";
 import { ComposerSurface } from "./ComposerSurface";
-import { DispatchComposerBanner } from "./DispatchRightPanel";
+import { DispatchComposerBanner } from "./dispatch/DispatchComposerBanner";
+import { useCollabUiStore } from "~/state/collabUiStore";
+import {
+  fetchDispatchApi,
+  refreshDispatchState,
+  useVelaDispatchState,
+} from "~/state/velaDispatch";
+import { LayersIcon as CollabChipIcon, XIcon as CollabChipCloseIcon } from "lucide-react";
 import { CollapsedComposerPromptPreview } from "./CollapsedComposerPromptPreview";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./ComposerBannerStack";
 import {
@@ -2100,16 +2107,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         }
         return;
       }
-      if (item.command === "dispatch") {
-        const applied = applyPromptReplacement(
-          trigger.rangeStart,
-          trigger.rangeEnd,
-          "请用 vela_dispatch_plan（action=\"publish\"，互相独立的任务设 dependsOn:[] 以便同时解锁并行执行，不要擅自启动 blind_check 子代理，未指定模型时省略 executor/reviewer）将以下需求拆成任务卡推到右侧派发面板，拆完停下等我确认：",
-          { expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd) },
-        );
+      if (item.command === "dispatch" || item.command === "collab") {
+        const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
+          expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
+        });
         if (applied) {
           setComposerHighlightedItemId(null);
-          useRightPanelStore.getState().open(routeThreadRef, "dispatch");
+          useCollabUiStore.getState().setComposerBinding(routeThreadRef, { kind: "new_plan" });
         }
         return;
       }
@@ -2420,6 +2424,64 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       onResume();
       return true;
     }
+    if (collabBinding?.kind === "reply_step") {
+      const replyText = promptRef.current.trim();
+      if (!replyText) return false;
+      event?.preventDefault();
+      const targetBinding = collabBinding;
+      useCollabUiStore.getState().setComposerBinding(routeThreadRef, null);
+      setPrompt("");
+      void fetchDispatchApi(
+        "/api/vela/dispatch/v2/step/resolve",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            threadId: routeThreadRef.threadId,
+            planId: targetBinding.planId,
+            stepId: targetBinding.stepId,
+            resolution: "human_decision",
+            response: replyText,
+          }),
+        },
+        undefined,
+        routeThreadRef.environmentId,
+      )
+        .then(() => {
+          if (gitCwd) {
+            void refreshDispatchState(gitCwd, routeThreadRef.threadId, routeThreadRef.environmentId);
+          }
+          // oxlint-disable-next-line t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy
+          toastManager.add({ type: "success", title: "已提交回复" });
+        })
+        .catch((err) => {
+          toastManager.add({
+            type: "error",
+            // oxlint-disable-next-line t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy
+            title: "提交回复失败",
+            description: err instanceof Error ? err.message : String(err),
+          });
+        });
+      return true;
+    }
+    if (collabBinding && (collabBinding.kind === "new_plan" || collabBinding.kind === "adjust_plan")) {
+      const rawText = promptRef.current.trim();
+      if (rawText) {
+        const prefix =
+          collabBinding.kind === "new_plan"
+            ? "[并行任务：请调用 vela_dispatch_plan(action=\"publish\", autoStart=false) 拆分为并行步骤并等待确认]\n"
+            : `[调整并行任务步骤（planId=${collabBinding.planId}）]\n`;
+        const wrapped = `${prefix}${rawText}`;
+        promptRef.current = wrapped;
+        setPrompt(wrapped);
+      }
+      useCollabUiStore.getState().setComposerBinding(routeThreadRef, null);
+    }
+    if (
+      composerCollab?.status === "delivered" &&
+      !composerCollab.appliedDelivery?.revertedAt
+    ) {
+      useCollabUiStore.getState().markAppliedCollapsed(composerCollab.planId, true);
+    }
     const submission = submitComposerDraft({
       prompt: promptRef.current,
       submissionTarget,
@@ -2581,7 +2643,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ? promptSuggestion
       : null;
 
+  const collabBinding = useCollabUiStore(
+    (state) => state.composerBindingByThread[scopedThreadKey(routeThreadRef)],
+  );
+  const { state: composerDispatchState } = useVelaDispatchState(
+    gitCwd ?? undefined,
+    gitCwd ? routeThreadRef.threadId : undefined,
+    gitCwd ? routeThreadRef.environmentId : undefined,
+  );
+  const composerCollab = composerDispatchState?.collab ?? null;
+  const isCollabReviewRunning =
+    composerCollab?.activeInbox?.kind === "review" &&
+    composerCollab.activeInbox.status === "dispatched";
+
   const onComposerCommandKey = (key: string, event: KeyboardEvent, isTaskItem?: boolean) => {
+    if (key === "Escape" && collabBinding && !event.isComposing) {
+      useCollabUiStore.getState().setComposerBinding(routeThreadRef, null);
+      return true;
+    }
     if (key === "Escape" && composerSendHeld && !event.isComposing) {
       cancelHeldSend();
       return true;
@@ -3713,6 +3792,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             workspaceRoot={gitCwd ?? undefined}
             threadRef={routeThreadRef}
             isMainAgentWorking={phase === "running" || phase === "connecting" || isSendBusy}
+            onFocusComposer={focusComposer}
           />
           {showComposerTopDrawer ? (
             <ComposerBanner.Attachment>
@@ -3925,6 +4005,40 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
               {composerAttachmentFileList}
 
+              {collabBinding ? (
+                <div className="flex items-center px-3 pt-2">
+                  <span
+                    className={cn(
+                      "inline-flex max-w-full items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs",
+                      collabBinding.kind === "reply_step"
+                        ? "border-warning/30 bg-warning/10 text-warning-foreground"
+                        : "border-border/75 bg-muted/40 text-foreground/85",
+                    )}
+                  >
+                    <CollabChipIcon className="size-3 shrink-0 opacity-75" />
+                    {/* oxlint-disable t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */}
+                    <span className="truncate font-medium">
+                      {collabBinding.kind === "new_plan"
+                        ? "并行任务"
+                        : collabBinding.kind === "adjust_plan"
+                          ? "调整并行步骤"
+                          : `回复第 ${collabBinding.stepNumber} 步`}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label="取消绑定"
+                      onClick={() =>
+                        useCollabUiStore.getState().setComposerBinding(routeThreadRef, null)
+                      }
+                      className="ms-0.5 inline-flex size-3.5 items-center justify-center rounded-sm opacity-70 transition-opacity hover:opacity-100"
+                    >
+                      <CollabChipCloseIcon className="size-3" />
+                    </button>
+                    {/* oxlint-enable t3code/no-untranslated-copy */}
+                  </span>
+                </div>
+              ) : null}
+
               <div
                 className={cn(
                   "relative transition-opacity duration-150",
@@ -3975,25 +4089,35 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     onCitationSubmitAndSend={submitCitationAndSendStable}
                     onCitationDraftSave={saveCitationDraftToPromptStable}
                     onPaste={onComposerPasteStable}
+                    /* oxlint-disable t3code/no-untranslated-copy -- Vela collaboration UI uses curated Chinese copy */
                     placeholder={
-                      isComposerApprovalState
-                        ? activePendingApproval?.supportsFeedback
-                          ? gt("Send feedback to decline this request")
-                          : gt("Send a message to decline and redirect the agent")
-                        : activePendingProgress
-                          ? isChoiceOnlyPendingQuestion
-                            ? gt("Choose an option above")
-                            : activePendingProgress.activeQuestion?.options.length === 0
-                              ? gt("Type your answer")
-                              : gt(
-                                  "Type your own answer, or leave this blank to use the selected option",
-                                )
-                          : projectSelectionRequired
-                            ? gt("Choose a project above to start a thread")
-                            : showProviderUnavailable
-                              ? gt("Enable a provider in Settings to send a message")
-                              : (offeredPromptSuggestion ?? m(DEFAULT_COMPOSER_PLACEHOLDER))
+                      collabBinding?.kind === "reply_step"
+                        ? `输入对第 ${collabBinding.stepNumber} 步的决定或说明（按 Esc 取消）…`
+                        : collabBinding?.kind === "adjust_plan"
+                          ? "描述需要增删或调整的步骤…"
+                          : collabBinding?.kind === "new_plan"
+                            ? "描述需要拆分为并行任务的需求…"
+                            : isCollabReviewRunning
+                              ? "审查进行中，新消息将排队发送"
+                              : isComposerApprovalState
+                                ? activePendingApproval?.supportsFeedback
+                                  ? gt("Send feedback to decline this request")
+                                  : gt("Send a message to decline and redirect the agent")
+                                : activePendingProgress
+                                  ? isChoiceOnlyPendingQuestion
+                                    ? gt("Choose an option above")
+                                    : activePendingProgress.activeQuestion?.options.length === 0
+                                      ? gt("Type your answer")
+                                      : gt(
+                                          "Type your own answer, or leave this blank to use the selected option",
+                                        )
+                                  : projectSelectionRequired
+                                    ? gt("Choose a project above to start a thread")
+                                    : showProviderUnavailable
+                                      ? gt("Enable a provider in Settings to send a message")
+                                      : (offeredPromptSuggestion ?? m(DEFAULT_COMPOSER_PLACEHOLDER))
                     }
+                    /* oxlint-enable t3code/no-untranslated-copy */
                     placeholderSuffix={
                       offeredPromptSuggestion !== null ? (
                         // The placeholder ignores pointer events so clicks reach the editor; only this hint opts back in.

@@ -119,10 +119,11 @@ const layerWakeups = Wakeups.layer({
         Effect.acquireRelease(
           Effect.gen(function* () {
             const nowMs = yield* Clock.currentTimeMillis;
-            let backgroundedAtMs = AppState.currentState === "background" ? nowMs : null;
+            let backgroundedAtMs: number | null =
+              AppState.currentState === "active" ? null : nowMs;
             return AppState.addEventListener("change", (state) => {
-              if (state === "background") {
-                backgroundedAtMs = Date.now();
+              if (state === "background" || state === "inactive") {
+                backgroundedAtMs ??= Date.now();
                 return;
               }
               if (state === "active") {

@@ -29,7 +29,7 @@ export function DispatchProgressStrip({
   return (
     <div className="space-y-1.5">
       <div
-        className="flex h-1.5 w-full shrink-0 gap-0.5 px-3 py-0"
+        className="flex w-full shrink-0 gap-0.5 px-3 py-0"
         role="progressbar"
         aria-label="分步派发进度"
         aria-valuemin={0}
@@ -47,18 +47,22 @@ export function DispatchProgressStrip({
                     type="button"
                     onClick={() => onSelectStep?.(step.id)}
                     aria-label={`${step.id} ${step.title}：${STATUS_LABEL[step.status]}`}
-                    className={cn(
-                      "relative h-1.5 min-w-0 flex-1 overflow-hidden rounded-full transition-colors duration-500 focus-visible:outline-1 focus-visible:outline-ring",
-                      tone.className,
-                    )}
+                    className="group/seg relative flex min-w-0 flex-1 cursor-pointer items-center py-2 -my-1.5 focus-visible:outline-1 focus-visible:outline-ring"
                   >
-                    {tone.sweep && (
-                      <span
-                        ref={observeVisibleAnimation}
-                        aria-hidden="true"
-                        className="visible-animate-dispatch-sweep pointer-events-none absolute inset-y-0 left-0 w-1/2 rounded-full bg-gradient-to-r from-transparent via-foreground/45 to-transparent"
-                      />
-                    )}
+                    <span
+                      className={cn(
+                        "relative block h-1.5 w-full overflow-hidden rounded-full transition-all duration-500 group-hover/seg:h-2",
+                        tone.className,
+                      )}
+                    >
+                      {tone.sweep && (
+                        <span
+                          ref={observeVisibleAnimation}
+                          aria-hidden="true"
+                          className="visible-animate-dispatch-sweep pointer-events-none absolute inset-y-0 left-0 w-1/2 rounded-full bg-gradient-to-r from-transparent via-foreground/45 to-transparent"
+                        />
+                      )}
+                    </span>
                   </button>
                 }
               />

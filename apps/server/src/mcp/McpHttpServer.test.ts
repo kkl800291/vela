@@ -16,6 +16,7 @@ import {
   ProviderInstanceId,
   ProviderInteractionMode,
   RuntimeMode,
+  RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -1229,6 +1230,7 @@ it.effect("admits provider and OAuth client credentials and points only clients 
           threadId: ThreadId.make("thread-provider"),
           providerSessionId: "provider-session",
           providerInstanceId: ProviderInstanceId.make("codex"),
+          runId: RunId.make("untrusted-context-run"),
         },
         client: undefined,
         capabilities: new Set(["orchestration"]),
@@ -1265,6 +1267,10 @@ it.effect("admits provider and OAuth client credentials and points only clients 
           }),
         ),
       ).pipe(
+        Layer.provide(Layer.mock(ThreadManagementService.ThreadManagementService)({
+          resolveCallerRunId: ({ providerSessionId }) =>
+            Effect.succeed(providerSessionId === "provider-session" ? RunId.make("bound-provider-run") : undefined),
+        })),
         Layer.provide(ServerSettings.layerTest()),
         Layer.provide(
           Layer.mock(McpSessionRegistry.McpSessionRegistry)({
@@ -1345,6 +1351,9 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         "provider-session",
         "client:session-1",
       ]);
+
+      expect(seen[0]?.thread?.runId).toBe(RunId.make("bound-provider-run"));
+      expect(seen[1]?.thread).toBeUndefined();
 
       const missing = yield* call(undefined);
       expect(missing.status).toBe(401);

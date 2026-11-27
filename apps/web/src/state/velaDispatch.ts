@@ -1,8 +1,22 @@
-import type { ProviderOptionDescriptor } from "@t3tools/contracts";
+import { environmentEndpointUrl } from "@t3tools/client-runtime/environment";
+import { ManagedRelay } from "@t3tools/client-runtime/relay";
+import {
+  type CollabAttentionReason,
+  EnvironmentId,
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type ProviderOptionDescriptor,
+  type VelaCollabProjection,
+} from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import { AtomRegistry } from "effect/reactivity";
 import { useEffect, useState, useSyncExternalStore } from "react";
 
+import { connectionAtomRuntime } from "../connection/runtime";
 import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
 import { resolvePrimaryEnvironmentHttpUrl } from "../environments/primary/target";
+import { appAtomRegistry } from "../rpc/atomRegistry";
+import { environmentSession } from "./session";
 
 export type DispatchIsolationMode = "direct" | "worktree";
 
@@ -169,6 +183,7 @@ export interface DispatchStepRun {
   readonly branchName: string;
   readonly baseCommit: string;
   readonly baselineTree: string | null;
+  readonly completedTree?: string | null | undefined;
   readonly workspacePath: string;
   readonly childThreadId: string | null;
   readonly childRunId: string | null;
@@ -214,6 +229,7 @@ export interface DispatchEventLogEntry {
 
 export interface DispatchConfig {
   readonly defaultAgent?: DispatchAgentTarget | null | undefined;
+  readonly enableBatchAudit?: boolean | undefined;
   readonly maxReviewRounds?: number | undefined;
   readonly maxOrchestratorEscalationRounds?: number | undefined;
   readonly maxAcceptanceRounds?: number | undefined;
@@ -238,6 +254,26 @@ export interface DispatchArchivedPlan {
   readonly archivedAt: string;
 }
 
+export interface DispatchAttentionItem {
+  readonly engineVersion?: 2;
+  readonly planId?: string;
+  readonly attentionReason?: CollabAttentionReason | "ready_to_deliver";
+  readonly id: string;
+  readonly kind: "decision" | "escalation" | "accept";
+  readonly projectRoot: string;
+  readonly threadId: string | null;
+  readonly planTitle: string | null;
+  readonly stepId: string;
+  readonly stepTitle: string;
+  readonly summary: string;
+  readonly blockedStepTitles: ReadonlyArray<string>;
+  readonly updatedAt: string;
+}
+
+export interface ScopedDispatchAttentionItem extends DispatchAttentionItem {
+  readonly environmentId: EnvironmentId;
+}
+
 export interface DispatchTaskSpecPatch {
   readonly title?: string | undefined;
   readonly goal?: string | undefined;
@@ -257,6 +293,7 @@ export interface DispatchTaskSpecPatch {
 }
 
 export interface VelaDispatchState {
+  readonly collab?: VelaCollabProjection | null;
   readonly version: 1;
   readonly projectRoot: string;
   readonly projectId: string | null;
@@ -299,7 +336,42 @@ function isSameOriginBrowserPrimary(): boolean {
   return new URL(resolvePrimaryEnvironmentHttpUrl("/")).origin === window.location.origin;
 }
 
-async function buildAuthRequest(init?: RequestInit): Promise<{
+function buildUrlWithSearchParams(
+  baseUrlString: string,
+  searchParams?: Readonly<Record<string, string>>,
+): string {
+  const url = new URL(baseUrlString);
+  if (searchParams) {
+    for (const [key, value] of Object.entries(searchParams)) {
+      url.searchParams.set(key, value);
+    }
+  }
+  return url.toString();
+}
+
+function normalizeHttpMethod(method: string | undefined): "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS" {
+  const upper = (method ?? "GET").toUpperCase();
+  if (
+    upper === "GET" ||
+    upper === "POST" ||
+    upper === "PUT" ||
+    upper === "DELETE" ||
+    upper === "PATCH" ||
+    upper === "HEAD" ||
+    upper === "OPTIONS"
+  ) {
+    return upper;
+  }
+  return "GET";
+}
+
+async function resolveDispatchRequest(
+  pathname: string,
+  init?: RequestInit,
+  searchParams?: Readonly<Record<string, string>>,
+  environmentId?: EnvironmentId | null,
+): Promise<{
+  readonly url: string;
   readonly headers: Headers;
   readonly credentials: RequestCredentials;
 }> {
@@ -307,6 +379,59 @@ async function buildAuthRequest(init?: RequestInit): Promise<{
   if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
+
+  const targetEnvId = environmentId ?? EnvironmentId.make(PRIMARY_LOCAL_ENVIRONMENT_ID);
+  const prepared = Option.getOrNull(
+    appAtomRegistry.get(environmentSession.preparedConnectionValueAtom(targetEnvId)),
+  );
+
+  if (prepared !== null) {
+    const url = buildUrlWithSearchParams(
+      environmentEndpointUrl(prepared.httpBaseUrl, pathname),
+      searchParams,
+    );
+    const auth = prepared.httpAuthorization;
+    if (auth === null) {
+      return { url, headers, credentials: "include" };
+    }
+    if (auth._tag === "Bearer") {
+      headers.set("Authorization", `Bearer ${auth.token}`);
+      return { url, headers, credentials: "omit" };
+    }
+    // DPoP authorization for remote / relay-connected environments
+    const dpopHeaders = await Effect.runPromise(
+      Effect.gen(function* () {
+        const context = yield* AtomRegistry.getResult(appAtomRegistry, connectionAtomRuntime);
+        const signerOpt = yield* Effect.serviceOption(ManagedRelay.ManagedRelayDpopSigner).pipe(
+          Effect.provide(context),
+        );
+        if (Option.isNone(signerOpt)) {
+          return null;
+        }
+        const proof = yield* signerOpt.value.createProof({
+          method: normalizeHttpMethod(init?.method),
+          url,
+          accessToken: auth.accessToken,
+        });
+        return {
+          authorization: `DPoP ${auth.accessToken}`,
+          dpop: proof,
+        };
+      }),
+    );
+    if (dpopHeaders === null) {
+      throw new Error("远端环境缺少 DPoP 签名器，无法发送派发请求");
+    }
+    headers.set("Authorization", dpopHeaders.authorization);
+    headers.set("DPoP", dpopHeaders.dpop);
+    return { url, headers, credentials: "omit" };
+  }
+
+  if (environmentId && environmentId !== PRIMARY_LOCAL_ENVIRONMENT_ID) {
+    throw new Error("远端环境尚未连接，无法访问派发服务");
+  }
+
+  const url = buildUrlWithSearchParams(resolvePrimaryEnvironmentHttpUrl(pathname), searchParams);
   let credentials: RequestCredentials = "omit";
   if (isSameOriginBrowserPrimary()) {
     credentials = "include";
@@ -316,29 +441,21 @@ async function buildAuthRequest(init?: RequestInit): Promise<{
       headers.set("Authorization", `Bearer ${token}`);
     }
   }
-  return { headers, credentials };
-}
-
-function resolveDispatchUrl(
-  pathname: string,
-  searchParams?: Readonly<Record<string, string>>,
-): string {
-  const url = new URL(resolvePrimaryEnvironmentHttpUrl(pathname));
-  if (searchParams) {
-    for (const [key, value] of Object.entries(searchParams)) {
-      url.searchParams.set(key, value);
-    }
-  }
-  return url.toString();
+  return { url, headers, credentials };
 }
 
 export async function fetchDispatchApi<T>(
   pathname: string,
   init?: RequestInit,
   searchParams?: Readonly<Record<string, string>>,
+  environmentId?: EnvironmentId | null,
 ): Promise<T> {
-  const url = resolveDispatchUrl(pathname, searchParams);
-  const { headers, credentials } = await buildAuthRequest(init);
+  const { url, headers, credentials } = await resolveDispatchRequest(
+    pathname,
+    init,
+    searchParams,
+    environmentId,
+  );
   const response = await fetch(url, { ...init, headers, credentials });
   const data = (await response.json().catch(() => null)) as
     | (T & { error?: string })
@@ -355,24 +472,131 @@ export async function fetchDispatchApi<T>(
   return data as T;
 }
 
+export type CollabEvidenceTarget = { readonly reviewId: string } | { readonly deliveryId: string };
+
+export interface CollabEvidenceFile {
+  readonly path: string;
+  readonly oldPath?: string;
+  readonly status: "A" | "M" | "D" | "R";
+  readonly isBinary: boolean;
+  readonly sizeBytes: number;
+  readonly oldOid: string | null;
+  readonly newOid: string | null;
+  readonly oldMode: string | null;
+  readonly newMode: string | null;
+  readonly additions: number | null;
+  readonly deletions: number | null;
+}
+
+interface CollabEvidencePage {
+  readonly offset: number;
+  readonly nextOffset: number | null;
+}
+
+type CollabEvidenceText =
+  | { readonly encoding: "utf8"; readonly text: string }
+  | { readonly encoding: "base64"; readonly dataBase64: string };
+
+type CollabEvidenceEntry = { readonly oid: string; readonly mode: string };
+
+type CollabEvidenceQuery =
+  | { readonly view: "manifest"; readonly offset?: number }
+  | { readonly view: "diff"; readonly path: string; readonly offset?: number }
+  | {
+      readonly view: "file";
+      readonly path: string;
+      readonly side?: "base" | "snapshot";
+      readonly startLine?: number;
+      readonly endLine?: number;
+    };
+
+export interface CollabEvidenceResults {
+  readonly manifest: CollabEvidencePage & {
+    readonly kind: "manifest";
+    readonly files: ReadonlyArray<CollabEvidenceFile>;
+    readonly summary?: string;
+  };
+  readonly diff:
+    | (CollabEvidencePage &
+        CollabEvidenceText & {
+          readonly kind: "patch";
+          readonly file: CollabEvidenceFile;
+          readonly byteLength: number;
+        })
+    | { readonly kind: "binary"; readonly file: CollabEvidenceFile };
+  readonly file:
+    | (CollabEvidenceText & {
+        readonly kind: "lines";
+        readonly entry: CollabEvidenceEntry;
+        readonly startLine: number;
+        readonly endLine: number;
+        readonly byteLength: number;
+        readonly truncated: boolean;
+      })
+    | { readonly kind: "binary"; readonly entry: CollabEvidenceEntry };
+}
+
+export function fetchCollabEvidence<View extends CollabEvidenceQuery["view"]>(
+  input: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: string;
+    readonly planId: string;
+    readonly target: CollabEvidenceTarget;
+    readonly maxBytes?: number;
+    readonly signal?: AbortSignal;
+    readonly view: View;
+  } & Extract<CollabEvidenceQuery, { view: View }>,
+): Promise<CollabEvidenceResults[View]> {
+  const { environmentId, signal, target, ...query } = input;
+  const params = Object.fromEntries(
+    Object.entries({ ...query, ...target }).flatMap(([key, value]) =>
+      value === undefined ? [] : [[key, String(value)]],
+    ),
+  );
+  return fetchDispatchApi(
+    "/api/vela/dispatch/v2/evidence",
+    signal ? { signal } : undefined,
+    params,
+    environmentId,
+  );
+}
+
 const stateCache = new Map<string, VelaDispatchState>();
 const stateListeners = new Map<string, Set<(state: VelaDispatchState) => void>>();
 const activeStreams = new Map<string, { refCount: number; abort: AbortController }>();
 
-let providersCache: ReadonlyArray<DispatchProviderSummary> | null = null;
-let providersInflight: Promise<ReadonlyArray<DispatchProviderSummary>> | null = null;
+const providersCacheByEnv = new Map<string, ReadonlyArray<DispatchProviderSummary>>();
+const providersInflightByEnv = new Map<string, Promise<ReadonlyArray<DispatchProviderSummary>>>();
 
-export function dispatchCacheKey(projectRoot: string, threadId?: string | null): string {
+function normalizeEnvCacheKey(environmentId?: EnvironmentId | null): string {
+  return environmentId ?? PRIMARY_LOCAL_ENVIRONMENT_ID;
+}
+
+export function dispatchCacheKey(
+  projectRoot: string,
+  threadId?: string | null,
+  environmentId?: EnvironmentId | null,
+): string {
+  const envKey = normalizeEnvCacheKey(environmentId);
   const normalizedThreadId = threadId?.trim();
-  return normalizedThreadId ? `${projectRoot}::${normalizedThreadId}` : projectRoot;
+  return normalizedThreadId ? `${envKey}::${projectRoot}::${normalizedThreadId}` : `${envKey}::${projectRoot}`;
 }
 
 export function setCachedDispatchState(
   projectRoot: string,
   next: VelaDispatchState,
   threadId?: string | null,
+  environmentId?: EnvironmentId | null,
 ): void {
-  const key = dispatchCacheKey(projectRoot, threadId);
+  const key = dispatchCacheKey(projectRoot, threadId, environmentId);
+  const previous = stateCache.get(key)?.collab;
+  if (
+    previous &&
+    next.collab?.planId === previous.planId &&
+    next.collab.revision < previous.revision
+  ) {
+    return;
+  }
   stateCache.set(key, next);
   const listeners = stateListeners.get(key);
   if (listeners) {
@@ -385,19 +609,29 @@ export function setCachedDispatchState(
 export async function refreshDispatchState(
   projectRoot: string,
   threadId?: string | null,
+  environmentId?: EnvironmentId | null,
 ): Promise<VelaDispatchState> {
   const normalizedThreadId = threadId?.trim();
-  const state = await fetchDispatchApi<VelaDispatchState>("/api/vela/dispatch/state", undefined, {
-    projectRoot,
-    ...(normalizedThreadId ? { threadId: normalizedThreadId } : {}),
-  });
-  setCachedDispatchState(projectRoot, state, normalizedThreadId);
+  const state = await fetchDispatchApi<VelaDispatchState>(
+    "/api/vela/dispatch/state",
+    undefined,
+    {
+      projectRoot,
+      ...(normalizedThreadId ? { threadId: normalizedThreadId } : {}),
+    },
+    environmentId,
+  );
+  setCachedDispatchState(projectRoot, state, normalizedThreadId, environmentId);
   return state;
 }
 
-function ensureDispatchStream(projectRoot: string, threadId?: string | null): () => void {
+function ensureDispatchStream(
+  projectRoot: string,
+  threadId?: string | null,
+  environmentId?: EnvironmentId | null,
+): () => void {
   const normalizedThreadId = threadId?.trim();
-  const key = dispatchCacheKey(projectRoot, normalizedThreadId);
+  const key = dispatchCacheKey(projectRoot, normalizedThreadId, environmentId);
   let entry = activeStreams.get(key);
   if (!entry) {
     const abort = new AbortController();
@@ -407,12 +641,15 @@ function ensureDispatchStream(projectRoot: string, threadId?: string | null): ()
     void (async () => {
       while (!abort.signal.aborted) {
         try {
-          const url = resolveDispatchUrl("/api/vela/dispatch/stream", {
-            projectRoot,
-            ...(normalizedThreadId ? { threadId: normalizedThreadId } : {}),
-          });
-          const { headers, credentials } = await buildAuthRequest();
-          headers.set("Accept", "text/event-stream");
+          const { url, headers, credentials } = await resolveDispatchRequest(
+            "/api/vela/dispatch/stream",
+            { headers: { Accept: "text/event-stream" } },
+            {
+              projectRoot,
+              ...(normalizedThreadId ? { threadId: normalizedThreadId } : {}),
+            },
+            environmentId,
+          );
           const response = await fetch(url, {
             headers,
             credentials,
@@ -441,7 +678,7 @@ function ensureDispatchStream(projectRoot: string, threadId?: string | null): ()
               if (dataLines.length > 0) {
                 try {
                   const parsed = JSON.parse(dataLines.join("\n")) as VelaDispatchState;
-                  setCachedDispatchState(projectRoot, parsed, normalizedThreadId);
+                  setCachedDispatchState(projectRoot, parsed, normalizedThreadId, environmentId);
                 } catch {
                   // Ignore malformed SSE chunk
                 }
@@ -484,9 +721,10 @@ const dispatchStores = new Map<string, DispatchStore>();
 function getDispatchStore(
   projectRoot: string | undefined,
   normalizedThreadId: string | undefined,
+  environmentId?: EnvironmentId | null,
 ): DispatchStore {
   if (!projectRoot) return EMPTY_DISPATCH_STORE;
-  const key = dispatchCacheKey(projectRoot, normalizedThreadId);
+  const key = dispatchCacheKey(projectRoot, normalizedThreadId, environmentId);
   let store = dispatchStores.get(key);
   if (!store) {
     store = {
@@ -498,7 +736,7 @@ function getDispatchStore(
         }
         const listener = () => onStoreChange();
         set.add(listener);
-        const stopStream = ensureDispatchStream(projectRoot, normalizedThreadId);
+        const stopStream = ensureDispatchStream(projectRoot, normalizedThreadId, environmentId);
         return () => {
           set?.delete(listener);
           stopStream();
@@ -514,53 +752,258 @@ function getDispatchStore(
 export function useVelaDispatchState(
   projectRoot: string | undefined,
   threadId?: string | null,
+  environmentId?: EnvironmentId | null,
 ): {
   readonly state: VelaDispatchState | null;
   readonly refresh: () => Promise<void>;
 } {
   const normalizedThreadId = threadId?.trim() || undefined;
-  const store = getDispatchStore(projectRoot, normalizedThreadId);
+  const store = getDispatchStore(projectRoot, normalizedThreadId, environmentId);
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
   const refresh = async () => {
     if (!projectRoot) return;
-    await refreshDispatchState(projectRoot, normalizedThreadId);
+    await refreshDispatchState(projectRoot, normalizedThreadId, environmentId);
   };
 
   return { state, refresh };
 }
 
-export function useVelaDispatchProviders(): ReadonlyArray<DispatchProviderSummary> {
-  const [providers, setProviders] = useState<ReadonlyArray<DispatchProviderSummary>>(() =>
-    providersCache && providersCache.every((p) => Boolean(p.name?.trim()))
-      ? providersCache
-      : [],
-  );
+function getValidCachedProviders(envKey: string): ReadonlyArray<DispatchProviderSummary> | null {
+  const cached = providersCacheByEnv.get(envKey);
+  if (cached && cached.every((p) => Boolean(p.name?.trim()))) {
+    return cached;
+  }
+  return null;
+}
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads cached Vela provider catalog for dispatch target pickers
+export function useVelaDispatchProviders(
+  environmentId?: EnvironmentId | null,
+): ReadonlyArray<DispatchProviderSummary> {
+  const envKey = normalizeEnvCacheKey(environmentId);
+  const [providersByEnv, setProvidersByEnv] = useState<{
+    readonly envKey: string;
+    readonly list: ReadonlyArray<DispatchProviderSummary>;
+  }>(() => ({
+    envKey,
+    list: getValidCachedProviders(envKey) ?? [],
+  }));
+
+  const currentCached = getValidCachedProviders(envKey);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads cached Vela provider catalog per environmentId for dispatch target pickers
   useEffect(() => {
-    if (providersCache && providersCache.every((p) => Boolean(p.name?.trim()))) return;
-    if (!providersInflight) {
-      providersInflight = fetchDispatchApi<{ providers: DispatchProviderSummary[] }>(
+    const valid = getValidCachedProviders(envKey);
+    if (valid) return;
+    let inflight = providersInflightByEnv.get(envKey);
+    if (!inflight) {
+      inflight = fetchDispatchApi<{ providers: DispatchProviderSummary[] }>(
         "/api/vela/dispatch/providers",
+        undefined,
+        undefined,
+        environmentId,
       )
         .then((res) => {
-          providersCache = res.providers;
+          providersCacheByEnv.set(envKey, res.providers);
           return res.providers;
         })
         .catch(() => [])
         .finally(() => {
-          providersInflight = null;
+          providersInflightByEnv.delete(envKey);
         });
+      providersInflightByEnv.set(envKey, inflight);
     }
     let active = true;
-    void providersInflight.then((list) => {
-      if (active) setProviders(list);
+    void inflight.then((list) => {
+      if (active) setProvidersByEnv({ envKey, list });
     });
     return () => {
       active = false;
     };
-  }, []);
+  }, [envKey, environmentId]);
 
-  return providers;
+  if (currentCached) return currentCached;
+  return providersByEnv.envKey === envKey ? providersByEnv.list : [];
+}
+
+interface AttentionEnvEntry {
+  items: ReadonlyArray<ScopedDispatchAttentionItem>;
+  refCount: number;
+  abort: AbortController;
+}
+
+const attentionByEnv = new Map<string, AttentionEnvEntry>();
+const attentionListeners = new Set<() => void>();
+let attentionVersion = 0;
+
+function notifyAttentionListeners(): void {
+  attentionVersion += 1;
+  for (const listener of attentionListeners) {
+    listener();
+  }
+}
+
+function retainAttentionEnvStream(environmentId: EnvironmentId): () => void {
+  const envKey = normalizeEnvCacheKey(environmentId);
+  let entry = attentionByEnv.get(envKey);
+  if (!entry) {
+    const abort = new AbortController();
+    entry = { items: [], refCount: 0, abort };
+    attentionByEnv.set(envKey, entry);
+
+    void (async () => {
+      while (!abort.signal.aborted) {
+        try {
+          const { url, headers, credentials } = await resolveDispatchRequest(
+            "/api/vela/dispatch/attention/stream",
+            { headers: { Accept: "text/event-stream" } },
+            undefined,
+            environmentId,
+          );
+          const response = await fetch(url, {
+            headers,
+            credentials,
+            signal: abort.signal,
+          });
+          if (!response.ok || !response.body) {
+            await new Promise((r) => setTimeout(r, 4_000));
+            continue;
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          while (!abort.signal.aborted) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let idx = buffer.indexOf("\n\n");
+            while (idx !== -1) {
+              const rawEvent = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+              const dataLines = rawEvent
+                .split("\n")
+                .filter((l) => l.startsWith("data:"))
+                .map((l) => l.slice(5).trim());
+              if (dataLines.length > 0) {
+                try {
+                  const parsed = JSON.parse(dataLines.join("\n")) as {
+                    items?: ReadonlyArray<DispatchAttentionItem>;
+                  };
+                  const scoped = (parsed.items ?? []).map((item) => ({
+                    ...item,
+                    environmentId,
+                  }));
+                  const target = attentionByEnv.get(envKey);
+                  if (target) {
+                    target.items = scoped;
+                    notifyAttentionListeners();
+                  }
+                } catch {
+                  // Ignore malformed SSE chunk
+                }
+              }
+              idx = buffer.indexOf("\n\n");
+            }
+          }
+        } catch {
+          if (abort.signal.aborted) break;
+          await new Promise((r) => setTimeout(r, 3_500));
+        }
+      }
+    })();
+  }
+
+  entry.refCount += 1;
+  return () => {
+    const current = attentionByEnv.get(envKey);
+    if (!current) return;
+    current.refCount -= 1;
+    if (current.refCount <= 0) {
+      current.abort.abort();
+      attentionByEnv.delete(envKey);
+      notifyAttentionListeners();
+    }
+  };
+}
+
+function subscribeAttentionSnapshot(listener: () => void): () => void {
+  attentionListeners.add(listener);
+  return () => {
+    attentionListeners.delete(listener);
+  };
+}
+
+function readAttentionSnapshot(): number {
+  return attentionVersion;
+}
+
+export function useVelaDispatchAttention(
+  environmentIds: ReadonlyArray<EnvironmentId>,
+): ReadonlyArray<ScopedDispatchAttentionItem> {
+  const envKeyList = environmentIds.join("\n");
+  useSyncExternalStore(subscribeAttentionSnapshot, readAttentionSnapshot, readAttentionSnapshot);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes to per-environment dispatch attention SSE streams while environments are connected
+  useEffect(() => {
+    const ids = envKeyList
+      .split("\n")
+      .filter((id) => id.length > 0)
+      .map((id) => EnvironmentId.make(id));
+    const cleanups = ids.map((envId) => retainAttentionEnvStream(envId));
+    return () => {
+      for (const cleanup of cleanups) cleanup();
+    };
+  }, [envKeyList]);
+
+  const combined: ScopedDispatchAttentionItem[] = [];
+  for (const envId of environmentIds) {
+    const entry = attentionByEnv.get(normalizeEnvCacheKey(envId));
+    if (entry?.items.length) {
+      combined.push(...entry.items);
+    }
+  }
+  return combined.toSorted((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+}
+
+const pendingFocusByThread = new Map<string, { readonly stepId: string; readonly at: number }>();
+const focusListenersByThread = new Map<string, Set<(stepId: string) => void>>();
+
+export function requestFocusDispatchStep(threadId: string, stepId: string): void {
+  const listeners = focusListenersByThread.get(threadId);
+  if (listeners && listeners.size > 0) {
+    pendingFocusByThread.delete(threadId);
+    for (const listener of listeners) {
+      listener(stepId);
+    }
+    return;
+  }
+  pendingFocusByThread.set(threadId, { stepId, at: Date.now() });
+}
+
+export function subscribeFocusDispatchStep(
+  threadId: string,
+  listener: (stepId: string) => void,
+): () => void {
+  let set = focusListenersByThread.get(threadId);
+  if (!set) {
+    set = new Set();
+    focusListenersByThread.set(threadId, set);
+  }
+  set.add(listener);
+
+  const pending = pendingFocusByThread.get(threadId);
+  if (pending) {
+    pendingFocusByThread.delete(threadId);
+    if (Date.now() - pending.at < 5_000) {
+      listener(pending.stepId);
+    }
+  }
+
+  return () => {
+    set?.delete(listener);
+    if (set?.size === 0) {
+      focusListenersByThread.delete(threadId);
+    }
+  };
 }

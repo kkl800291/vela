@@ -1,3 +1,5 @@
+import type { CollabAttentionReason } from "@t3tools/contracts";
+
 export type DispatchIsolationMode = "direct" | "worktree";
 
 export type DispatchStepKind = "research" | "decision" | "change"; // 调研/排查(只读) | 决策(用户拍板) | 改动(代码/文档/配置)
@@ -182,6 +184,7 @@ export interface DispatchStepRun {
   readonly branchName: string;
   readonly baseCommit: string;
   readonly baselineTree: string | null;
+  readonly completedTree?: string | null | undefined;
   readonly workspacePath: string;
   readonly childThreadId: string | null;
   readonly childRunId: string | null;
@@ -222,6 +225,7 @@ export interface DispatchBlindCheckRecord {
 
 export interface DispatchConfig {
   readonly defaultAgent?: DispatchAgentTarget | null | undefined;
+  readonly enableBatchAudit?: boolean | undefined;
   readonly maxReviewRounds: number;
   readonly maxOrchestratorEscalationRounds: number;
   readonly maxAcceptanceRounds: number;
@@ -268,6 +272,22 @@ export interface DispatchArchivedPlan {
   readonly steps: ReadonlyArray<DispatchTaskCard>;
   readonly runs: Readonly<Record<string, DispatchStepRun>>;
   readonly archivedAt: string;
+}
+
+export interface DispatchAttentionItem {
+  readonly engineVersion?: 2;
+  readonly planId?: string;
+  readonly attentionReason?: CollabAttentionReason | "ready_to_deliver";
+  readonly id: string;
+  readonly kind: "decision" | "escalation" | "accept";
+  readonly projectRoot: string;
+  readonly threadId: string | null;
+  readonly planTitle: string | null;
+  readonly stepId: string;
+  readonly stepTitle: string;
+  readonly summary: string;
+  readonly blockedStepTitles: ReadonlyArray<string>;
+  readonly updatedAt: string;
 }
 
 export interface VelaDispatchState {

@@ -19,6 +19,14 @@ import {
   type DispatchTaskSpecPatch,
 } from "~/state/velaDispatch";
 import { Button } from "../ui/button";
+import {
+  Dialog,
+  DialogDescription,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from "../ui/dialog";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
 import {
   Menu,
@@ -35,13 +43,16 @@ import { ScrollArea } from "../ui/scroll-area";
 import { toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { DispatchActivity } from "./dispatch/DispatchActivity";
+import { AgentTargetPicker } from "./dispatch/AgentTargetPicker";
+import { CollabV2Card } from "./dispatch/CollabV2Card";
 import { DispatchComposerBanner } from "./dispatch/DispatchComposerBanner";
 import { DispatchHistory } from "./dispatch/DispatchHistory";
 import { DispatchKickoff } from "./dispatch/DispatchKickoff";
 import { DispatchOutline } from "./dispatch/DispatchOutline";
 import { DispatchProgressStrip } from "./dispatch/DispatchProgressStrip";
+import { DispatchStepDiffDialog } from "./dispatch/DispatchStepDiffDialog";
 import { DispatchStepEditor } from "./dispatch/DispatchStepEditor";
-import { providerLabelOf } from "./dispatch/dispatchModel";
+import { isActiveCollabPlan, providerLabelOf } from "./dispatch/dispatchModel";
 import { useDispatchActions } from "./dispatch/useDispatchActions";
 
 export { DispatchComposerBanner };
@@ -50,6 +61,8 @@ interface DispatchRightPanelProps {
   readonly workspaceRoot: string | undefined;
   readonly threadRef: ScopedThreadRef;
   readonly isServerThread?: boolean | undefined;
+  readonly hasConversationMessages?: boolean | undefined;
+  readonly currentBranch?: string | null | undefined;
   readonly sendPrompt?: ((prompt: string) => Promise<boolean>) | undefined;
 }
 
@@ -57,15 +70,23 @@ export function DispatchRightPanel({
   workspaceRoot,
   threadRef,
   isServerThread,
+  hasConversationMessages,
+  currentBranch: _currentBranch,
   sendPrompt,
 }: DispatchRightPanelProps) {
-  const { state, refresh } = useVelaDispatchState(workspaceRoot, threadRef.threadId);
-  const providers = useVelaDispatchProviders();
+  const { state, refresh } = useVelaDispatchState(
+    workspaceRoot,
+    threadRef.threadId,
+    threadRef.environmentId,
+  );
+  const providers = useVelaDispatchProviders(threadRef.environmentId);
   const {
     busyKey,
     runAction,
+    runCollabAction,
     runKickoff,
     openChildThread,
+    openFileInPanel,
     openDiffInPanel,
   } = useDispatchActions(workspaceRoot, threadRef, { isServerThread, sendPrompt });
 
@@ -74,7 +95,12 @@ export function DispatchRightPanel({
   >(undefined);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingStep, setEditingStep] = useState<DispatchTaskCard | null>(null);
+  const [diffStepId, setDiffStepId] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [newPlanAfter, setNewPlanAfter] = useState<string | null>(null);
+  const [devPickerPlanId, setDevPickerPlanId] = useState<string | null>(null);
+  const collab = state?.collab;
+  const preparingNewPlan = collab?.planId === newPlanAfter;
 
   const handleRefresh = async () => {
     if (isRefreshing) return;
@@ -113,13 +139,120 @@ export function DispatchRightPanel({
     );
   }
 
-  const steps = state?.steps ?? [];
-  const hasPlanOrBlind = steps.length > 0 || Boolean(state?.blindCheck);
+  if (collab && !preparingNewPlan) {
+    const { planId, config } = collab;
+    const active = isActiveCollabPlan(collab.status);
+    return (
+      <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+        <div
+          data-surface-subheader
+          className="flex h-10 shrink-0 items-center justify-between border-b border-border/50 px-3"
+        >
+          <span className="text-sm font-medium">协作检查器</span>
+          <Menu>
+            <MenuTrigger
+              render={
+                <Button size="icon-xs" variant="ghost" aria-label="协作选项">
+                  <MoreHorizontalIcon className="size-3.5" />
+                </Button>
+              }
+            />
+            <MenuPopup align="end">
+              {active && (
+                <>
+                  <MenuItem disabled={busyKey !== null} onClick={() => setDevPickerPlanId(planId)}>
+                    <BotIcon className="size-3.5" /> 切换默认开发代理
+                  </MenuItem>
+                  <MenuItem
+                    disabled={busyKey !== null}
+                    onClick={() =>
+                      void runCollabAction({
+                        endpoint: "config",
+                        planId,
+                        enableBatchAudit: !config.enableBatchAudit,
+                      })
+                    }
+                  >
+                    {config.enableBatchAudit ? "关闭交付前冷眼终审" : "开启交付前冷眼终审"}
+                  </MenuItem>
+                </>
+              )}
+              <MenuItem onClick={openDiffInPanel}>
+                <FileDiffIcon className="size-3.5" /> 查看工作区 Diff
+              </MenuItem>
+              <MenuSeparator />
+              {active ? (
+                <MenuItem
+                  variant="destructive"
+                  disabled={busyKey !== null}
+                  onClick={async () => {
+                    if (await runCollabAction({ endpoint: "plan", action: "cancel", planId }))
+                      setNewPlanAfter(planId);
+                  }}
+                >
+                  <Trash2Icon className="size-3.5" /> 取消计划
+                </MenuItem>
+              ) : (
+                <MenuItem onClick={() => setNewPlanAfter(planId)}>
+                  <PlusIcon className="size-3.5" /> 开启新计划
+                </MenuItem>
+              )}
+            </MenuPopup>
+          </Menu>
+        </div>
+        <ScrollArea className="min-h-0 flex-1" scrollFade>
+          <CollabV2Card
+            key={planId}
+            collab={collab}
+            threadRef={threadRef}
+            workspaceRoot={workspaceRoot}
+            inspector
+          />
+        </ScrollArea>
+        <Dialog
+          open={active && devPickerPlanId === planId}
+          onOpenChange={(open) => setDevPickerPlanId(open ? planId : null)}
+        >
+          <DialogPopup>
+            <DialogHeader>
+              <DialogTitle>切换默认开发代理</DialogTitle>
+              <DialogDescription>适用于接下来启动的开发步骤。</DialogDescription>
+            </DialogHeader>
+            <DialogPanel>
+              <AgentTargetPicker
+                value={config.defaultDevAgent ?? "inherit"}
+                providers={providers}
+                allowInherit
+                disabled={busyKey !== null}
+                align="start"
+                onSelect={(target) => {
+                  if (target === "self") return;
+                  void runCollabAction({
+                    endpoint: "config",
+                    planId,
+                    defaultDevAgent: target === "inherit" ? null : target,
+                  });
+                }}
+              />
+            </DialogPanel>
+          </DialogPopup>
+        </Dialog>
+      </div>
+    );
+  }
+
+  const steps = preparingNewPlan ? [] : (state?.steps ?? []);
+  const blindCheck = preparingNewPlan ? null : (state?.blindCheck ?? null);
+  const hasPlanOrBlind = steps.length > 0 || Boolean(blindCheck);
   const doneCount = steps.filter((s) => s.status === "done").length;
   const lockedSteps = steps.filter((s) => s.status === "locked");
 
   const selectedDefaultAgent =
-    pendingDefaultAgent !== undefined ? pendingDefaultAgent : (state?.config?.defaultAgent ?? null);
+    pendingDefaultAgent !== undefined
+      ? pendingDefaultAgent
+      : preparingNewPlan
+        ? (collab?.config.defaultDevAgent ?? null)
+        : (state?.config?.defaultAgent ?? null);
 
   const focusStep = (stepId: string) => {
     if (typeof document !== "undefined") {
@@ -295,10 +428,12 @@ export function DispatchRightPanel({
                 </MenuSub>
               )}
 
-              <MenuItem onClick={openCreateEditor}>
-                <PlusIcon className="size-3.5" />
-                手动新建单步任务卡
-              </MenuItem>
+              {hasPlanOrBlind && (
+                <MenuItem onClick={openCreateEditor}>
+                  <PlusIcon className="size-3.5" />
+                  手动新建单步任务卡
+                </MenuItem>
+              )}
 
               {lockedSteps.length > 0 && (
                 <MenuItem
@@ -363,17 +498,21 @@ export function DispatchRightPanel({
           <div className="pb-4">
             <DispatchKickoff
               workspaceRoot={workspaceRoot}
+              threadId={threadRef.threadId}
               providers={providers}
-              blindCheck={state?.blindCheck ?? null}
+              blindCheck={blindCheck}
               selectedDefaultAgent={selectedDefaultAgent}
+              defaultEnableBatchAudit={
+                (preparingNewPlan ? collab?.config.enableBatchAudit : state?.config?.enableBatchAudit) ?? false
+              }
+              hasConversationMessages={hasConversationMessages}
               busyKey={busyKey}
               onSelectDefaultAgent={(target) => {
                 setPendingDefaultAgent(target);
-                void runAction("config:default", "/api/vela/dispatch/config", {
-                  defaultAgent: target,
-                });
               }}
-              onKickoff={(req, mode) => runKickoff(req, mode, selectedDefaultAgent)}
+              onKickoff={(req, mode, enableBatchAudit) =>
+                runKickoff(req, mode, selectedDefaultAgent, enableBatchAudit)
+              }
               onCancelBlindCheck={() =>
                 void runAction(
                   "cancel:blind",
@@ -408,10 +547,11 @@ export function DispatchRightPanel({
             <DispatchOutline
               steps={steps}
               runs={state?.runs ?? {}}
-              blindCheck={state?.blindCheck ?? null}
+              blindCheck={blindCheck}
               providers={providers}
               onOpenThread={openChildThread}
               onOpenDiff={openDiffInPanel}
+              onOpenStepDiff={(stepId) => setDiffStepId(stepId)}
               onEditStep={openEditEditor}
             />
             <DispatchActivity events={state?.events ?? []} />
@@ -432,6 +572,15 @@ export function DispatchRightPanel({
           </div>
         )}
       </ScrollArea>
+
+      <DispatchStepDiffDialog
+        step={diffStepId ? (steps.find((s) => s.id === diffStepId) ?? null) : null}
+        run={diffStepId && state ? state.runs[diffStepId] : undefined}
+        onClose={() => setDiffStepId(null)}
+        onOpenFile={openFileInPanel}
+        onOpenWorkspaceDiff={openDiffInPanel}
+        onOpenChildThread={openChildThread}
+      />
 
       <DispatchStepEditor
         open={editorOpen}

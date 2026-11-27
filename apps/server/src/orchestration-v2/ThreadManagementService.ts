@@ -442,6 +442,11 @@ export interface ThreadManagementServiceShape {
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
   readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly resolveCallerRunId: (input: {
+    readonly threadId: ThreadId;
+    readonly providerSessionId: string;
+    readonly providerInstanceId: ProviderInstanceId;
+  }) => Effect.Effect<RunId | undefined, Orchestrator.OrchestratorV2Error>;
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -1977,6 +1982,47 @@ const make = Effect.gen(function* () {
       },
     ),
     getThreadProjection,
+    resolveCallerRunId: Effect.fn("ThreadManagementService.resolveCallerRunId")(function* (caller) {
+      const { thread, runs } = yield* orchestrator.getThreadRecords(
+        caller.threadId,
+        ["runs"],
+        { runStatuses: ACTIVE_RUN_STATUSES },
+      );
+      if (thread.archivedAt !== null || thread.deletedAt !== null) return undefined;
+      const eligible = runs.filter((run) =>
+        run.providerInstanceId === caller.providerInstanceId &&
+        run.providerThreadId !== null && run.activeAttemptId !== null,
+      );
+      if (!eligible.length) return undefined;
+      const attemptIds = eligible.flatMap(({ activeAttemptId }) => activeAttemptId ?? []);
+      const { attempts, providerThreads, providerTurns, runs: currentRuns } =
+        yield* orchestrator.getThreadRecords(caller.threadId,
+          ["runs", "attempts", "providerThreads", "providerTurns"], {
+            runIds: eligible.map(({ id }) => id),
+            attemptIds,
+            providerTurnAttemptIds: attemptIds,
+            providerThreadIds: eligible.flatMap(({ providerThreadId }) => providerThreadId ?? []),
+          },
+        );
+      const sessions = new Set(providerThreads.filter((binding) =>
+        binding.appThreadId === caller.threadId &&
+        binding.providerInstanceId === caller.providerInstanceId &&
+        binding.providerSessionId === caller.providerSessionId,
+      ).map(({ id }) => id));
+      const active = currentRuns.filter((run) => {
+        if (!isActiveRun(run) || run.providerInstanceId !== caller.providerInstanceId ||
+            run.providerThreadId === null || !sessions.has(run.providerThreadId)) return false;
+        const attempt = attempts.find(({ id }) => id === run.activeAttemptId);
+        const turn = Orchestrator.providerTurnForRun({
+          attempts,
+          providerTurns: providerTurns.filter(({ providerThreadId }) => providerThreadId === run.providerThreadId),
+        }, run);
+        return attempt?.runId === run.id && attempt.providerThreadId === run.providerThreadId &&
+          turn?.runAttemptId === attempt.id && turn.providerThreadId === attempt.providerThreadId &&
+          turn.status === "running";
+      });
+      return active.length === 1 ? active[0]?.id : undefined;
+    }),
     getCheckpointContext,
     getThreadSnapshot,
     getThreadTranscript,

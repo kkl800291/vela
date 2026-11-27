@@ -115,6 +115,18 @@ export interface McpTestResult {
   readonly testedAt: string;
 }
 
+export interface McpSyncEngineResult {
+  readonly engineId: McpEngineId;
+  readonly ok: boolean;
+  readonly error?: string;
+}
+
+export interface SyncMcpServerResult {
+  readonly snapshot: UnifiedMcpSnapshot;
+  readonly results: ReadonlyArray<McpSyncEngineResult>;
+  readonly ok: boolean;
+}
+
 export interface ApplyMcpAuthInput {
   readonly name: string;
   readonly sourceEngineId: McpEngineId;
@@ -234,6 +246,11 @@ function extractBearerEnvVarFromAuthHeader(value: string | undefined): string | 
   return match?.[1];
 }
 
+/** `${ENV}` and `Bearer ${ENV}` are references, not literal credentials. */
+function isHeaderEnvPlaceholder(value: string): boolean {
+  return /^(?:Bearer\s+)?\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(value.trim());
+}
+
 function maskEntry(raw: RawMcpServerEntry): UnifiedMcpServerEntry {
   const maskedEnvKeys: string[] = [];
   let maskedEnv: Record<string, string> | undefined;
@@ -254,8 +271,8 @@ function maskEntry(raw: RawMcpServerEntry): UnifiedMcpServerEntry {
   if (raw.headers && Object.keys(raw.headers).length > 0) {
     maskedHeaders = {};
     for (const [k, v] of Object.entries(raw.headers)) {
-      const isEnvPlaceholder = /^Bearer\s+\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(v.trim());
-      if (isSensitiveKey(k) && v.length > 0 && !isEnvPlaceholder) {
+      // Custom api_key_header names are not covered by isSensitiveKey.
+      if (v.length > 0 && !isHeaderEnvPlaceholder(v)) {
         maskedHeaders[k] = SECRET_MASK_SENTINEL;
         maskedHeaderKeys.push(k);
       } else {
@@ -423,11 +440,11 @@ function readJsonEngine(
   }
 }
 
-function mutateJsonEngine(
+function prepareJsonEngineMutation(
   descriptor: EngineDescriptor,
   configPath: string,
   mutator: (mcpServers: Record<string, unknown>) => void,
-): void {
+): string {
   let root: Record<string, unknown> = {};
   if (fs.existsSync(configPath)) {
     const rawText = fs.readFileSync(configPath, "utf8").trim();
@@ -442,7 +459,15 @@ function mutateJsonEngine(
   const existingServers = isPlainObject(root.mcpServers) ? { ...root.mcpServers } : {};
   mutator(existingServers);
   root.mcpServers = existingServers;
-  writeFileAtomic(configPath, `${JSON.stringify(root, null, 2)}\n`);
+  return `${JSON.stringify(root, null, 2)}\n`;
+}
+
+function mutateJsonEngine(
+  descriptor: EngineDescriptor,
+  configPath: string,
+  mutator: (mcpServers: Record<string, unknown>) => void,
+): void {
+  writeFileAtomic(configPath, prepareJsonEngineMutation(descriptor, configPath, mutator));
 }
 
 function scanAntigravityPlugins(homeDir: string): McpPluginEntry[] {
@@ -519,6 +544,198 @@ interface TomlSection {
   readonly headerLine: string | null; // null for preamble before first [section]
   readonly segments: ReadonlyArray<string>;
   readonly lines: string[];
+  /** `[[array.of.tables]]` headers. These are not `[mcp_servers.*]` / `[plugins.*]` tables. */
+  readonly isArrayTable: boolean;
+  /**
+   * True for array tables and for standard tables that are subtables of an array element
+   * (`[mcp_servers.foo.env]` under `[[mcp_servers.foo]]`).
+   */
+  readonly belongsToArrayTable: boolean;
+}
+
+interface TomlValueScan {
+  bracketDepth: number;
+  braceDepth: number;
+  multiline: "basic" | "literal" | null;
+}
+
+function tomlPathEquals(left: ReadonlyArray<string>, right: ReadonlyArray<string>): boolean {
+  return left.length === right.length && left.every((segment, index) => segment === right[index]);
+}
+
+function isStrictTomlPrefix(prefix: ReadonlyArray<string>, full: ReadonlyArray<string>): boolean {
+  return prefix.length > 0 && prefix.length < full.length && prefix.every((segment, index) => segment === full[index]);
+}
+
+function isTomlTopLevel(scan: TomlValueScan): boolean {
+  return scan.bracketDepth === 0 && scan.braceDepth === 0 && scan.multiline === null;
+}
+
+/** TOML closes a multiline string on a run of 3–5 quotes; the extras are content, not a new string. */
+function consumeTomlMultilineCloser(line: string, index: number, quote: '"' | "'"): number | null {
+  if (!line.startsWith(quote.repeat(3), index)) return null;
+  let end = index + 3;
+  while (end < line.length && end - index < 5 && line[end] === quote) end += 1;
+  return end;
+}
+
+/** Advance bracket/brace/multiline-string state so values like `[[1]]` are not table headers. */
+function advanceTomlValueScan(line: string, scan: TomlValueScan): TomlValueScan {
+  let { bracketDepth, braceDepth, multiline } = scan;
+  let index = 0;
+  while (index < line.length) {
+    if (multiline === "basic") {
+      if (line[index] === "\\" && index + 1 < line.length) {
+        index += 2;
+        continue;
+      }
+      const basicEnd = consumeTomlMultilineCloser(line, index, '"');
+      if (basicEnd !== null) {
+        multiline = null;
+        index = basicEnd;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+    if (multiline === "literal") {
+      const literalEnd = consumeTomlMultilineCloser(line, index, "'");
+      if (literalEnd !== null) {
+        multiline = null;
+        index = literalEnd;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+
+    const ch = line[index]!;
+    if (ch === '"') {
+      if (line.startsWith('"""', index)) {
+        multiline = "basic";
+        index += 3;
+        continue;
+      }
+      index += 1;
+      let escaped = false;
+      while (index < line.length) {
+        const inner = line[index]!;
+        if (escaped) {
+          escaped = false;
+        } else if (inner === "\\") {
+          escaped = true;
+        } else if (inner === '"') {
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      if (line.startsWith("'''", index)) {
+        multiline = "literal";
+        index += 3;
+        continue;
+      }
+      index += 1;
+      while (index < line.length && line[index] !== "'") index += 1;
+      if (index < line.length) index += 1;
+      continue;
+    }
+    if (ch === "#") break;
+    if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") bracketDepth -= 1;
+    else if (ch === "{") braceDepth += 1;
+    else if (ch === "}") braceDepth -= 1;
+    index += 1;
+  }
+  return { bracketDepth, braceDepth, multiline };
+}
+
+function markArrayTableOwnership(sections: readonly TomlSection[]): TomlSection[] {
+  const arrayPaths = sections
+    .filter((section) => section.isArrayTable && section.segments.length > 0)
+    .map((section) => section.segments);
+  return sections.map((section) => ({
+    ...section,
+    lines: section.lines,
+    belongsToArrayTable:
+      section.isArrayTable ||
+      arrayPaths.some((path) => isStrictTomlPrefix(path, section.segments)),
+  }));
+}
+
+/** Drop a trailing `# comment` that is outside strings, starting from an open multiline string if needed. */
+function stripTomlInlineCommentWithState(
+  line: string,
+  initialMultiline: "basic" | "literal" | null,
+): string {
+  let multiline = initialMultiline;
+  let index = 0;
+  while (index < line.length) {
+    if (multiline === "basic") {
+      if (line[index] === "\\" && index + 1 < line.length) {
+        index += 2;
+        continue;
+      }
+      const basicEnd = consumeTomlMultilineCloser(line, index, '"');
+      if (basicEnd !== null) {
+        multiline = null;
+        index = basicEnd;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+    if (multiline === "literal") {
+      const literalEnd = consumeTomlMultilineCloser(line, index, "'");
+      if (literalEnd !== null) {
+        multiline = null;
+        index = literalEnd;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+    const ch = line[index]!;
+    if (ch === '"') {
+      if (line.startsWith('"""', index)) {
+        multiline = "basic";
+        index += 3;
+        continue;
+      }
+      index += 1;
+      let escaped = false;
+      while (index < line.length) {
+        const inner = line[index]!;
+        if (escaped) {
+          escaped = false;
+        } else if (inner === "\\") {
+          escaped = true;
+        } else if (inner === '"') {
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      if (line.startsWith("'''", index)) {
+        multiline = "literal";
+        index += 3;
+        continue;
+      }
+      index += 1;
+      while (index < line.length && line[index] !== "'") index += 1;
+      if (index < line.length) index += 1;
+      continue;
+    }
+    if (ch === "#") return line.slice(0, index);
+    index += 1;
+  }
+  return line;
 }
 
 function stripTomlInlineComment(line: string): string {
@@ -561,19 +778,23 @@ function parseTomlKeyPath(rawHeader: string): string[] {
     if (i >= len) break;
     const ch = rawHeader[i]!;
     if (ch === '"') {
+      const start = i;
       i += 1;
-      let buf = "";
-      while (i < len && rawHeader[i] !== '"') {
-        if (rawHeader[i] === "\\" && i + 1 < len) {
-          buf += rawHeader[i + 1]!;
-          i += 2;
-        } else {
-          buf += rawHeader[i]!;
+      let escaped = false;
+      while (i < len) {
+        const current = rawHeader[i]!;
+        if (escaped) {
+          escaped = false;
+        } else if (current === "\\") {
+          escaped = true;
+        } else if (current === '"') {
           i += 1;
+          break;
         }
+        i += 1;
       }
-      i += 1; // closing quote
-      segments.push(buf);
+      const token = rawHeader.slice(start, i);
+      segments.push(parseTomlStringValue(token) ?? token.slice(1, Math.max(token.length - 1, 1)));
     } else if (ch === "'") {
       i += 1;
       let buf = "";
@@ -604,36 +825,187 @@ function parseTomlSections(content: string): TomlSection[] {
   }
 
   const sections: TomlSection[] = [];
-  let current: TomlSection = { headerLine: null, segments: [], lines: [] };
+  let current: TomlSection = {
+    headerLine: null,
+    segments: [],
+    lines: [],
+    isArrayTable: false,
+    belongsToArrayTable: false,
+  };
   sections.push(current);
+  let scan: TomlValueScan = { bracketDepth: 0, braceDepth: 0, multiline: null };
 
   for (const line of rawLines) {
-    const trimmed = stripTomlInlineComment(line).trim();
-    if (
-      trimmed.startsWith("[") &&
-      !trimmed.startsWith("[[") &&
-      trimmed.endsWith("]")
-    ) {
-      const inner = trimmed.slice(1, -1).trim();
-      const segments = parseTomlKeyPath(inner);
-      current = { headerLine: line, segments, lines: [] };
-      sections.push(current);
-    } else {
-      current.lines.push(line);
+    if (isTomlTopLevel(scan)) {
+      const trimmed = stripTomlInlineComment(line).trim();
+      const arrayInner =
+        trimmed.startsWith("[[") && trimmed.endsWith("]]") ? trimmed.slice(2, -2).trim() : null;
+      if (arrayInner !== null && arrayInner.length > 0) {
+        // Array-of-tables is its own section. Leaving it in the previous table lets
+        // toggle/delete rewrite or drop unrelated `[[...]]` blocks.
+        current = {
+          headerLine: line,
+          segments: parseTomlKeyPath(arrayInner),
+          lines: [],
+          isArrayTable: true,
+          belongsToArrayTable: true,
+        };
+        sections.push(current);
+        continue;
+      }
+      if (trimmed.startsWith("[") && !trimmed.startsWith("[[") && trimmed.endsWith("]")) {
+        const inner = trimmed.slice(1, -1).trim();
+        const segments = parseTomlKeyPath(inner);
+        current = {
+          headerLine: line,
+          segments,
+          lines: [],
+          isArrayTable: false,
+          belongsToArrayTable: false,
+        };
+        sections.push(current);
+        continue;
+      }
     }
+    current.lines.push(line);
+    scan = advanceTomlValueScan(line, scan);
   }
 
-  return sections;
+  return markArrayTableOwnership(sections);
+}
+
+const TOML_BASIC_ESCAPES: Readonly<Record<string, string>> = {
+  b: "\b",
+  t: "\t",
+  n: "\n",
+  f: "\f",
+  r: "\r",
+  '"': '"',
+  "\\": "\\",
+};
+
+/** Left-to-right TOML basic-string escapes. `\\U...` stays a literal backslash plus text. */
+function decodeTomlBasicStringContents(inner: string): string {
+  let out = "";
+  for (let index = 0; index < inner.length; index += 1) {
+    if (inner[index] !== "\\") {
+      out += inner[index];
+      continue;
+    }
+    const next = inner[index + 1];
+    if (next === undefined) {
+      out += "\\";
+      break;
+    }
+    const simple = TOML_BASIC_ESCAPES[next];
+    if (simple !== undefined) {
+      out += simple;
+      index += 1;
+      continue;
+    }
+    if (next === "u" && /^[0-9A-Fa-f]{4}$/.test(inner.slice(index + 2, index + 6))) {
+      out += String.fromCharCode(Number.parseInt(inner.slice(index + 2, index + 6), 16));
+      index += 5;
+      continue;
+    }
+    if (next === "U" && /^[0-9A-Fa-f]{8}$/.test(inner.slice(index + 2, index + 10))) {
+      const codePoint = Number.parseInt(inner.slice(index + 2, index + 10), 16);
+      if (codePoint <= 0x10ffff) {
+        out += String.fromCodePoint(codePoint);
+        index += 9;
+        continue;
+      }
+    }
+    out += `\\${next}`;
+    index += 1;
+  }
+  return out;
+}
+
+function readTomlQuoteRun(raw: string, index: number, quote: '"' | "'"): number {
+  let run = 0;
+  while (index + run < raw.length && raw[index + run] === quote && run < 5) run += 1;
+  return run;
+}
+
+function parseMultilineBasicString(raw: string): string | undefined {
+  if (!raw.startsWith('"""')) return undefined;
+  let index = 3;
+  if (raw[index] === "\n") index += 1;
+  let body = "";
+  while (index < raw.length) {
+    if (raw[index] === "\\") {
+      const continuation = /^[ \t]*\n[ \t\n]*/.exec(raw.slice(index + 1));
+      if (continuation) {
+        index += 1 + continuation[0].length;
+        continue;
+      }
+      const next = raw[index + 1];
+      if (next === undefined) {
+        body += "\\";
+        break;
+      }
+      const simple = TOML_BASIC_ESCAPES[next];
+      if (simple !== undefined) {
+        body += simple;
+        index += 2;
+        continue;
+      }
+      if (next === "u" && /^[0-9A-Fa-f]{4}$/.test(raw.slice(index + 2, index + 6))) {
+        body += String.fromCharCode(Number.parseInt(raw.slice(index + 2, index + 6), 16));
+        index += 6;
+        continue;
+      }
+      if (next === "U" && /^[0-9A-Fa-f]{8}$/.test(raw.slice(index + 2, index + 10))) {
+        const codePoint = Number.parseInt(raw.slice(index + 2, index + 10), 16);
+        if (codePoint <= 0x10ffff) {
+          body += String.fromCodePoint(codePoint);
+          index += 10;
+          continue;
+        }
+      }
+      body += `\\${next}`;
+      index += 2;
+      continue;
+    }
+    if (raw[index] === '"') {
+      const run = readTomlQuoteRun(raw, index, '"');
+      if (run >= 3) {
+        body += '"'.repeat(run - 3);
+        return body;
+      }
+    }
+    body += raw[index];
+    index += 1;
+  }
+  return undefined;
+}
+
+function parseMultilineLiteralString(raw: string): string | undefined {
+  if (!raw.startsWith("'''")) return undefined;
+  let index = 3;
+  if (raw[index] === "\n") index += 1;
+  let body = "";
+  while (index < raw.length) {
+    if (raw[index] === "'") {
+      const run = readTomlQuoteRun(raw, index, "'");
+      if (run >= 3) {
+        body += "'".repeat(run - 3);
+        return body;
+      }
+    }
+    body += raw[index];
+    index += 1;
+  }
+  return undefined;
 }
 
 function parseTomlStringValue(raw: string): string | undefined {
   const trimmed = raw.trim();
+  if (trimmed.startsWith('"""')) return parseMultilineBasicString(trimmed);
+  if (trimmed.startsWith("'''")) return parseMultilineLiteralString(trimmed);
   if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    try {
-      return JSON.parse(trimmed) as string;
-    } catch {
-      return trimmed.slice(1, -1);
-    }
+    return decodeTomlBasicStringContents(trimmed.slice(1, -1));
   }
   if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
     return trimmed.slice(1, -1);
@@ -684,38 +1056,80 @@ function parseTomlStringArray(raw: string): string[] | undefined {
   return items;
 }
 
+function skipTomlMultilineString(text: string, index: number, quote: '"' | "'"): number {
+  let cursor = index + 3;
+  while (cursor < text.length) {
+    if (quote === '"' && text[cursor] === "\\" && cursor + 1 < text.length) {
+      cursor += 2;
+      continue;
+    }
+    if (text.startsWith(quote.repeat(3), cursor)) {
+      let end = cursor + 3;
+      while (end < text.length && end - cursor < 5 && text[end] === quote) end += 1;
+      return end;
+    }
+    cursor += 1;
+  }
+  return text.length;
+}
+
+function skipTomlBasicString(text: string, index: number): number {
+  let cursor = index + 1;
+  while (cursor < text.length) {
+    if (text[cursor] === "\\" && cursor + 1 < text.length) {
+      cursor += 2;
+      continue;
+    }
+    if (text[cursor] === '"') return cursor + 1;
+    cursor += 1;
+  }
+  return text.length;
+}
+
+function skipTomlLiteralString(text: string, index: number): number {
+  const end = text.indexOf("'", index + 1);
+  return end === -1 ? text.length : end + 1;
+}
+
+function splitTomlTopLevelCommas(inner: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let index = 0;
+  while (index < inner.length) {
+    if (inner.startsWith('"""', index)) {
+      index = skipTomlMultilineString(inner, index, '"');
+      continue;
+    }
+    if (inner.startsWith("'''", index)) {
+      index = skipTomlMultilineString(inner, index, "'");
+      continue;
+    }
+    const ch = inner[index]!;
+    if (ch === '"') {
+      index = skipTomlBasicString(inner, index);
+      continue;
+    }
+    if (ch === "'") {
+      index = skipTomlLiteralString(inner, index);
+      continue;
+    }
+    if (ch === ",") {
+      parts.push(inner.slice(start, index));
+      start = index + 1;
+    }
+    index += 1;
+  }
+  parts.push(inner.slice(start));
+  return parts;
+}
+
 function parseTomlInlineTable(raw: string): Record<string, string> | undefined {
   const trimmed = raw.trim();
   if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return undefined;
   const inner = trimmed.slice(1, -1).trim();
   if (!inner) return {};
   const result: Record<string, string> = {};
-  // Split top-level commas outside quotes
-  const parts: string[] = [];
-  let start = 0;
-  let inDouble = false;
-  let inSingle = false;
-  let escaped = false;
-  for (let i = 0; i < inner.length; i += 1) {
-    const ch = inner[i]!;
-    if (inDouble) {
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') inDouble = false;
-    } else if (inSingle) {
-      if (ch === "'") inSingle = false;
-    } else if (ch === '"') {
-      inDouble = true;
-    } else if (ch === "'") {
-      inSingle = true;
-    } else if (ch === ",") {
-      parts.push(inner.slice(start, i));
-      start = i + 1;
-    }
-  }
-  parts.push(inner.slice(start));
-
-  for (const part of parts) {
+  for (const part of splitTomlTopLevelCommas(inner)) {
     const eqIndex = findTomlEqualsIndex(part);
     if (eqIndex === -1) continue;
     const rawKey = part.slice(0, eqIndex).trim();
@@ -728,87 +1142,104 @@ function parseTomlInlineTable(raw: string): Record<string, string> | undefined {
 }
 
 function findTomlEqualsIndex(line: string): number {
-  let inDouble = false;
-  let inSingle = false;
-  let escaped = false;
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i]!;
-    if (inDouble) {
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') inDouble = false;
-    } else if (inSingle) {
-      if (ch === "'") inSingle = false;
-    } else if (ch === '"') {
-      inDouble = true;
-    } else if (ch === "'") {
-      inSingle = true;
-    } else if (ch === "=") {
-      return i;
+  let index = 0;
+  while (index < line.length) {
+    if (line.startsWith('"""', index)) {
+      index = skipTomlMultilineString(line, index, '"');
+      continue;
     }
+    if (line.startsWith("'''", index)) {
+      index = skipTomlMultilineString(line, index, "'");
+      continue;
+    }
+    const ch = line[index]!;
+    if (ch === '"') {
+      index = skipTomlBasicString(line, index);
+      continue;
+    }
+    if (ch === "'") {
+      index = skipTomlLiteralString(line, index);
+      continue;
+    }
+    if (ch === "=") return index;
+    index += 1;
   }
   return -1;
 }
 
-function collectTomlKeyValues(lines: ReadonlyArray<string>): Array<{ key: string; rawValue: string }> {
-  const pairs: Array<{ key: string; rawValue: string }> = [];
-  let i = 0;
-  while (i < lines.length) {
-    const cleaned = stripTomlInlineComment(lines[i]!).trim();
-    if (!cleaned) {
-      i += 1;
-      continue;
-    }
-    const eqIndex = findTomlEqualsIndex(cleaned);
-    if (eqIndex === -1) {
-      i += 1;
-      continue;
-    }
-    const rawKey = cleaned.slice(0, eqIndex).trim();
-    const key = parseTomlStringValue(rawKey) ?? rawKey;
-    let rawValue = cleaned.slice(eqIndex + 1).trim();
-
-    // Support multiline arrays / inline tables
-    let openBrackets = countUnquotedDelta(rawValue, "[", "]");
-    let openBraces = countUnquotedDelta(rawValue, "{", "}");
-    while ((openBrackets > 0 || openBraces > 0) && i + 1 < lines.length) {
-      i += 1;
-      const nextPart = stripTomlInlineComment(lines[i]!).trim();
-      rawValue = `${rawValue} ${nextPart}`;
-      openBrackets += countUnquotedDelta(nextPart, "[", "]");
-      openBraces += countUnquotedDelta(nextPart, "{", "}");
-    }
-
-    pairs.push({ key, rawValue });
-    i += 1;
-  }
-  return pairs;
+interface TomlAssignment {
+  readonly key: string;
+  readonly rawKey: string;
+  readonly rawValue: string;
+  readonly start: number;
+  readonly end: number;
 }
 
-function countUnquotedDelta(text: string, openChar: string, closeChar: string): number {
-  let delta = 0;
-  let inDouble = false;
-  let inSingle = false;
-  let escaped = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i]!;
-    if (inDouble) {
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') inDouble = false;
-    } else if (inSingle) {
-      if (ch === "'") inSingle = false;
-    } else if (ch === '"') {
-      inDouble = true;
-    } else if (ch === "'") {
-      inSingle = true;
-    } else if (ch === openChar) {
-      delta += 1;
-    } else if (ch === closeChar) {
-      delta -= 1;
+function collectTomlAssignments(lines: ReadonlyArray<string>): TomlAssignment[] {
+  const assignments: TomlAssignment[] = [];
+  let scan: TomlValueScan = { bracketDepth: 0, braceDepth: 0, multiline: null };
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index]!;
+    if (!isTomlTopLevel(scan)) {
+      scan = advanceTomlValueScan(line, scan);
+      index += 1;
+      continue;
     }
+    const eqIndex = findTomlEqualsIndex(line);
+    if (eqIndex === -1) {
+      scan = advanceTomlValueScan(line, scan);
+      index += 1;
+      continue;
+    }
+    const start = index;
+    const rawKey = stripTomlInlineComment(line.slice(0, eqIndex)).trim();
+    if (!rawKey) {
+      scan = advanceTomlValueScan(line, scan);
+      index += 1;
+      continue;
+    }
+    const key = parseTomlStringValue(rawKey) ?? rawKey;
+    const rawValueStart = line.slice(eqIndex + 1).trimStart();
+    const valueStartsMultiline =
+      rawValueStart.startsWith('"""') || rawValueStart.startsWith("'''");
+    const strippedStart = stripTomlInlineCommentWithState(rawValueStart, null);
+    const startScan = advanceTomlValueScan(rawValueStart, {
+      bracketDepth: 0,
+      braceDepth: 0,
+      multiline: null,
+    });
+    const valueParts = [
+      startScan.multiline === null ? strippedStart.trimEnd() : strippedStart,
+    ];
+    scan = advanceTomlValueScan(line, scan);
+    // Inline tables can open """ / ''' on a later column. Keep those bodies newline-accurate.
+    let preserveNewlines = valueStartsMultiline || scan.multiline !== null;
+    while (!isTomlTopLevel(scan) && index + 1 < lines.length) {
+      const insideMultiline = scan.multiline !== null;
+      if (insideMultiline) preserveNewlines = true;
+      index += 1;
+      const nextLine = lines[index]!;
+      const nextScan = advanceTomlValueScan(nextLine, scan);
+      const strippedNext = stripTomlInlineCommentWithState(nextLine, scan.multiline);
+      valueParts.push(nextScan.multiline === null ? strippedNext.trimEnd() : strippedNext);
+      scan = nextScan;
+      if (scan.multiline !== null) preserveNewlines = true;
+    }
+    assignments.push({
+      key,
+      rawKey,
+      rawValue: preserveNewlines ? valueParts.join("\n") : valueParts.join(" "),
+      start,
+      end: index,
+    });
+    index += 1;
   }
-  return delta;
+  return assignments;
+}
+
+function collectTomlKeyValues(lines: ReadonlyArray<string>): Array<{ key: string; rawValue: string }> {
+  return collectTomlAssignments(lines).map(({ key, rawValue }) => ({ key, rawValue }));
 }
 
 function formatTomlKeySegment(segment: string): string {
@@ -864,6 +1295,92 @@ function serializeCodexTomlSections(entry: RawMcpServerEntry): string[] {
   return lines;
 }
 
+function isStandardTomlTable(section: TomlSection): boolean {
+  return section.headerLine !== null && !section.isArrayTable && !section.belongsToArrayTable;
+}
+
+function assertCodexArrayTableWritable(
+  sections: readonly TomlSection[],
+  targetSegments: readonly string[],
+): void {
+  const conflict = sections.find((section) => {
+    if (!section.isArrayTable || section.segments.length === 0) return false;
+    // `[a.b]` conflicts with `[[a.b]]`, and `[a.b]` under `[[a]]` is the array element's subtable.
+    // `[a]` plus `[[a.b]]` is a normal table that contains an array and is allowed.
+    return (
+      tomlPathEquals(section.segments, targetSegments) ||
+      isStrictTomlPrefix(section.segments, targetSegments)
+    );
+  });
+  if (!conflict) return;
+  const targetPath = targetSegments.join(".");
+  const arrayPath = conflict.segments.join(".");
+  throw new Error(
+    `无法写入 [${targetPath}]：config.toml 已有数组表 [[${arrayPath}]]，两者路径冲突。请先修改或删除该数组表后再保存 MCP 服务。`,
+  );
+}
+
+function tomlPathsConflict(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    tomlPathEquals(left, right) ||
+    isStrictTomlPrefix(left, right) ||
+    isStrictTomlPrefix(right, left)
+  );
+}
+
+function assertNoParentDottedServerConflict(
+  sections: readonly TomlSection[],
+  serverName: string,
+): void {
+  const target = ["mcp_servers", serverName];
+  for (const section of sections) {
+    const inPreamble = section.headerLine === null;
+    const inMcpRoot =
+      isStandardTomlTable(section) &&
+      section.segments.length === 1 &&
+      section.segments[0] === "mcp_servers";
+    if (!inPreamble && !inMcpRoot) continue;
+    for (const assignment of collectTomlAssignments(section.lines)) {
+      const keySegs = parseTomlKeyPath(assignment.rawKey);
+      if (keySegs.length === 0) continue;
+      // Preamble: `mcp_servers = {...}`, `mcp_servers.docs = {...}`, and dotted keys.
+      // `[mcp_servers]`: `docs = {...}` and `docs.command = ...`.
+      const conflicts = inPreamble
+        ? tomlPathsConflict(keySegs, target)
+        : keySegs[0] === serverName;
+      if (!conflicts) continue;
+      throw new Error(
+        `无法写入 [mcp_servers.${serverName}]：config.toml 已通过键「${assignment.rawKey}」定义该表。请先删除该键后再保存 MCP 服务。`,
+      );
+    }
+  }
+}
+
+function assertNoDottedSubtableConflict(
+  lines: readonly string[],
+  serverName: string,
+  subtableName: string,
+): void {
+  // `env = { ... }` is one key and is replaced by the subtable. Dotted `env.*` cannot be.
+  const conflict = collectTomlAssignments(lines).find((assignment) => {
+    const segments = parseTomlKeyPath(assignment.rawKey);
+    return segments.length >= 2 && segments[0] === subtableName;
+  });
+  if (!conflict) return;
+  throw new Error(
+    `无法写入 [mcp_servers.${serverName}.${subtableName}]：config.toml 的 [mcp_servers.${serverName}] 已通过点号键「${conflict.rawKey}」定义 ${subtableName}。请先删除该点号键后再保存 MCP 服务。`,
+  );
+}
+
+function isCodexServerSection(section: TomlSection, serverName?: string): boolean {
+  return (
+    isStandardTomlTable(section) &&
+    section.segments.length >= 2 &&
+    section.segments[0] === "mcp_servers" &&
+    (serverName === undefined || section.segments[1] === serverName)
+  );
+}
+
 function readCodexEngine(configPath: string): {
   exists: boolean;
   servers: RawMcpServerEntry[];
@@ -889,7 +1406,7 @@ function readCodexEngine(configPath: string): {
     };
 
     for (const section of sections) {
-      if (section.segments.length >= 2 && section.segments[0] === "mcp_servers") {
+      if (isCodexServerSection(section)) {
         const serverName = section.segments[1]!;
         const entry = ensureServer(serverName);
         const kvPairs = collectTomlKeyValues(section.lines);
@@ -938,7 +1455,11 @@ function readCodexEngine(configPath: string): {
           }
           if (Object.keys(headers).length > 0) entry.headers = headers;
         }
-      } else if (section.segments.length === 2 && section.segments[0] === "plugins") {
+      } else if (
+        isStandardTomlTable(section) &&
+        section.segments.length === 2 &&
+        section.segments[0] === "plugins"
+      ) {
         const pluginId = section.segments[1]!;
         const kvPairs = collectTomlKeyValues(section.lines);
         const enabledPair = kvPairs.find((pair) => pair.key === "enabled");
@@ -988,65 +1509,272 @@ function renderTomlSections(sections: ReadonlyArray<TomlSection>): string {
   return outLines.length > 0 ? `${outLines.join("\n")}\n` : "";
 }
 
+function findTomlKeySpan(
+  lines: ReadonlyArray<string>,
+  targetKey: string,
+): { start: number; end: number } | null {
+  const found = collectTomlAssignments(lines).find((assignment) => assignment.key === targetKey);
+  return found ? { start: found.start, end: found.end } : null;
+}
+
+function extractTomlLineTrailingComment(
+  line: string,
+  initialMultiline: "basic" | "literal" | null = null,
+): string {
+  const withoutComment = stripTomlInlineCommentWithState(line, initialMultiline);
+  if (withoutComment.length >= line.length) return "";
+  const leadingWs = withoutComment.match(/\s+$/)?.[0] ?? " ";
+  return `${leadingWs}${line.slice(withoutComment.length)}`;
+}
+
+function extractTomlSpanTrailingComment(
+  lines: ReadonlyArray<string>,
+  span: { start: number; end: number },
+): string {
+  let scan: TomlValueScan = { bracketDepth: 0, braceDepth: 0, multiline: null };
+  for (let i = span.start; i < span.end; i += 1) {
+    scan = advanceTomlValueScan(lines[i]!, scan);
+  }
+  return extractTomlLineTrailingComment(lines[span.end]!, scan.multiline);
+}
+
+function upsertTomlSectionKey(lines: string[], key: string, formattedValue: string | null): void {
+  const span = findTomlKeySpan(lines, key);
+  if (formattedValue === null) {
+    if (span) {
+      lines.splice(span.start, span.end - span.start + 1);
+    }
+    return;
+  }
+
+  const assignment = `${formatTomlKeySegment(key)} = ${formattedValue}`;
+  if (span) {
+    const trailing = extractTomlSpanTrailingComment(lines, span);
+    lines.splice(span.start, span.end - span.start + 1, `${assignment}${trailing}`);
+    return;
+  }
+
+  let insertAt = lines.length;
+  while (insertAt > 0 && lines[insertAt - 1]!.trim() === "") {
+    insertAt -= 1;
+  }
+  lines.splice(insertAt, 0, assignment);
+}
+
+function patchTomlMapSubtable(section: TomlSection, entries: Readonly<Record<string, string>>): void {
+  const existingPairs = collectTomlKeyValues(section.lines);
+  for (const { key } of existingPairs) {
+    if (!Object.prototype.hasOwnProperty.call(entries, key)) {
+      upsertTomlSectionKey(section.lines, key, null);
+    }
+  }
+  for (const [k, v] of Object.entries(entries)) {
+    upsertTomlSectionKey(section.lines, k, JSON.stringify(v));
+  }
+}
+
+function renameTomlSectionServer(
+  section: TomlSection,
+  newServerName: string,
+  sections: readonly TomlSection[],
+): TomlSection {
+  if (
+    section.isArrayTable ||
+    section.belongsToArrayTable ||
+    section.headerLine === null ||
+    section.segments.length < 2
+  ) {
+    return section;
+  }
+  const nextSegments = [section.segments[0]!, newServerName, ...section.segments.slice(2)];
+  assertCodexArrayTableWritable(sections, nextSegments);
+  const trailing = extractTomlLineTrailingComment(section.headerLine);
+  return {
+    headerLine: `[${nextSegments.map(formatTomlKeySegment).join(".")}]${trailing}`,
+    segments: nextSegments,
+    lines: section.lines,
+    isArrayTable: false,
+    belongsToArrayTable: false,
+  };
+}
+
+function ensureSectionTrailingBlankLine(section: TomlSection | undefined): void {
+  if (!section) return;
+  if (
+    section.headerLine !== null ||
+    section.lines.some((line) => line.trim() !== "")
+  ) {
+    if (section.lines.length === 0 || section.lines[section.lines.length - 1]!.trim() !== "") {
+      section.lines.push("");
+    }
+  }
+}
+
+function prepareCodexTomlUpsert(
+  configPath: string,
+  entry: RawMcpServerEntry,
+  originalName?: string,
+): string {
+  const content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const sections = parseTomlSections(content);
+  const hasOriginalSections = Boolean(
+    originalName &&
+      originalName !== entry.name &&
+      sections.some((section) => isCodexServerSection(section, originalName)),
+  );
+  const sourceName = hasOriginalSections && originalName ? originalName : entry.name;
+
+  const isTargetServerSection = (section: TomlSection, name: string) =>
+    isCodexServerSection(section, name);
+
+  const filteredSections =
+    hasOriginalSections && originalName
+      ? sections.filter((section) => !isTargetServerSection(section, entry.name))
+      : sections;
+
+  const mainSection = filteredSections.find(
+    (section) => isTargetServerSection(section, sourceName) && section.segments.length === 2,
+  );
+
+  assertNoParentDottedServerConflict(sections, entry.name);
+
+  if (!mainSection) {
+    // Brand-new server (or no existing main table): append cleanly without touching other sections.
+    const remaining = filteredSections.filter(
+      (section) => !isTargetServerSection(section, sourceName),
+    );
+    const newLines = serializeCodexTomlSections(entry);
+    const newSections = parseTomlSections(`${newLines.join("\n")}\n`).filter(
+      (section) => section.headerLine !== null,
+    );
+    for (const section of newSections) {
+      assertCodexArrayTableWritable(sections, section.segments);
+    }
+    ensureSectionTrailingBlankLine(remaining[remaining.length - 1]);
+    remaining.push(...newSections);
+    return renderTomlSections(remaining);
+  }
+
+  // Patch managed keys in-place on the existing main section, preserving all unmanaged fields
+  // (cwd, startup_timeout_sec, tool_timeout_sec, enabled_tools, etc.) and comments.
+  if (entry.transport === "http") {
+    upsertTomlSectionKey(mainSection.lines, "url", JSON.stringify(entry.url ?? ""));
+    upsertTomlSectionKey(
+      mainSection.lines,
+      "bearer_token_env_var",
+      entry.bearerTokenEnvVar ? JSON.stringify(entry.bearerTokenEnvVar) : null,
+    );
+    upsertTomlSectionKey(mainSection.lines, "command", null);
+    upsertTomlSectionKey(mainSection.lines, "args", null);
+    upsertTomlSectionKey(mainSection.lines, "env", null);
+  } else {
+    upsertTomlSectionKey(mainSection.lines, "command", JSON.stringify(entry.command ?? ""));
+    upsertTomlSectionKey(
+      mainSection.lines,
+      "args",
+      entry.args && entry.args.length > 0
+        ? `[${entry.args.map((arg) => JSON.stringify(arg)).join(", ")}]`
+        : null,
+    );
+    upsertTomlSectionKey(mainSection.lines, "url", null);
+    upsertTomlSectionKey(mainSection.lines, "bearer_token_env_var", null);
+    upsertTomlSectionKey(mainSection.lines, "http_headers", null);
+  }
+
+  if (!entry.enabled) {
+    upsertTomlSectionKey(mainSection.lines, "enabled", "false");
+  } else if (findTomlKeySpan(mainSection.lines, "enabled") !== null) {
+    upsertTomlSectionKey(mainSection.lines, "enabled", "true");
+  }
+
+  const managedSubtableName = entry.transport === "http" ? "http_headers" : "env";
+  const obsoleteSubtableName = entry.transport === "http" ? "env" : "http_headers";
+  const desiredMap: Record<string, string> =
+    entry.transport === "http"
+      ? entry.headers
+        ? { ...entry.headers }
+        : {}
+      : entry.env
+        ? { ...entry.env }
+        : {};
+  if (
+    entry.transport === "http" &&
+    entry.bearerTokenEnvVar &&
+    desiredMap.Authorization === `Bearer \${${entry.bearerTokenEnvVar}}`
+  ) {
+    delete desiredMap.Authorization;
+  }
+  const hasDesiredMap = Object.keys(desiredMap).length > 0;
+
+  assertCodexArrayTableWritable(sections, ["mcp_servers", entry.name]);
+  if (hasDesiredMap) {
+    assertCodexArrayTableWritable(sections, ["mcp_servers", entry.name, managedSubtableName]);
+    assertNoDottedSubtableConflict(mainSection.lines, entry.name, managedSubtableName);
+  }
+
+  // Remove inline map key so subtable remains the single canonical representation without duplicates.
+  upsertTomlSectionKey(mainSection.lines, managedSubtableName, null);
+
+  let managedSubtableUpdated = false;
+  const updatedSections: TomlSection[] = [];
+  for (const section of filteredSections) {
+    if (!isTargetServerSection(section, sourceName)) {
+      updatedSections.push(section);
+      continue;
+    }
+
+    if (section.segments.length === 3 && section.segments[2] === obsoleteSubtableName) {
+      continue;
+    }
+
+    if (section.segments.length === 3 && section.segments[2] === managedSubtableName) {
+      if (!hasDesiredMap) {
+        continue;
+      }
+      const renamed =
+        sourceName !== entry.name ? renameTomlSectionServer(section, entry.name, sections) : section;
+      patchTomlMapSubtable(renamed, desiredMap);
+      managedSubtableUpdated = true;
+      updatedSections.push(renamed);
+      continue;
+    }
+
+    const renamed =
+      sourceName !== entry.name ? renameTomlSectionServer(section, entry.name, sections) : section;
+    updatedSections.push(renamed);
+  }
+
+  if (hasDesiredMap && !managedSubtableUpdated) {
+    const keySeg = formatTomlKeySegment(entry.name);
+    const mainIdx = updatedSections.findIndex(
+      (section) => isTargetServerSection(section, entry.name) && section.segments.length === 2,
+    );
+    const insertAt = mainIdx !== -1 ? mainIdx + 1 : updatedSections.length;
+    ensureSectionTrailingBlankLine(updatedSections[insertAt - 1]);
+    const subLines = Object.entries(desiredMap).map(
+      ([k, v]) => `${formatTomlKeySegment(k)} = ${JSON.stringify(v)}`,
+    );
+    if (insertAt < updatedSections.length) {
+      subLines.push("");
+    }
+    updatedSections.splice(insertAt, 0, {
+      headerLine: `[mcp_servers.${keySeg}.${managedSubtableName}]`,
+      segments: ["mcp_servers", entry.name, managedSubtableName],
+      lines: subLines,
+      isArrayTable: false,
+      belongsToArrayTable: false,
+    });
+  }
+
+  return renderTomlSections(updatedSections);
+}
+
 function upsertCodexTomlServer(
   configPath: string,
   entry: RawMcpServerEntry,
   originalName?: string,
 ): void {
-  const content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
-  const sections = parseTomlSections(content);
-  const namesToReplace = new Set<string>([entry.name]);
-  if (originalName && originalName !== entry.name) {
-    namesToReplace.add(originalName);
-  }
-
-  let insertIndex = -1;
-  const remaining: TomlSection[] = [];
-  for (const section of sections) {
-    const isTarget =
-      section.segments.length >= 2 &&
-      section.segments[0] === "mcp_servers" &&
-      namesToReplace.has(section.segments[1]!);
-    if (isTarget) {
-      if (insertIndex === -1) {
-        insertIndex = remaining.length;
-      }
-      continue;
-    }
-    remaining.push(section);
-  }
-
-  const newLines = serializeCodexTomlSections(entry);
-  const newSections = parseTomlSections(`${newLines.join("\n")}\n`).filter(
-    (section) => section.headerLine !== null,
-  );
-
-  // Ensure a clean blank separator before inserted block
-  const prevSection =
-    insertIndex === -1 ? remaining[remaining.length - 1] : remaining[insertIndex - 1];
-  if (
-    prevSection &&
-    (prevSection.headerLine !== null || prevSection.lines.some((line) => line.trim() !== ""))
-  ) {
-    if (
-      prevSection.lines.length === 0 ||
-      prevSection.lines[prevSection.lines.length - 1]!.trim() !== ""
-    ) {
-      prevSection.lines.push("");
-    }
-  }
-  const lastNewSection = newSections[newSections.length - 1];
-  if (insertIndex !== -1 && insertIndex < remaining.length && lastNewSection) {
-    lastNewSection.lines.push("");
-  }
-
-  if (insertIndex === -1) {
-    remaining.push(...newSections);
-  } else {
-    remaining.splice(insertIndex, 0, ...newSections);
-  }
-
-  writeFileAtomic(configPath, renderTomlSections(remaining));
+  writeFileAtomic(configPath, prepareCodexTomlUpsert(configPath, entry, originalName));
 }
 
 function toggleCodexTomlServer(configPath: string, name: string, enabled: boolean): void {
@@ -1056,35 +1784,13 @@ function toggleCodexTomlServer(configPath: string, name: string, enabled: boolea
   const content = fs.readFileSync(configPath, "utf8");
   const sections = parseTomlSections(content);
   const target = sections.find(
-    (section) =>
-      section.segments.length === 2 &&
-      section.segments[0] === "mcp_servers" &&
-      section.segments[1] === name,
+    (section) => isCodexServerSection(section, name) && section.segments.length === 2,
   );
   if (!target) {
     throw new Error(`MCP server "${name}" not found in Codex config`);
   }
 
-  let updated = false;
-  for (let i = 0; i < target.lines.length; i += 1) {
-    const cleaned = stripTomlInlineComment(target.lines[i]!).trim();
-    const eqIndex = findTomlEqualsIndex(cleaned);
-    if (eqIndex !== -1 && cleaned.slice(0, eqIndex).trim() === "enabled") {
-      target.lines[i] = `enabled = ${enabled ? "true" : "false"}`;
-      updated = true;
-      break;
-    }
-  }
-
-  if (!updated) {
-    // Insert before trailing blank lines of this section
-    let insertAt = target.lines.length;
-    while (insertAt > 0 && target.lines[insertAt - 1]!.trim() === "") {
-      insertAt -= 1;
-    }
-    target.lines.splice(insertAt, 0, `enabled = ${enabled ? "true" : "false"}`);
-  }
-
+  upsertTomlSectionKey(target.lines, "enabled", enabled ? "true" : "false");
   writeFileAtomic(configPath, renderTomlSections(sections));
 }
 
@@ -1092,14 +1798,8 @@ function deleteCodexTomlServer(configPath: string, name: string): void {
   if (!fs.existsSync(configPath)) return;
   const content = fs.readFileSync(configPath, "utf8");
   const sections = parseTomlSections(content);
-  const remaining = sections.filter(
-    (section) =>
-      !(
-        section.segments.length >= 2 &&
-        section.segments[0] === "mcp_servers" &&
-        section.segments[1] === name
-      ),
-  );
+  const remaining = sections.filter((section) => !isCodexServerSection(section, name));
+  if (remaining.length === sections.length) return;
   writeFileAtomic(configPath, renderTomlSections(remaining));
 }
 
@@ -1185,8 +1885,14 @@ export class UnifiedMcpManager {
       for (const [k, v] of Object.entries(input.env)) {
         const key = k.trim();
         if (!key) continue;
-        if (v === SECRET_MASK_SENTINEL && referenceRaw?.env?.[key] !== undefined) {
-          resolvedEnv[key] = referenceRaw.env[key]!;
+        if (v === SECRET_MASK_SENTINEL) {
+          const preserved = referenceRaw?.env?.[key];
+          if (preserved === undefined) {
+            throw new Error(
+              `无法保存环境变量「${key}」：值为脱敏占位符，且没有可还原的原始凭据。重命名或新增脱敏字段时请重新输入凭据。`,
+            );
+          }
+          resolvedEnv[key] = preserved;
         } else {
           resolvedEnv[key] = v;
         }
@@ -1198,8 +1904,14 @@ export class UnifiedMcpManager {
       for (const [k, v] of Object.entries(input.headers)) {
         const key = k.trim();
         if (!key) continue;
-        if (v === SECRET_MASK_SENTINEL && referenceRaw?.headers?.[key] !== undefined) {
-          resolvedHeaders[key] = referenceRaw.headers[key]!;
+        if (v === SECRET_MASK_SENTINEL) {
+          const preserved = referenceRaw?.headers?.[key];
+          if (preserved === undefined) {
+            throw new Error(
+              `无法保存请求头「${key}」：值为脱敏占位符，且没有可还原的原始凭据。重命名或新增脱敏字段时请重新输入凭据。`,
+            );
+          }
+          resolvedHeaders[key] = preserved;
         } else {
           resolvedHeaders[key] = v;
         }
@@ -1216,7 +1928,7 @@ export class UnifiedMcpManager {
     return {
       name: trimmedName,
       transport: input.transport,
-      enabled: input.enabled ?? true,
+      enabled: input.enabled ?? referenceRaw?.enabled ?? true,
       ...(input.transport === "stdio"
         ? {
             command: input.command?.trim() ?? "",
@@ -1248,29 +1960,56 @@ export class UnifiedMcpManager {
 
     const originalName = input.originalName?.trim();
 
-    for (const targetEngineId of input.targets) {
+    if (originalName && originalName !== trimmedName) {
+      const conflicts: string[] = [];
+      for (const targetEngineId of input.targets) {
+        const descriptor = ENGINE_BY_ID.get(targetEngineId);
+        if (!descriptor) {
+          throw new Error(`Unknown target engine: ${String(targetEngineId)}`);
+        }
+        const existingServers = this.readRawEngineServers(targetEngineId).servers;
+        if (existingServers.some((server) => server.name === trimmedName)) {
+          conflicts.push(descriptor.label);
+        }
+      }
+      if (conflicts.length > 0) {
+        throw new Error(
+          `无法重命名为「${trimmedName}」：${conflicts.join("、")} 中已存在同名 MCP 服务`,
+        );
+      }
+    }
+
+    const prepared = input.targets.map((targetEngineId) => {
       const descriptor = ENGINE_BY_ID.get(targetEngineId);
       if (!descriptor) {
         throw new Error(`Unknown target engine: ${String(targetEngineId)}`);
       }
-      const configPath = this.resolveConfigPath(descriptor);
-      const rawEntry = this.resolveUnmaskedSecrets(input, targetEngineId);
+      return {
+        descriptor,
+        configPath: this.resolveConfigPath(descriptor),
+        rawEntry: this.resolveUnmaskedSecrets(input, targetEngineId),
+      };
+    });
 
-      if (descriptor.format === "toml") {
-        upsertCodexTomlServer(configPath, rawEntry, originalName);
-      } else {
-        mutateJsonEngine(descriptor, configPath, (mcpServers) => {
-          const existingObj = isPlainObject(mcpServers[originalName ?? trimmedName])
-            ? (mcpServers[originalName ?? trimmedName] as Record<string, unknown>)
-            : isPlainObject(mcpServers[trimmedName])
-              ? (mcpServers[trimmedName] as Record<string, unknown>)
-              : undefined;
-          if (originalName && originalName !== trimmedName) {
-            delete mcpServers[originalName];
-          }
-          mcpServers[trimmedName] = serializeJsonServerEntry(descriptor, rawEntry, existingObj);
-        });
-      }
+    const writes = prepared.map(({ descriptor, configPath, rawEntry }) => {
+      const content =
+        descriptor.format === "toml"
+          ? prepareCodexTomlUpsert(configPath, rawEntry, originalName)
+          : prepareJsonEngineMutation(descriptor, configPath, (mcpServers) => {
+              const existingObj = isPlainObject(mcpServers[originalName ?? trimmedName])
+                ? (mcpServers[originalName ?? trimmedName] as Record<string, unknown>)
+                : isPlainObject(mcpServers[trimmedName])
+                  ? (mcpServers[trimmedName] as Record<string, unknown>)
+                  : undefined;
+              if (originalName && originalName !== trimmedName) {
+                delete mcpServers[originalName];
+              }
+              mcpServers[trimmedName] = serializeJsonServerEntry(descriptor, rawEntry, existingObj);
+            });
+      return { configPath, content };
+    });
+    for (const write of writes) {
+      writeFileAtomic(write.configPath, write.content);
     }
 
     return this.getSnapshot();
@@ -1334,7 +2073,7 @@ export class UnifiedMcpManager {
     return this.getSnapshot();
   }
 
-  public syncServer(input: SyncMcpServerInput): UnifiedMcpSnapshot {
+  public syncServer(input: SyncMcpServerInput): SyncMcpServerResult {
     const name = input.name.trim();
     if (!name) {
       throw new Error("MCP server name is required");
@@ -1345,25 +2084,42 @@ export class UnifiedMcpManager {
       throw new Error(`MCP server "${name}" not found in ${input.sourceEngineId}`);
     }
 
+    const results: McpSyncEngineResult[] = [];
     for (const targetEngineId of input.targetEngineIds) {
       if (targetEngineId === input.sourceEngineId) continue;
       const descriptor = ENGINE_BY_ID.get(targetEngineId);
-      if (!descriptor) continue;
+      if (!descriptor) {
+        results.push({ engineId: targetEngineId, ok: false, error: `Unknown engine: ${targetEngineId}` });
+        continue;
+      }
       const configPath = this.resolveConfigPath(descriptor);
 
-      if (descriptor.format === "toml") {
-        upsertCodexTomlServer(configPath, sourceEntry);
-      } else {
-        mutateJsonEngine(descriptor, configPath, (mcpServers) => {
-          const existingObj = isPlainObject(mcpServers[name])
-            ? (mcpServers[name] as Record<string, unknown>)
-            : undefined;
-          mcpServers[name] = serializeJsonServerEntry(descriptor, sourceEntry, existingObj);
+      try {
+        if (descriptor.format === "toml") {
+          upsertCodexTomlServer(configPath, sourceEntry);
+        } else {
+          mutateJsonEngine(descriptor, configPath, (mcpServers) => {
+            const existingObj = isPlainObject(mcpServers[name])
+              ? (mcpServers[name] as Record<string, unknown>)
+              : undefined;
+            mcpServers[name] = serializeJsonServerEntry(descriptor, sourceEntry, existingObj);
+          });
+        }
+        results.push({ engineId: targetEngineId, ok: true });
+      } catch (error) {
+        results.push({
+          engineId: targetEngineId,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
         });
       }
     }
 
-    return this.getSnapshot();
+    return {
+      snapshot: this.getSnapshot(),
+      results,
+      ok: results.every((r) => r.ok),
+    };
   }
 
   public async testServer(engineId: McpEngineId, name: string): Promise<McpTestResult> {
