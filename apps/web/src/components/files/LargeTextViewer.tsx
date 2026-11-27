@@ -21,7 +21,7 @@ function firstScreen(text: string, delimiter: "," | "\t" | null, complete: boole
   const rows = delimiter
     ? parseDelimitedPreview(text, delimiter, {
         maxRows: PREVIEW_PAGE_ROWS * 2 + 1,
-        maxColumns: LARGE_TEXT_MAX_COLUMNS,
+        maxColumns: LARGE_TEXT_MAX_COLUMNS + 1,
         maxCellLength: FIRST_SCREEN_BYTES,
       }).rows
     : text
@@ -39,10 +39,7 @@ type Meta = Extract<TextPreviewResult, { type: "meta" }>;
 function firstScreenState(text: string, delimiter: "," | "\t" | null, complete: boolean) {
   const rows = firstScreen(text, delimiter, complete);
   if (!rows.length) return null;
-  const displayedColumns = Math.min(
-    LARGE_TEXT_MAX_COLUMNS,
-    rows.reduce((max, row) => Math.max(max, row.length), 1),
-  );
+  const widest = rows.reduce((max, row) => Math.max(max, row.length), 1);
   return {
     pages: new Map(
       [0, PREVIEW_PAGE_ROWS]
@@ -52,8 +49,8 @@ function firstScreenState(text: string, delimiter: "," | "\t" | null, complete: 
     meta: {
       type: "meta",
       count: rows.length,
-      displayedColumns,
-      totalColumns: displayedColumns,
+      displayedColumns: Math.min(LARGE_TEXT_MAX_COLUMNS, widest),
+      totalColumns: widest,
       complete: false,
     } satisfies Meta as Meta,
   };

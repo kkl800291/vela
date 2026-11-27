@@ -16,6 +16,7 @@ export interface T3ProjectFileState {
   fileName: string | null;
   file: T3ProjectFile | null;
   scripts: ReadonlyArray<T3ProjectFileScript>;
+  refresh: () => void;
 }
 
 export function useT3ProjectFileState(
@@ -50,6 +51,12 @@ export function useT3ProjectFileState(
       : legacyContents !== null
         ? LEGACY_T3_PROJECT_FILE_NAME
         : null;
+  const refresh = () => {
+    primaryQuery.refresh();
+    if (shouldCheckLegacy) {
+      legacyQuery.refresh();
+    }
+  };
 
   if (contents === null) {
     return {
@@ -57,13 +64,14 @@ export function useT3ProjectFileState(
       fileName: null,
       file: null,
       scripts: NO_SCRIPTS,
+      refresh,
     } as const;
   }
   const file = parseT3ProjectFile(contents);
   if (file === null) {
-    return { status: "invalid", fileName, file: null, scripts: NO_SCRIPTS } as const;
+    return { status: "invalid", fileName, file: null, scripts: NO_SCRIPTS, refresh } as const;
   }
-  return { status: "valid", fileName, file, scripts: file.scripts ?? NO_SCRIPTS } as const;
+  return { status: "valid", fileName, file, scripts: file.scripts ?? NO_SCRIPTS, refresh } as const;
 }
 
 export function useT3ProjectFileScripts(

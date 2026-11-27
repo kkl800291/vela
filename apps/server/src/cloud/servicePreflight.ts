@@ -6,6 +6,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { BUILD_MIGRATION_HEAD, recordedMigrations } from "../persistence/databaseMigrationHead.ts";
 import { skippedV2Migrations } from "../persistence/Migrations.ts";
 import { reconciledV2PreviewHistory } from "../persistence/reconcileV2PreviewMigration.ts";
+import { reconciledVelaCollabHistory } from "../persistence/velaMigrations.ts";
 import type * as ProcessRunner from "../processRunner.ts";
 import {
   pinnedRuntimeCommand,
@@ -77,10 +78,11 @@ export function runServicePreflight(input: {
     };
   }
 
-  // Startup reconciles V2 preview ids before it checks the history, so check what it will see.
+  // Startup reconciles V2 preview ids and legacy Vela migration 117 before checking history.
   const reconciled = reconciledV2PreviewHistory(recorded);
+  const normalized = reconciled === null ? null : reconciledVelaCollabHistory(reconciled);
   const incompatible =
-    reconciled === null ? ["an unexpected V2 preview history"] : skippedV2Migrations(reconciled);
+    normalized === null ? ["an unexpected V2 preview history"] : skippedV2Migrations(normalized);
   if (incompatible.length > 0) {
     return {
       status: "blocked",

@@ -6,7 +6,9 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { describe } from "vite-plus/test";
 
 import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
-import { runMigrations } from "../persistence/Migrations.ts";
+import { runMigrations, skippedV2Migrations } from "../persistence/Migrations.ts";
+import { reconciledVelaCollabHistory } from "../persistence/velaMigrations.ts";
+import VelaCollaborationV2Migration from "../persistence/VelaMigrations/001_VelaCollaborationV2.ts";
 import {
   layer,
   targetWorktreeLeaseResource,
@@ -106,14 +108,22 @@ const transition = (
 
 describe("Vela Collaboration SQLite", () => {
   it.effect(
-    "registers migration 117 and enforces one pending or dispatched inbox per thread in SQLite",
+    "runs upstream migrations 117..119 alongside vela_sql_migrations and enforces single active inbox",
     () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         const store = yield* VelaCollabStore;
         yield* runMigrations({ toMigrationInclusive: 116 });
-        assert.deepStrictEqual(yield* runMigrations(), [[117, "VelaCollaborationV2"]]);
-        assert.equal(BUILD_MIGRATION_HEAD, 117);
+        assert.deepStrictEqual(yield* runMigrations(), [
+          [117, "WorkflowMailSender"],
+          [118, "WorkflowPools"],
+          [119, "WorkflowRunSubject"],
+        ]);
+        assert.equal(BUILD_MIGRATION_HEAD, 119);
+        const velaHistory = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+          SELECT migration_id, name FROM vela_sql_migrations ORDER BY migration_id
+        `;
+        assert.deepStrictEqual(velaHistory, [{ migration_id: 1, name: "VelaCollaborationV2" }]);
         yield* store.commitTransition(transition(1));
         const insert = (id: string, status: string, environmentId = scope.environmentId) => sql`
         INSERT INTO vela_collab_inbox (inbox_item_id, environment_id, parent_thread_id, plan_id, kind,
@@ -126,6 +136,41 @@ describe("Vela Collaboration SQLite", () => {
         yield* insert("other-environment", "pending", "other");
         yield* sql`UPDATE vela_collab_inbox SET status = 'completed' WHERE inbox_item_id = 'first'`;
         yield* insert("second", "dispatched");
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "reconciles legacy effect_sql_migrations 117_VelaCollaborationV2 while preserving existing collaboration rows",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* VelaCollabStore;
+        yield* runMigrations({ toMigrationInclusive: 116 });
+        yield* VelaCollaborationV2Migration;
+        yield* sql`
+          INSERT INTO effect_sql_migrations (migration_id, name) VALUES (117, 'VelaCollaborationV2')
+        `;
+        yield* store.commitTransition(transition(1));
+
+        const recorded = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+          SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
+        `;
+        const normalized = reconciledVelaCollabHistory(
+          recorded.map((row) => ({ id: row.migration_id, name: row.name })),
+        );
+        assert.deepStrictEqual(skippedV2Migrations(normalized), []);
+
+        assert.deepStrictEqual(yield* runMigrations(), [
+          [117, "WorkflowMailSender"],
+          [118, "WorkflowPools"],
+          [119, "WorkflowRunSubject"],
+        ]);
+        const velaHistory = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+          SELECT migration_id, name FROM vela_sql_migrations ORDER BY migration_id
+        `;
+        assert.deepStrictEqual(velaHistory, [{ migration_id: 1, name: "VelaCollaborationV2" }]);
+        const persisted = yield* store.getPlan(plan.planId);
+        assert.deepStrictEqual(persisted?.title, plan.title);
       }).pipe(Effect.provide(testLayer)),
   );
 
